@@ -4,8 +4,10 @@ finish by calling ``submit_assessment``.
 The model only ever sees the symbol code chose. Its tools are read-only and take no
 symbol: whatever it puts in a tool call, the data is for this name. Tool results are
 data, and news text is wrapped as ``untrusted_news``. Every limit ends the dive with no
-assessment: tool calls, turns, input tokens, the per-dive timeout, and the budget, which
-is checked before each call.
+assessment: tool calls, turns, input tokens, the per-dive timeout, and the budget. The
+input-token cap and the budget are both checked before each call, against an upper-bound
+estimate of its input: a call that could cross either is never sent (the repair turn
+included). Once a reply shows the next call cannot fit, its tools are not run.
 """
 
 from __future__ import annotations
@@ -129,10 +131,18 @@ class Assessment(BaseModel):
     side: Literal["long", "bearish", "pass"]
     horizon: Literal["intraday", "swing"]
     score: Annotated[int, Field(strict=True, ge=0, le=100)]
-    thesis: Annotated[str, Field(max_length=1500)]
-    invalidation: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    thesis: Annotated[str, Field(min_length=1, max_length=1500)]
+    invalidation: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
     swing_days: Annotated[int, Field(strict=True, ge=1, le=20)] | None = None
     risks: list[Annotated[str, Field(max_length=200)]] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _intraday_has_no_days(cls, data: Any) -> Any:
+        # An intraday idea is flat by the close: any swing_days it carries is ignored.
+        if isinstance(data, dict) and data.get("horizon") == "intraday":
+            return {**data, "swing_days": None}
+        return data
 
     @model_validator(mode="after")
     def _swing_needs_days(self) -> Self:
@@ -184,7 +194,7 @@ class DiveResult:
             "tool_calls": self.tool_calls,
             "usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
             "assessment": self.assessment.model_dump(mode="json") if self.assessment else None,
-            "messages": self.messages,
+            "messages": list(self.messages),
         }
 
 
@@ -303,11 +313,12 @@ async def run_tool(
 
 def _intro(ctx: DiveContext) -> str:
     q = ctx.quote
+    features = json.dumps({k: round(v, 4) for k, v in ctx.features.items()}, default=str)
     return (
         f"Symbol: {ctx.symbol}\n"
         f"Today: {ctx.today.isoformat()}, before the open.\n"
         f"Quote: last {q.last}, previous close {q.prev_close}.\n"
-        f"Screen features: {json.dumps({k: round(v, 4) for k, v in ctx.features.items()})}\n"
+        f"Screen features: {features}\n"
         "Study it with the tools, then call submit_assessment."
     )
 
@@ -315,7 +326,7 @@ def _intro(ctx: DiveContext) -> str:
 def _estimate(messages: list[dict[str, Any]]) -> int:
     """An upper bound on a request's input tokens: half its serialized characters, plus
     the tool-use overhead the API adds that we do not send (as the posture review does)."""
-    chars = len(SYSTEM_PROMPT) + len(json.dumps(messages)) + len(json.dumps(TOOLS))
+    chars = len(SYSTEM_PROMPT) + len(json.dumps(messages, default=str)) + len(json.dumps(TOOLS))
     return chars // 2 + 1 + TOOL_OVERHEAD_TOKENS
 
 
@@ -358,6 +369,9 @@ async def _loop(
         force = last_turn or result.tool_calls >= settings.max_tool_calls
         tool_choice = {"type": "tool", "name": SUBMIT} if force else {"type": "any"}
         estimate = max(largest_input, _estimate(result.messages))
+        if result.input_tokens + estimate > settings.max_dive_input_tokens:
+            result.outcome = "input_limit"  # this call could cross the cap: never sent
+            return
         held = meter.reserve(model, estimate, settings.max_tokens)
         if held is None:
             result.outcome = "budget"
@@ -390,10 +404,20 @@ async def _loop(
         result.input_tokens += answer.usage.input_tokens
         result.output_tokens += answer.usage.output_tokens
         largest_input = max(largest_input, answer.usage.input_tokens)
+        if not answer.content:  # nothing to send back, and no answer: a failed call
+            result.outcome = "llm_error"
+            return
         result.messages.append({"role": "assistant", "content": list(answer.content)})
 
+        uses = answer.tool_uses()
+        submits = any(use.get("name") == SUBMIT for use in uses)
+        if not submits and result.input_tokens + largest_input > settings.max_dive_input_tokens:
+            # The next request is at least as large as this one, so it cannot be sent:
+            # stop before running tools whose results would go nowhere.
+            result.outcome = "input_limit"
+            return
         replies: list[dict[str, Any]] = []
-        for use in answer.tool_uses():
+        for use in uses:
             name, call_id = str(use.get("name")), str(use.get("id"))
             raw_args = use.get("input")
             args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
@@ -421,9 +445,6 @@ async def _loop(
                 data = await run_tool(name, args, ctx, market=market, events=events,
                                       result=result)  # fmt: skip
             replies.append(_tool_result(call_id, data, settings, error="error" in data))
-        if result.input_tokens >= settings.max_dive_input_tokens:
-            result.outcome = "input_limit"
-            return
         if not replies:
             replies = [{"type": "text", "text": "Call submit_assessment now."}]
         result.messages.append({"role": "user", "content": replies})
@@ -436,6 +457,6 @@ def _tool_result(
     return {
         "type": "tool_result",
         "tool_use_id": call_id,
-        "content": truncate(json.dumps(data), settings.tool_result_max_chars),
+        "content": truncate(json.dumps(data, default=str), settings.tool_result_max_chars),
         "is_error": error,
     }

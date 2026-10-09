@@ -111,6 +111,9 @@ def test_an_assessment_follows_the_schema():
         {"thesis": "x" * 1501},
         {"invalidation": 0},
         {"invalidation": float("nan")},
+        {"invalidation": True},
+        {"invalidation": "101"},
+        {"thesis": ""},
         {"swing_days": None},
         {"swing_days": 21},
         {"risks": ["r"] * 6},
@@ -125,6 +128,16 @@ def test_bad_assessments_are_refused(bad):
 
 def test_intraday_needs_no_swing_days():
     assert Assessment.model_validate(GOOD | {"horizon": "intraday", "swing_days": None})
+
+
+@pytest.mark.parametrize("days", [5, 99, "x"])
+def test_intraday_swing_days_are_ignored(days):
+    a = Assessment.model_validate(GOOD | {"horizon": "intraday", "swing_days": days})
+    assert (a.horizon, a.swing_days) == ("intraday", None)
+
+
+def test_an_integer_invalidation_is_kept():
+    assert Assessment.model_validate(GOOD | {"invalidation": 101}).invalidation == 101
 
 
 # --- the loop -----------------------------------------------------------------------
@@ -191,6 +204,19 @@ async def test_a_bad_submission_gets_one_repair_turn():
     assert llm.requests[1]["tool_choice"] == {"type": "tool", "name": SUBMIT}
 
 
+@pytest.mark.parametrize(
+    ("bad", "field"),
+    [({"invalidation": True}, "invalidation"), ({"invalidation": "101"}, "invalidation"),
+     ({"thesis": ""}, "thesis")],
+)  # fmt: skip
+async def test_each_rejection_gets_the_repair_turn(bad, field):
+    result, llm, _, _ = await dive([submit(**(GOOD | bad)), submit(**GOOD)])
+    assert result.outcome == "submitted"
+    (error,) = tool_results(llm.requests[1])
+    assert field in error["error"]
+    assert llm.requests[1]["tool_choice"] == {"type": "tool", "name": SUBMIT}
+
+
 async def test_a_second_bad_submission_drops_the_dive():
     bad = submit(**(GOOD | {"score": 150}))
     result, llm, _, _ = await dive([bad, submit(**(GOOD | {"side": "short"}))])
@@ -206,11 +232,56 @@ async def test_a_repair_on_the_last_turn_still_gets_its_turn():
     assert result.outcome == "submitted"
 
 
+async def first_estimate() -> int:
+    """The input estimate of a dive's first request (a probe the budget refuses)."""
+    probe = RecordingMeter(run="0.001")
+    await run_dive(
+        ctx(), market=FakeMarketData(), events=FakeEvents(), llm=ScriptedLLM(), meter=probe,
+        settings=DiveSettings(),
+    )  # fmt: skip
+    return probe.estimates[0]
+
+
 async def test_too_many_input_tokens_ends_the_dive():
-    settings = DiveSettings(max_dive_input_tokens=1500)
-    script = [reply(tool_use("profile", {}, call_id=f"t{i}")) for i in range(3)]
-    result, _, _, _ = await dive(script, settings=settings)
-    assert (result.outcome, result.turns) == ("input_limit", 2)
+    # The bars result makes the second request's estimate cross the cap: it is never sent.
+    cap = await first_estimate() + 1500
+    settings = DiveSettings(max_dive_input_tokens=cap)
+    script = [reply(tool_use("daily_bars", {"days": 120}, call_id=f"t{i}")) for i in range(3)]
+    result, llm, _, _ = await dive(script, settings=settings)
+    assert (result.outcome, result.assessment, result.turns) == ("input_limit", None, 1)
+    assert len(llm.requests) == 1
+    assert result.input_tokens <= cap
+
+
+async def test_a_first_request_over_the_cap_is_never_sent():
+    result, llm, _, _ = await dive(
+        [submit(**GOOD)], settings=DiveSettings(max_dive_input_tokens=1000)
+    )
+    assert (result.outcome, result.assessment, llm.requests) == ("input_limit", None, [])
+
+
+async def test_no_tools_run_once_the_next_call_cannot_fit():
+    # The reply alone shows the next request (at least as large) would cross the cap.
+    cap = await first_estimate() + 100
+    events = FakeEvents()
+    events.news["NVDA"] = news("NVDA", 3)
+    big = [
+        reply(tool_use("news", {"days": 1}, call_id=f"n{i}"), input_tokens=4000) for i in range(2)
+    ]
+    result, llm, _, events = await dive(
+        big, settings=DiveSettings(max_dive_input_tokens=cap), events=events
+    )
+    assert (result.outcome, result.tool_calls, len(llm.requests)) == ("input_limit", 0, 1)
+    assert events.called("company_news") == []
+
+
+async def test_the_repair_turn_is_not_sent_past_the_cap():
+    cap = await first_estimate() + 100
+    bad = reply(tool_use(SUBMIT, GOOD | {"score": 150}, call_id="s"), input_tokens=4000)
+    result, llm, _, _ = await dive(
+        [bad, submit(**GOOD)], settings=DiveSettings(max_dive_input_tokens=cap)
+    )
+    assert (result.outcome, result.assessment, len(llm.requests)) == ("input_limit", None, 1)
 
 
 async def test_no_call_is_made_that_the_budget_cannot_cover():
@@ -369,15 +440,43 @@ async def test_the_trail_records_the_conversation():
     assert [m["role"] for m in trail["messages"]] == ["user", "assistant", "user", "assistant"]
     assert trail["assessment"]["score"] == 82
     json.dumps(trail)  # it must be storable as is
+    trail["messages"].clear()
+    assert len(result.messages) == 4  # the trail is a copy
+
+
+async def test_an_empty_reply_ends_the_dive():
+    result, llm, _, _ = await dive([reply(), submit(**GOOD)])
+    assert (result.outcome, result.assessment, len(llm.requests)) == ("llm_error", None, 1)
+    assert [m["role"] for m in result.messages] == ["user"]
+
+
+async def test_non_dict_tool_input_is_treated_as_empty():
+    calls = [
+        tool_use("profile", ["x"], call_id="p"),  # type: ignore[arg-type]
+        tool_use("daily_bars", "days=5", call_id="b"),  # type: ignore[arg-type]
+    ]
+    _, llm, _, _ = await dive([reply(*calls), submit(**GOOD)])
+    profile, bars = tool_results(llm.requests[1])
+    assert profile["industry"] == "Semiconductors"
+    assert bars == {"error": "days must be an integer from 1 to 120"}
+
+
+async def test_a_market_context_that_is_not_plain_json_does_not_crash_the_dive():
+    context = ctx(market_context={"vix": Decimal("18.5"), "day": TODAY})
+    result, llm, _, _ = await dive(
+        [reply(tool_use("market_context", {}, call_id="m")), submit(**GOOD)], context=context
+    )
+    assert result.outcome == "submitted"
+    assert tool_results(llm.requests[1]) == [{"vix": "18.5", "day": "2026-10-09"}]
 
 
 # --- the budget, beyond the brief ---------------------------------------------------
 
 
 class RecordingMeter(CostMeter):
-    def __init__(self) -> None:
+    def __init__(self, run: str = "3") -> None:
         prices = ResearchJobSettings().budget.prices
-        super().__init__(prices, run_usd=Decimal(3), day_remaining_usd=Decimal(8))
+        super().__init__(prices, run_usd=Decimal(run), day_remaining_usd=Decimal(8))
         self.estimates: list[int] = []
 
     def reserve(self, model, input_tokens, max_tokens):
@@ -451,19 +550,21 @@ async def test_an_exhausted_meter_stops_the_dive_before_any_call():
 
 async def test_an_overrun_stops_the_next_call():
     # The reply claims far more input than was reserved: the meter is exhausted after it.
-    huge = reply(tool_use("profile", {}), input_tokens=50_000)  # under the 60k dive limit
-    result, llm, _, _ = await dive([huge, submit(**GOOD)])
+    huge = reply(tool_use("profile", {}), input_tokens=50_000)
+    settings = DiveSettings(max_dive_input_tokens=500_000)  # far from the input cap
+    result, llm, _, _ = await dive([huge, submit(**GOOD)], settings=settings)
     assert (result.outcome, result.assessment, len(llm.requests)) == ("budget", None, 1)
 
 
 # --- the tools, beyond the brief ----------------------------------------------------
 
 
-async def test_options_without_a_price_is_an_error_result():
+@pytest.mark.parametrize("price", [None, float("nan"), float("inf"), 0.0, -1.0])
+async def test_options_without_a_usable_price_is_an_error_result(price):
     market = FakeMarketData()
     _, llm, market, _ = await dive(
         [reply(tool_use("options_liquidity", {}, call_id="o")), submit(**GOOD)],
-        context=ctx(quote=quote("NVDA", None, 100.0)),
+        context=ctx(quote=quote("NVDA", price, 100.0)),
         market=market,
     )
     assert tool_results(llm.requests[1]) == [{"error": "no price"}]
