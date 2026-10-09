@@ -1,4 +1,4 @@
-"""Command line: ``traider run | check | login | backtest``.
+"""Command line: ``traider run | check | login | backtest | settings``.
 
 ``check`` is the first thing to run against the real Schwab API. It only reads:
 it signs in, looks at the account, the calendar and the quotes, and tells you
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -20,6 +21,7 @@ from decimal import Decimal
 from typing import TextIO
 
 import aiohttp
+from pydantic import ValidationError
 
 from traider import app
 from traider.backtest import BacktestError, BacktestResult, load_bars_csv, run_backtest
@@ -45,6 +47,13 @@ from traider.schwab.tokens import (
     TokenManager,
     TokenStoreError,
     new_grant,
+)
+from traider.settings import Settings
+from traider.settings_store import (
+    DynamoSettingsStore,
+    SettingsConflict,
+    SettingsInvalid,
+    SettingsStore,
 )
 from traider.timeutil import ET, SystemClock, trading_date
 
@@ -440,6 +449,70 @@ async def _backtest(args: argparse.Namespace, config: Config, out: TextIO) -> in
     return 0
 
 
+# ------------------------------------------------------------------------- settings
+
+
+async def settings_show(store: SettingsStore, out: TextIO) -> int:
+    try:
+        latest = await store.latest()
+    except SettingsInvalid as exc:
+        out.write(f"newest version {exc.version} is invalid: {exc}\n")
+        return 1
+    if latest is None:
+        out.write("no settings stored yet; the bot writes version 1 when it first starts\n")
+        return 1
+    out.write(f"version {latest.version} by {latest.author} at {latest.at.isoformat()}\n")
+    out.write(json.dumps(latest.settings.model_dump(mode="json"), indent=2) + "\n")
+    return 0
+
+
+async def settings_history(store: SettingsStore, out: TextIO, *, limit: int = 20) -> int:
+    for version in await store.history(limit):
+        changed = ", ".join(version.diff) or "-"
+        out.write(
+            f"{version.version} {version.at.isoformat()} {version.author} "
+            f"[{changed}] {version.note}\n"
+        )
+    return 0
+
+
+def _read_settings_file(path: str) -> Settings:
+    with open(path, encoding="utf-8") as handle:
+        return Settings.model_validate(json.load(handle))
+
+
+async def settings_apply(
+    store: SettingsStore, path: str, out: TextIO, *, note: str, now: datetime
+) -> int:
+    try:
+        settings = await asyncio.to_thread(_read_settings_file, path)
+    except (OSError, ValueError, ValidationError) as exc:
+        out.write(f"invalid settings file: {exc}\n")
+        return 1
+    try:
+        latest = await store.latest()
+        expected = latest.version if latest is not None else 0
+    except SettingsInvalid as exc:
+        # The newest version is damaged. Writing on top of it is how an operator repairs it.
+        expected = exc.version
+    try:
+        written = await store.write(
+            settings, expected_version=expected, author="cli", note=note, now=now
+        )
+    except SettingsConflict as exc:
+        out.write(f"not written: {exc}. Run `traider settings show` and try again.\n")
+        return 1
+    out.write(f"wrote version {written.version}\n")
+    for key, (old, new) in written.diff.items():
+        out.write(f"  {key}: {old} -> {new}\n")
+    return 0
+
+
+def _settings_store(config: Config) -> SettingsStore:
+    assert config.settings_table is not None
+    return DynamoSettingsStore(app.Aws(config.aws_region).table(config.settings_table))
+
+
 # ----------------------------------------------------------------------------- main
 
 
@@ -470,6 +543,14 @@ def _parser() -> argparse.ArgumentParser:
         help="assumed bid-ask spread in basis points (default 2)",
     )
     backtest.add_argument("--cash", type=float, help="starting cash (default from configuration)")
+    settings = commands.add_parser("settings", help="read or change the bot's versioned settings")
+    actions = settings.add_subparsers(dest="action", required=True)
+    actions.add_parser("show", help="print the settings in force")
+    history = actions.add_parser("history", help="list earlier versions")
+    history.add_argument("--limit", type=int, default=20)
+    apply = actions.add_parser("apply", help="write a JSON file as the next version")
+    apply.add_argument("file")
+    apply.add_argument("--note", default="", help="why, kept with the version")
     return parser
 
 
@@ -491,6 +572,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
+    if args.command == "settings":
+        if not config.settings_table:
+            print("TRAIDER_SETTINGS_TABLE is not set", file=sys.stderr)
+            return 2
+        store = _settings_store(config)
+        if args.action == "show":
+            return asyncio.run(settings_show(store, sys.stdout))
+        if args.action == "history":
+            return asyncio.run(settings_history(store, sys.stdout, limit=args.limit))
+        return asyncio.run(
+            settings_apply(store, args.file, sys.stdout, note=args.note, now=SystemClock().now())
+        )
     try:
         if args.command == "check":
             return asyncio.run(check(config, sys.stdout))
