@@ -8,7 +8,7 @@ import pytest
 from moto import mock_aws
 
 from traider.research.models import Pick, Posture, RunMeta
-from traider.research.store import DynamoResearchStore, MemoryResearchStore
+from traider.research.store import DynamoResearchStore, MemoryResearchStore, ResearchWriter
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 T1 = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)
@@ -321,9 +321,46 @@ async def test_day_cost_adds_up_and_starts_at_zero(store):
     assert await store.day_cost("2026-10-08") == Decimal(0)
 
 
-async def test_a_cost_cannot_be_taken_back(store):
+@pytest.mark.parametrize("bad", [Decimal("-1"), Decimal("Infinity"), Decimal("NaN")])
+async def test_a_cost_cannot_be_taken_back(store, bad):
+    await store.add_day_cost(DAY, Decimal("2"))
     with pytest.raises(ValueError, match="only grow"):
-        await store.add_day_cost(DAY, Decimal("-1"))
+        await store.add_day_cost(DAY, bad)
+    assert await store.day_cost(DAY) == Decimal("2")
+
+
+class SpyTable:
+    """Wraps a table and records every call made through it."""
+
+    def __init__(self, table):
+        self._table = table
+        self.calls: list[tuple[str, dict]] = []
+
+    def __getattr__(self, name):
+        fn = getattr(self._table, name)
+
+        def spy(**kwargs):
+            self.calls.append((name, kwargs))
+            return fn(**kwargs)
+
+        return spy
+
+
+async def test_adding_to_the_day_cost_is_one_atomic_update(store):
+    if isinstance(store, MemoryResearchStore):
+        pytest.skip("atomicity is a DynamoDB matter")
+    spy = SpyTable(store._table)
+    store._table = spy
+    assert await store.add_day_cost(DAY, Decimal("1.5")) == Decimal("1.5")
+    assert [name for name, _ in spy.calls] == ["update_item"]
+    assert spy.calls[0][1]["UpdateExpression"] == "ADD usd :usd"
+    assert spy.calls[0][1]["Key"] == {"pk": f"COST#{DAY}", "sk": "TOTAL"}
+
+
+def test_both_stores_satisfy_the_writer_protocol():
+    memory: ResearchWriter = MemoryResearchStore()
+    dynamo: ResearchWriter = DynamoResearchStore(None)
+    assert memory is not None and dynamo is not None
 
 
 async def test_only_one_holder_of_a_lock_until_it_expires(store):

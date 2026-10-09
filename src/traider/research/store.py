@@ -60,7 +60,9 @@ class ResearchWriter(Protocol):
         self, meta: RunMeta, picks: Sequence[Pick], posture: Posture | None
     ) -> None: ...
 
-    async def runs_for_day(self, day: str, kind: RunKind) -> list[RunMeta]: ...
+    async def runs_for_day(self, day: str, kind: RunKind) -> list[RunMeta]:
+        """GSI reads are eventually consistent: the lock, not this, guards against double runs."""
+        ...
 
     async def add_day_cost(self, day: str, usd: Decimal) -> Decimal: ...
 
@@ -274,6 +276,7 @@ class DynamoResearchStore:
         await self._call(self._table.put_item, Item=_meta_item(meta))
 
     async def runs_for_day(self, day: str, kind: RunKind) -> list[RunMeta]:
+        """GSI reads are eventually consistent: the lock, not this, guards against double runs."""
         items: list[dict[str, Any]] = []
         kwargs: dict[str, Any] = {
             "IndexName": "gsi1",
