@@ -17,6 +17,7 @@ class Data:
     control: aws.ssm.Parameter
     table: aws.dynamodb.Table
     settings_table: aws.dynamodb.Table
+    research_table: aws.dynamodb.Table | None
     topic: aws.sns.Topic
 
 
@@ -83,9 +84,38 @@ def build(settings: Settings) -> Data:
         tags=tags,
     )
 
+    # Research (opt-in): what the research jobs decided each morning. The bot only reads
+    # it, by key (Query and GetItem). The index is for reports; the bot never uses it.
+    research_table = None
+    if settings.research:
+        research_table = aws.dynamodb.Table(
+            "research",
+            name=f"{prefix}-research",
+            billing_mode="PAY_PER_REQUEST",
+            hash_key="pk",
+            range_key="sk",
+            attributes=[
+                aws.dynamodb.TableAttributeArgs(name="pk", type="S"),
+                aws.dynamodb.TableAttributeArgs(name="sk", type="S"),
+                aws.dynamodb.TableAttributeArgs(name="gsi1pk", type="S"),
+                aws.dynamodb.TableAttributeArgs(name="gsi1sk", type="S"),
+            ],
+            global_secondary_indexes=[
+                aws.dynamodb.TableGlobalSecondaryIndexArgs(
+                    name="gsi1",
+                    hash_key="gsi1pk",
+                    range_key="gsi1sk",
+                    projection_type="ALL",
+                )
+            ],
+            point_in_time_recovery=aws.dynamodb.TablePointInTimeRecoveryArgs(enabled=True),
+            deletion_protection_enabled=settings.trading_mode == "live",
+            tags=tags,
+        )
+
     topic = aws.sns.Topic("alerts", name=f"{prefix}-alerts", tags=tags)
     if settings.alert_email:
         aws.sns.TopicSubscription(
             "alerts-email", topic=topic.arn, protocol="email", endpoint=settings.alert_email
         )
-    return Data(app_secret, token_secret, control, table, settings_table, topic)
+    return Data(app_secret, token_secret, control, table, settings_table, research_table, topic)

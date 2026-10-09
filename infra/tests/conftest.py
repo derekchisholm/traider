@@ -169,7 +169,11 @@ def deploy(config: dict[str, Any] | None = None, *, stack: str = "dev") -> Deplo
     """Run the program with this stack configuration and return what it declared."""
     recorder = Recorder()
     pulumi.runtime.set_mocks(recorder, project="traider", stack=stack, preview=False)
-    merged = {**BASE, **(config or {})}
+    # pinnedSymbols is the new name for symbols, and setting both is an error, so a test
+    # that sets one does not also get the other from BASE.
+    given = config or {}
+    base = {} if "pinnedSymbols" in given else BASE
+    merged = {**base, **given}
     pulumi.runtime.set_all_config(
         {
             "aws:region": REGION,

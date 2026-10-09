@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pulumi
 import pulumi_aws as aws
@@ -198,58 +199,65 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
     # The task role is what the bot's own code can do. Each statement names exact
     # resources. Note what is missing: it cannot change the control switch.
     task_role = aws.iam.Role("bot-task", assume_role_policy=_ECS_TRUST, tags=tags)
+    statements: list[dict[str, Any]] = [
+        {
+            "Sid": "ReadSchwabSecrets",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": [data.app_secret.arn, data.token_secret.arn],
+        },
+        {
+            "Sid": "SaveRotatedRefreshToken",
+            "Effect": "Allow",
+            "Action": "secretsmanager:PutSecretValue",
+            "Resource": data.token_secret.arn,
+        },
+        {
+            "Sid": "ReadControlSwitch",
+            "Effect": "Allow",
+            "Action": "ssm:GetParameter",
+            "Resource": data.control.arn,
+        },
+        {
+            "Sid": "State",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem",
+                "dynamodb:Query",
+            ],
+            "Resource": data.table.arn,
+        },
+        {
+            "Sid": "Settings",
+            "Effect": "Allow",
+            "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"],
+            "Resource": data.settings_table.arn,
+        },
+        {
+            "Sid": "Alerts",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": data.topic.arn,
+        },
+    ]
+    if data.research_table is not None:
+        # Read only, by key. Not the index (that is for reports), and no writes: the
+        # research jobs own this table.
+        statements.append(
+            {
+                "Sid": "Research",
+                "Effect": "Allow",
+                "Action": ["dynamodb:Query", "dynamodb:GetItem"],
+                "Resource": data.research_table.arn,
+            }
+        )
     task_policy = aws.iam.RolePolicy(
         "bot-task",
         role=task_role.id,
-        policy=pulumi.Output.json_dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Sid": "ReadSchwabSecrets",
-                        "Effect": "Allow",
-                        "Action": "secretsmanager:GetSecretValue",
-                        "Resource": [data.app_secret.arn, data.token_secret.arn],
-                    },
-                    {
-                        "Sid": "SaveRotatedRefreshToken",
-                        "Effect": "Allow",
-                        "Action": "secretsmanager:PutSecretValue",
-                        "Resource": data.token_secret.arn,
-                    },
-                    {
-                        "Sid": "ReadControlSwitch",
-                        "Effect": "Allow",
-                        "Action": "ssm:GetParameter",
-                        "Resource": data.control.arn,
-                    },
-                    {
-                        "Sid": "State",
-                        "Effect": "Allow",
-                        "Action": [
-                            "dynamodb:GetItem",
-                            "dynamodb:PutItem",
-                            "dynamodb:UpdateItem",
-                            "dynamodb:DeleteItem",
-                            "dynamodb:Query",
-                        ],
-                        "Resource": data.table.arn,
-                    },
-                    {
-                        "Sid": "Settings",
-                        "Effect": "Allow",
-                        "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"],
-                        "Resource": data.settings_table.arn,
-                    },
-                    {
-                        "Sid": "Alerts",
-                        "Effect": "Allow",
-                        "Action": "sns:Publish",
-                        "Resource": data.topic.arn,
-                    },
-                ],
-            }
-        ),
+        policy=pulumi.Output.json_dumps({"Version": "2012-10-17", "Statement": statements}),
     )
 
     environment: dict[str, pulumi.Input[str]] = {
@@ -261,6 +269,8 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
         "TRAIDER_SETTINGS_TABLE": data.settings_table.name,
         "TRAIDER_ALERT_TOPIC_ARN": data.topic.arn,
     }
+    if data.research_table is not None:
+        environment["TRAIDER_RESEARCH_TABLE"] = data.research_table.name
     container = {
         "name": "bot",
         "image": image,

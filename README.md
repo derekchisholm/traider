@@ -258,8 +258,8 @@ cd infra
 pulumi login                 # Pulumi Cloud; or `pulumi login --local`
 pulumi stack init dev
 pulumi config set aws:region us-east-1
-pulumi config set --path 'traider:symbols[0]' SPY
-pulumi config set --path 'traider:symbols[1]' QQQ
+pulumi config set --path 'traider:pinnedSymbols[0]' SPY
+pulumi config set --path 'traider:pinnedSymbols[1]' QQQ
 pulumi config set traider:alertEmail you@example.com
 # The placeholder strategy holds `position_usd` worth of each symbol (500 by default)
 # and buys whole shares, so a share priced above that means it buys nothing. To see
@@ -372,7 +372,8 @@ the last good settings in force. `traider check` and `traider backtest` still us
 `traider check` reads price history (and the option chain, with `allow_options` on)
 for SPY and says so; with pinned symbols it uses the first one.
 `traider research seed FILE` writes research by hand for paper testing and
-`traider research show` prints what the bot would read (see the
+`traider research show` prints what the bot would read (both need `traider:research: true`
+on the stack, which is off by default; see the
 [runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
 
 To run the command line on your own machine against a deployed stack, use the

@@ -261,7 +261,9 @@ If the newest version is damaged and has no readable version number,
 table first.
 
 **Write research by hand** (paper testing, before the research jobs exist). With
-`TRAIDER_RESEARCH_TABLE` set in the `localEnv` output, write a file like this:
+`TRAIDER_RESEARCH_TABLE` set in the `localEnv` output (it is there once the stack has
+`traider:research: true`, which creates the table and is off by default), write a file
+like this:
 
 ```json
 {

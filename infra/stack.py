@@ -42,7 +42,8 @@ def build() -> Stack:
     # secrets live. The trading mode, the control switch and the state table are left
     # out on purpose, so nothing run locally with this can send a live order. The
     # settings table is included so `traider settings` works locally; settings cannot
-    # place orders.
+    # place orders. The same goes for the research table (when research is on), so
+    # `traider research seed|show` works: those commands never reach Schwab.
     local: dict[str, pulumi.Input[str]] = {
         "AWS_REGION": aws.get_region_output().region,
         **{k: v for k, v in settings.bot_env.items() if k != "TRAIDER_TRADING_MODE"},
@@ -50,11 +51,16 @@ def build() -> Stack:
         "TRAIDER_SCHWAB_TOKEN_SECRET_ID": store.token_secret.arn,
         "TRAIDER_SETTINGS_TABLE": store.settings_table.name,
     }
+    if store.research_table is not None:
+        local["TRAIDER_RESEARCH_TABLE"] = store.research_table.name
     if settings.callback_url:
         # Paste mode: `traider login` must use the same registered address.
         local["TRAIDER_SCHWAB_CALLBACK_URL"] = settings.callback_url
     local_env = pulumi.Output.all(**local).apply(
         lambda values: "\n".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
+    )
+    research_outputs: dict[str, pulumi.Input[str]] = (
+        {"researchTable": store.research_table.name} if store.research_table is not None else {}
     )
     return Stack(
         outputs={
@@ -67,6 +73,7 @@ def build() -> Stack:
             "tokenSecretArn": store.token_secret.arn,
             "stateTable": store.table.name,
             "settingsTable": store.settings_table.name,
+            **research_outputs,
             "alertTopicArn": store.topic.arn,
             "clusterName": deployed.cluster_name,
             "serviceName": deployed.service_name,

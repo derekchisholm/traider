@@ -31,7 +31,11 @@ _PASS_THROUGH = {
     "accountHash": "TRAIDER_SCHWAB_ACCOUNT_HASH",
     "logLevel": "TRAIDER_LOG_LEVEL",
 }
-_JSON = {"strategyParams": "TRAIDER_STRATEGY_PARAMS", "risk": "TRAIDER_RISK"}
+_JSON = {
+    "strategyParams": "TRAIDER_STRATEGY_PARAMS",
+    "risk": "TRAIDER_RISK",
+    "researchSettings": "TRAIDER_RESEARCH",
+}
 _BOOL = {"cancelUnknownOrders": "TRAIDER_CANCEL_UNKNOWN_ORDERS"}
 
 
@@ -39,7 +43,8 @@ _BOOL = {"cancelUnknownOrders": "TRAIDER_CANCEL_UNKNOWN_ORDERS"}
 class Settings:
     prefix: str  # e.g. traider-dev: unique per stack
     trading_mode: str
-    symbols: tuple[str, ...]
+    symbols: tuple[str, ...]  # the pinned symbols; may be empty when research is on
+    research: bool
     bot_env: dict[str, str]  # everything the bot needs that is known before deploy
     alert_email: str | None
     callback_url: str | None  # override; None means "the hosted callback"
@@ -62,25 +67,38 @@ def _time(config: pulumi.Config, key: str, default: str) -> tuple[int, int]:
     return int(match[1]), int(match[2])
 
 
-def _symbols(config: pulumi.Config) -> tuple[str, ...]:
-    raw: Any = config.get_object("symbols")
-    if raw is None:
+def _symbols(config: pulumi.Config, *, research: bool) -> tuple[str, ...]:
+    """The pinned symbols. ``symbols`` is the older name for ``pinnedSymbols``."""
+    pinned: Any = config.get_object("pinnedSymbols")
+    alias: Any = config.get_object("symbols")
+    if pinned is not None and alias is not None:
         raise ValueError(
-            "traider:symbols is required, for example: pulumi config set "
-            "--path 'traider:symbols[0]' SPY"
+            "traider:pinnedSymbols and traider:symbols are the same setting: set only "
+            "traider:pinnedSymbols"
         )
+    raw = pinned if pinned is not None else alias
     if isinstance(raw, str):
         raw = raw.split(",")
-    return tuple(str(item).strip().upper() for item in raw if str(item).strip())
+    symbols = tuple(str(item).strip().upper() for item in raw or () if str(item).strip())
+    if not symbols and not research:
+        raise ValueError(
+            "traider:pinnedSymbols (or traider:symbols) needs at least one symbol unless "
+            "traider:research is on, for example: pulumi config set "
+            "--path 'traider:pinnedSymbols[0]' SPY"
+        )
+    return symbols
 
 
 def load() -> Settings:
     config = pulumi.Config()
     prefix = f"{pulumi.get_project()}-{pulumi.get_stack()}"
-    symbols = _symbols(config)
+    research = bool(config.get_bool("research"))
+    symbols = _symbols(config, research=research)
     mode = config.get("tradingMode") or "paper"
 
-    env: dict[str, str] = {"TRAIDER_TRADING_MODE": mode, "TRAIDER_SYMBOLS": ",".join(symbols)}
+    env: dict[str, str] = {"TRAIDER_TRADING_MODE": mode}
+    if symbols:  # with research on and nothing pinned, the variable is left out
+        env["TRAIDER_SYMBOLS"] = ",".join(symbols)
     for key, name in _PASS_THROUGH.items():
         value = config.get(key)
         if value is not None and value != "":
@@ -94,12 +112,14 @@ def load() -> Settings:
         if flag is not None:
             env[name] = "true" if flag else "false"
 
-    # Check it the way the bot will. The two placeholders stand in for resources
-    # this stack creates, which the bot requires in live mode.
+    # Check it the way the bot will. The placeholders stand in for resources this stack
+    # creates: the bot requires two in live mode, and the research table is what lets it
+    # run with no pinned symbols.
+    placeholders = {"TRAIDER_CONTROL_PARAM": "/placeholder", "TRAIDER_STATE_TABLE": "placeholder"}
+    if research:
+        placeholders["TRAIDER_RESEARCH_TABLE"] = "placeholder"
     try:
-        checked = Config.from_env(
-            {**env, "TRAIDER_CONTROL_PARAM": "/placeholder", "TRAIDER_STATE_TABLE": "placeholder"}
-        )
+        checked = Config.from_env({**env, **placeholders})
         create_strategy(checked.strategy, checked.symbols, checked.strategy_params)
     except (ConfigError, ValueError) as exc:
         raise ValueError(f"the bot would reject this configuration: {exc}") from None
@@ -124,6 +144,7 @@ def load() -> Settings:
         prefix=prefix,
         trading_mode=mode,
         symbols=symbols,
+        research=research,
         bot_env=env,
         alert_email=alert_email,
         callback_url=config.get("schwabCallbackUrl"),
