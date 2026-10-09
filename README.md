@@ -220,7 +220,19 @@ uv run ruff check . && uv run mypy
 # CSV columns: timestamp (ISO 8601 with a timezone, or Unix seconds), open, high,
 # low, close, and optionally volume and symbol.
 TRAIDER_SYMBOLS=SPY uv run traider backtest --csv bars.csv --symbol SPY
+
+# Replay research too: one JSON Lines row per pick or posture, each with a "day".
+# Pick rows use the seed file's pick fields; a posture row is
+# {"day": "2026-10-06", "posture": "trade" | "reduced" | "stand_aside"}.
+uv run traider backtest --csv bars.csv --picks picks.jsonl
 ```
+
+With `--picks`, each day's rows become a research run for that day, read through the same
+gate as live: only picked symbols open positions on a day, and the day's posture applies. A
+day with pick rows and no posture row is a `trade` day; a day with no rows at all has no
+posture, so nothing opens. Bars may be for pinned symbols or any symbol in the picks, and
+`--schwab-days` downloads both. Intraday picks last until that day's close; swing picks
+carry to later days as they do live.
 
 A backtest checks that a strategy and its limits behave the way you intended. It
 does not predict live results.

@@ -16,6 +16,7 @@ from traider.research.models import (
     Pick,
     Posture,
     PostureLevel,
+    RunKind,
     RunMeta,
     RunStatus,
 )
@@ -71,13 +72,18 @@ def _expiry(raw: Mapping[str, Any], horizon: Horizon, today: date) -> datetime:
 
 
 def build_manual_run(
-    data: Mapping[str, Any], now: datetime
+    data: Mapping[str, Any],
+    now: datetime,
+    *,
+    run_id: str | None = None,
+    kind: RunKind = "manual",
 ) -> tuple[RunMeta, list[Pick], Posture | None]:
+    """Validate ``data`` and build the run. A backtest passes its own ``run_id`` and ``kind``."""
     if now.tzinfo is None:
         raise ValueError("now must carry a timezone")
     root = _mapping(data, "the seed file", _TOP_KEYS)
     now = now.astimezone(UTC)
-    run_id = f"manual-{now:%Y%m%dT%H%M%SZ}"
+    run_id = run_id or f"manual-{now:%Y%m%dT%H%M%SZ}"
     today = trading_date(now)
 
     raw_picks = root.get("picks", [])
@@ -123,7 +129,7 @@ def build_manual_run(
 
     meta = RunMeta(
         run_id=run_id,
-        kind="manual",
+        kind=kind,
         status=RunStatus.OK,
         started_at=now,
         finished_at=now,

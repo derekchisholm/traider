@@ -15,7 +15,7 @@ import os
 import secrets
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, TextIO
@@ -25,10 +25,17 @@ from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import ValidationError
 
 from traider import app
-from traider.backtest import BacktestError, BacktestResult, load_bars_csv, run_backtest
+from traider.backtest import (
+    BacktestError,
+    BacktestResult,
+    load_bars_csv,
+    load_picks_jsonl,
+    pick_symbols,
+    run_backtest,
+)
 from traider.broker.base import BrokerError
 from traider.broker.schwab import SchwabBroker
-from traider.config import Config, ConfigError, RiskLimits
+from traider.config import Config, ConfigError, RiskLimits, check_symbols
 from traider.log import setup_logging
 from traider.models import Bar
 from traider.research.seed import build_manual_run
@@ -395,10 +402,19 @@ async def download_bars(
     config: Config,
     *,
     days: int,
+    picks: Sequence[Mapping[str, Any]] | None = None,
     schwab_base_url: str = API_BASE,
     token_url: str = TOKEN_URL,
 ) -> list[Bar]:
-    """One-minute regular-session bars for every configured symbol from Schwab."""
+    """One-minute regular-session bars from Schwab for the pinned symbols and, with
+    ``picks``, every symbol the picks name."""
+    symbols = _backtest_symbols(config, picks)
+    if not symbols:
+        raise BacktestError("no symbols to download: pin symbols or give --picks")
+    try:
+        check_symbols(tuple(symbols))
+    except ValueError as exc:  # a pick row names something that is not an equity symbol
+        raise BacktestError(f"cannot download bars: {exc}") from None
     aws = app.Aws(config.aws_region)
     clock = SystemClock()
     tokens = TokenManager(
@@ -411,16 +427,25 @@ async def download_bars(
     bars: list[Bar] = []
     async with aiohttp.ClientSession() as http:
         client = SchwabClient(http, tokens, base_url=schwab_base_url)
-        for symbol in config.symbols:
+        for symbol in symbols:
             raw = await client.price_history(symbol, now - timedelta(days=days), now)
             bars.extend(parse_candles(raw, symbol))
     return bars
 
 
-def print_result(result: BacktestResult, config: Config, out: TextIO) -> None:
-    out.write(
-        f"Backtest: {', '.join(config.symbols)} | {config.strategy} {config.strategy_params}\n"
-    )
+def _backtest_symbols(config: Config, picks: Sequence[Mapping[str, Any]] | None) -> list[str]:
+    """The pinned symbols, then the symbols named by pick rows."""
+    return [*config.symbols, *(s for s in pick_symbols(picks or ()) if s not in config.symbols)]
+
+
+def print_result(
+    result: BacktestResult,
+    config: Config,
+    out: TextIO,
+    picks: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    symbols = ", ".join(_backtest_symbols(config, picks)) or "none"
+    out.write(f"Backtest: {symbols} | {config.strategy} {config.strategy_params}\n")
     out.write(f"{result.bars} bars replayed, {len(result.trades)} trades\n\n")
     out.write(f"Start equity   {_money(result.start_equity):>14}\n")
     out.write(f"End equity     {_money(result.end_equity):>14}\n")
@@ -453,17 +478,19 @@ def print_result(result: BacktestResult, config: Config, out: TextIO) -> None:
 
 
 async def _backtest(args: argparse.Namespace, config: Config, out: TextIO) -> int:
+    picks = load_picks_jsonl(args.picks) if args.picks else None
     if args.csv:
         bars = [bar for path in args.csv for bar in load_bars_csv(path, args.symbol)]
     else:
-        bars = await download_bars(config, days=args.schwab_days)
+        bars = await download_bars(config, days=args.schwab_days, picks=picks)
     result = await run_backtest(
         bars,
         config,
         spread_bps=Decimal(str(args.spread_bps)),
         starting_cash=Decimal(str(args.cash)) if args.cash is not None else None,
+        picks=picks,
     )
-    print_result(result, config, out)
+    print_result(result, config, out, picks)
     return 0
 
 
@@ -633,6 +660,12 @@ def _parser() -> argparse.ArgumentParser:
         help="assumed bid-ask spread in basis points (default 2)",
     )
     backtest.add_argument("--cash", type=float, help="starting cash (default from configuration)")
+    backtest.add_argument(
+        "--picks",
+        metavar="FILE",
+        help="replay research: a JSON Lines file of picks and postures, one row per line, "
+        'each with a "day"',
+    )
     settings = commands.add_parser("settings", help="read or change the bot's versioned settings")
     actions = settings.add_subparsers(dest="action", required=True)
     show = actions.add_parser("show", help="print the settings in force as JSON")

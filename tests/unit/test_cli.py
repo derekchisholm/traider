@@ -376,6 +376,50 @@ async def test_history_for_a_backtest_can_be_downloaded_from_schwab(schwab, tmp_
     assert span == 2 * 86400 * 1000
 
 
+async def test_a_backtest_download_with_picks_fetches_pinned_and_picked_symbols(schwab, tmp_path):
+    sign_in(schwab, tmp_path)
+    minute = (int(time.time()) // 60 - 10) * 60 * 1000
+    for symbol in ("SPY", "NVDA"):
+        schwab.candles[symbol] = [
+            {"open": 1, "high": 1, "low": 1, "close": 1, "volume": 5, "datetime": minute}
+        ]
+    picks = [{"day": "2026-10-06", "symbol": "NVDA"}, {"day": "2026-10-06", "posture": "trade"}]
+    bars = await cli.download_bars(
+        config(tmp_path, symbols=("SPY",)),
+        days=2,
+        picks=picks,
+        schwab_base_url=schwab.base_url,
+        token_url=schwab.token_url,
+    )
+    assert [bar.symbol for bar in bars] == ["SPY", "NVDA"]
+
+
+async def test_a_backtest_download_needs_symbols_from_the_config_or_the_picks(schwab, tmp_path):
+    sign_in(schwab, tmp_path)
+    research_only = config(tmp_path, symbols=(), research_table="research")
+    with pytest.raises(cli.BacktestError, match="--picks"):
+        await cli.download_bars(
+            research_only,
+            days=2,
+            schwab_base_url=schwab.base_url,
+            token_url=schwab.token_url,
+        )
+    assert schwab.calls("GET", "/pricehistory") == []
+
+
+async def test_a_backtest_download_refuses_a_pick_that_is_not_a_symbol(schwab, tmp_path):
+    sign_in(schwab, tmp_path)
+    with pytest.raises(cli.BacktestError, match="cannot download"):
+        await cli.download_bars(
+            config(tmp_path, symbols=("SPY",)),
+            days=2,
+            picks=[{"day": "2026-10-06", "symbol": "../x"}],
+            schwab_base_url=schwab.base_url,
+            token_url=schwab.token_url,
+        )
+    assert schwab.calls("GET", "/pricehistory") == []
+
+
 CSV = """timestamp,open,high,low,close,volume
 2026-10-08T15:00:00Z,100,100,100,100,1000
 2026-10-08T15:01:00Z,101,101,101,101,1000
@@ -437,3 +481,42 @@ def test_the_package_runs_as_a_module():
     assert result.returncode == 0
     for command in ("run", "check", "login", "backtest"):
         assert command in result.stdout
+
+
+PICKS_CSV = "timestamp,open,high,low,close,volume,symbol\n" + "".join(
+    f"2026-10-06T{13 + (31 + i) // 60}:{(31 + i) % 60:02d}:00Z,"
+    f"{100 + i / 10},{100 + i / 10},{100 + i / 10},{100 + i / 10},1000,NVDA\n"
+    for i in range(30)
+)
+
+
+def test_backtest_command_replays_picks_with_a_research_only_config(monkeypatch, tmp_path, capsys):
+    for name in list(os.environ):
+        if name.startswith("TRAIDER_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("TRAIDER_RESEARCH_TABLE", "research")
+    monkeypatch.setenv("TRAIDER_STRATEGY_PARAMS", '{"fast": 1, "slow": 2, "position_usd": 300}')
+    bars = tmp_path / "bars.csv"
+    bars.write_text(PICKS_CSV)
+    picks = tmp_path / "picks.jsonl"
+    picks.write_text(
+        '{"day": "2026-10-06", "symbol": "NVDA", "side": "long", "horizon": "intraday", '
+        '"score": 90, "thesis": "t", "invalidation": "1"}\n'
+    )
+    code = cli.main(["backtest", "--csv", str(bars), "--picks", str(picks), "--spread-bps", "0"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert "Backtest: NVDA" in captured.out
+    assert "BUY" in captured.out
+
+
+def test_backtest_command_names_the_bad_line_in_a_picks_file(env, tmp_path, capsys):
+    bars = tmp_path / "bars.csv"
+    bars.write_text(CSV)
+    picks = tmp_path / "picks.jsonl"
+    picks.write_text("oops\n")
+    code = cli.main(["backtest", "--csv", str(bars), "--symbol", "SPY", "--picks", str(picks)])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "line 1" in captured.err
+    assert "Traceback" not in captured.err
