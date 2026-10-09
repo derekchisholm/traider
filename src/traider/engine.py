@@ -681,8 +681,14 @@ class Engine:
                 continue
             self._ledger[symbol] = entry
 
+    def _ledger_entry(self, symbol: str) -> LedgerEntry | None:
+        """The symbol's ledger entry, for decisions that depend on how it is held. None
+        while the ledger is not loaded: a copy kept from before a failed reload may be out
+        of date. (Universe membership still uses that copy, so nothing is dropped.)"""
+        return self._ledger.get(symbol) if self._ledger_ok else None
+
     def _ledger_horizon(self, symbol: str) -> str:
-        entry = self._ledger.get(symbol)
+        entry = self._ledger_entry(symbol)
         return entry.horizon if entry is not None else "swing"
 
     def _intraday_closing(self, now: datetime) -> bool:
@@ -697,8 +703,9 @@ class Engine:
         )
 
     def _intraday_flatten(self, symbol: str, now: datetime) -> bool:
-        """An intraday position the bot opened, and the close is near: it is sold."""
-        entry = self._ledger.get(symbol)
+        """An intraday position the bot opened, and the close is near: it is sold. Never
+        while the ledger is not loaded (see _ledger_outage, which alerts instead)."""
+        entry = self._ledger_entry(symbol)
         return entry is not None and entry.horizon == "intraday" and self._intraday_closing(now)
 
     # ---------------------------------------------------------------- universe
@@ -1443,7 +1450,7 @@ class Engine:
         pick = view.pick(root, now)
         level = view.level
         factor = s.reduced_factor if level is PostureLevel.REDUCED else Decimal(1)
-        entry = self._ledger.get(order.symbol)
+        entry = self._ledger_entry(order.symbol)
         if entry is not None:
             horizon = entry.horizon
         else:

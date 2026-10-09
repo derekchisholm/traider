@@ -497,3 +497,36 @@ async def test_without_research_unpinning_still_warns_about_the_restart(tmp_path
     await h.settle()
     await pin(h, store, ("SPY",))
     assert [k for k in h.alert_keys() if k.startswith("unpinned_")] == ["unpinned_but_held:2"]
+
+
+async def test_a_stale_ledger_flattens_nothing_but_keeps_the_universe(tmp_path):
+    h = await researched(tmp_path, picks=[("NVDA", "long", "intraday")])
+    h.price("NVDA", "100.00", "100.02")
+    await h.target("NVDA", 2)
+    await h.settle()
+    assert h.position("NVDA") == 2
+    assert h.engine._ledger["NVDA"].horizon == "intraday"
+
+    # The lease moves away and back, and the reload on winning it fails: the bot keeps an
+    # in-memory copy that may be out of date.
+    h.store.ledger = _broken_ledger
+    lease = h.store.acquire_lease
+
+    async def refuse(*_args, **_kwargs):
+        return False
+
+    h.store.acquire_lease = refuse
+    await h.run_for(15)
+    assert not h.engine.is_leader
+    h.store.acquire_lease = lease
+    await h.run_for(15)
+    assert h.engine.is_leader
+    assert "NVDA" in h.engine._ledger  # the stale copy is still there
+
+    close = datetime(2026, 10, 8, 20, 0, tzinfo=UTC)
+    h.clock.set(close - timedelta(minutes=14))
+    await h.settle(30)
+    assert h.position("NVDA") == 2  # not flattened on the stale copy
+    assert not [o for o in h.broker.placed if o.side.value == "SELL"]
+    assert ledger_alerts(h, "ledger_not_loaded_close")
+    assert "NVDA" in h.engine.universe  # still the bot's for universe purposes
