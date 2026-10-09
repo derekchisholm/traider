@@ -174,6 +174,7 @@ class FakeSchwab:
         # Market data
         self.quotes: dict[str, dict[str, Any]] = {}
         self.candles: dict[str, list[dict[str, Any]]] = {}
+        self.movers: dict[str, list[dict[str, Any]]] = {}  # index -> screeners
         self.market_open = True
         self.session_start = "09:30:00"
         self.session_end = "16:00:00"
@@ -209,6 +210,7 @@ class FakeSchwab:
         app.router.add_get("/marketdata/v1/pricehistory", self._price_history)
         app.router.add_get("/marketdata/v1/chains", self._chains)
         app.router.add_get("/marketdata/v1/markets", self._markets)
+        app.router.add_get("/marketdata/v1/movers/{index}", self._movers)
         app.router.add_get("/ws", self._stream)
         self._server = TestServer(app)
         await self._server.start_server()
@@ -781,6 +783,11 @@ class FakeSchwab:
         if end is not None:
             candles = [c for c in candles if c["datetime"] <= int(end)]
         return web.json_response({"candles": candles, "symbol": symbol, "empty": not candles})
+
+    async def _movers(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        return web.json_response({"screeners": self.movers.get(request.match_info["index"], [])})
 
     async def _markets(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
