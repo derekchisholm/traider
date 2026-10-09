@@ -1,0 +1,96 @@
+# Every setting the stack understands, with its default.
+#
+# This file is a catalogue, not a stack file: Pulumi keeps each stack's settings in
+# Pulumi.<stack>.yaml, which `pulumi stack init` and `pulumi config set` create. Copy
+# the lines you want from here into that file's `config:` section, or set them with
+# `pulumi config set`. Only `traider:symbols` is required; everything commented out
+# below shows its default.
+#
+# `pulumi preview` checks the settings with the bot's own validation, so a misspelled
+# limit fails there and not in the running bot.
+
+config:
+  aws:region: us-east-1
+
+  # --- What to trade ------------------------------------------------------------
+  traider:symbols:
+    - SPY
+    - QQQ
+
+  # The shipped strategy is a placeholder (a moving-average cross) that exists to
+  # exercise the plumbing. It is not a recommendation. Write your own in
+  # src/traider/strategy/ and name it here.
+  # traider:strategy: sma_cross
+  # traider:strategyParams:
+  #   fast: 5            # bars in the fast average (one-minute bars)
+  #   slow: 20           # bars in the slow average
+  #   position_usd: 500  # dollars to hold while the fast average is above the slow
+
+  # --- Paper or live ------------------------------------------------------------
+  # paper: the bot reads real Schwab market data but fills orders itself. Nothing
+  #        is sent to Schwab.
+  # live:  real orders. This is only the first of two switches: after deploying you
+  #        must also set the control parameter to "live" (see the README).
+  # traider:tradingMode: paper
+  # traider:paperStartingCash: 10000
+
+  # Required for live: the last four digits of the Schwab account to trade in.
+  # Keep the quotes, or a leading zero is lost.
+  # traider:accountLast4: "1234"
+
+  # --- Limits -------------------------------------------------------------------
+  # Give any subset; the rest keep their defaults. Unknown names are rejected.
+  # traider:risk:
+  #   max_order_usd: 500             # largest single buy
+  #   max_position_usd: 1000         # largest holding in one symbol
+  #   max_total_exposure_usd: 2000   # largest total across all symbols
+  #   max_shares_per_order: 500
+  #   require_cash: true             # buys must be covered by available cash (no margin)
+  #   settled_cash_only: true        # ...and not by money from a sale made today.
+  #                                  # Needed in a cash account; a margin account can set false.
+  #   max_orders_per_day: 20
+  #   order_cooldown_s: 30           # per symbol, between orders
+  #   max_daily_loss_usd: 100        # stop opening positions for the day beyond this
+  #   min_price: 5
+  #   max_spread_bps: 20
+  #   max_quote_age_s: 15
+  #   max_feed_silence_s: 30
+  #   max_limit_deviation_bps: 100
+  #   entry_delay_min_after_open: 1
+  #   entry_cutoff_min_before_close: 5
+  #   min_token_hours_for_entry: 2   # no new buys when the Schwab sign-in is about to lapse
+
+  # --- Orders -------------------------------------------------------------------
+  # traider:orderType: LIMIT          # LIMIT or MARKET
+  # traider:limitOffsetBps: 5         # how far through the quote a limit is priced
+  # traider:orderTimeoutS: 20         # cancel and reconsider an unfilled order after this
+  # traider:flattenBeforeCloseMin: 10 # close the bot's positions this long before the close (default: off)
+  # traider:cancelUnknownOrders: false # only for an account nothing else trades in
+
+  # --- Market data --------------------------------------------------------------
+  # traider:feed: stream              # stream (with polling as fallback) or poll
+  # traider:pollIntervalS: 5
+
+  # --- Alerts -------------------------------------------------------------------
+  # AWS emails a confirmation link to this address; alerts start after you click it.
+  # Required for live trading.
+  # traider:alertEmail: you@example.com
+  # traider:reauthWarnHours: 48       # warn this long before the weekly sign-in lapses
+  # traider:watchdogSchedule: "cron(0 16 * * ? *)"   # UTC; when the daily check runs
+
+  # --- When the bot runs --------------------------------------------------------
+  # By default the task runs on weekdays from startTime to stopTime, New York time.
+  # traider:alwaysOn: false
+  # traider:startTime: "09:00"
+  # traider:stopTime: "16:30"
+
+  # --- Build and logs -----------------------------------------------------------
+  # traider:cpuArchitecture: ARM64    # or X86_64 if your machine cannot build ARM images
+  # traider:image: <registry>/<repository>@sha256:<digest>   # skip the build, run this image
+  # traider:logRetentionDays: 30
+  # traider:logLevel: INFO
+
+  # --- Schwab sign-in -----------------------------------------------------------
+  # Leave unset to use the hosted callback address this stack creates. Set it only
+  # if Schwab will not accept that address for your app (see the README).
+  # traider:schwabCallbackUrl: https://127.0.0.1

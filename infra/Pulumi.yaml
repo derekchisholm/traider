@@ -1,0 +1,6 @@
+name: traider
+description: Schwab trading bot on AWS Fargate, with a sign-in endpoint and alerts
+runtime:
+  name: python
+  options:
+    toolchain: uv

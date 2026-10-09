@@ -1,0 +1,51 @@
+[project]
+name = "traider-infra"
+version = "0.1.0"
+description = "Pulumi program that deploys traider to AWS"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pulumi>=3.268,<4",
+    "pulumi-aws>=7.50,<8",
+    "pulumi-docker-build>=0.0.22,<0.1",
+    "pulumi-random>=4.21,<5",
+    # The bot itself, so a bad bot configuration fails `pulumi preview` instead of
+    # crash-looping the container after deploy.
+    "traider",
+]
+
+[dependency-groups]
+dev = ["pytest>=9", "ruff>=0.16", "mypy>=2.4"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+traider = { path = "..", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "error",
+    # Raised inside the Pulumi SDKs themselves, on import and when run under mocks.
+    "ignore::DeprecationWarning:pulumi.*",
+    "ignore::DeprecationWarning:pulumi_aws.*",
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+files = ["__main__.py", "stack.py", "bot.py", "data.py", "lambdas.py", "network.py", "settings.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "C4", "RET"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+# Resource type names and made-up mock values look like passwords to the linter.
+"tests/**" = ["S105", "S106"]
