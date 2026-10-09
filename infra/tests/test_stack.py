@@ -998,6 +998,23 @@ def test_local_env_lets_the_cli_seed_and_show_research():
     assert local_env(on)["TRAIDER_RESEARCH_TABLE"] == on.one(TABLE, "research").inputs["name"]
 
 
+def test_a_live_stack_with_research_on_still_keeps_live_trading_out_of_local_env():
+    live_on = deploy(
+        {
+            "research": True,
+            "tradingMode": "live",
+            "accountLast4": "5678",
+            "alertEmail": "ops@example.test",
+        }
+    )
+    lines = local_env(live_on)
+    assert lines["TRAIDER_RESEARCH_TABLE"] == live_on.one(TABLE, "research").inputs["name"]
+    assert "TRAIDER_TRADING_MODE" not in lines
+    assert "TRAIDER_CONTROL_PARAM" not in lines
+    assert "TRAIDER_STATE_TABLE" not in lines
+    assert Config.from_env(lines).trading_mode == "paper"
+
+
 def test_research_with_no_pinned_symbols_is_a_configuration_the_bot_accepts():
     on = deploy({"research": True, "pinnedSymbols": []})
     for env in (environment(on), local_env(on)):

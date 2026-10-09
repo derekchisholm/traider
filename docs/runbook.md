@@ -9,6 +9,7 @@ come from `pulumi stack output`.
 - [Alerts and what to do](#alerts-and-what-to-do)
 - [Seeing what the bot did](#seeing-what-the-bot-did)
 - [Restarting, changing settings, tearing down](#restarting-changing-settings-tearing-down)
+- [Seeding research by hand](#seeding-research-by-hand)
 - [Going live](#going-live)
 - [First-deploy problems](#first-deploy-problems)
 
@@ -94,7 +95,16 @@ positions from Schwab and waits for the strategy to say what it wants today.
 
 A restart forgets what was only in memory: a frozen symbol, a strategy error,
 cooldowns, and which alerts were sent in the last 15 minutes. The day's order
-count, loss halt and sales total are kept.
+count, loss halt and sales total are kept. With research on, so is the position
+ledger (which positions the bot opened), and the bot reads research again at start-up;
+until it has, it opens nothing.
+
+With research on, the bot also sells the intraday positions it opened
+`research.intraday_flatten_min` minutes before the close (15 by default). That is an
+ordinary sell with the same limits as `flattenBeforeCloseMin`: it needs quotes, the lease,
+a sign-in and a switch that allows sells. Swing positions carry overnight like any other.
+If the ledger cannot be read the bot cannot tell which positions are intraday, and says so
+(*Position ledger not loaded*, below).
 
 ### If Schwab will not accept the hosted callback
 
@@ -148,8 +158,8 @@ once every 15 minutes.
 | Order on X is not finishing / Cannot read order status for X | An order has been open for five minutes, or its status has been unreadable for about 30 seconds. | Look at the order at Schwab. Cancel it there if needed. |
 | X expires today | The account holds an option on its last day. Sent once, when the bot first sees it that day. | Decide whether to leave it to the bot, which tries to sell in the last hour if it is allowed to trade, or to close it yourself. |
 | X expires today and is still held | It is the last hour and the option is still in the account. Repeats while that is so. | One alert is normal: the sale is in progress. If it repeats, the bot is not getting it sold (halt, no bid, stale quote, frozen symbol). Sell it at Schwab or tell Schwab not to exercise it: an option that expires in the money becomes 100 shares per contract. |
-| Unpinned symbols are still held | A settings version unpinned symbols the bot still holds (shares, or options on them). The alert names them. The bot keeps managing them until they are flat or the next restart (every morning on the schedule); after that it does not. | Sell them, or pin them again. |
-| X is held but not managed | The account holds X but X (or, for an option, its underlying) is not pinned, so the bot does not trade it. For an option that also means no expiry alerts and no sale before it expires. Once per symbol each time the bot starts (every morning on the schedule), and again if the position comes back after going flat. | If the bot bought it before it was unpinned, sell it yourself or pin it again. If the bot did not buy it, ignore this: pinning would hand it to the strategy, which may sell it. |
+| Unpinned symbols are still held | A settings version unpinned symbols the bot still holds (shares, or options on them). The alert names them. With research off, the bot keeps managing them until they are flat or the next restart (every morning on the schedule); after that it does not. With research on, a position the bot opened is in its ledger and stays managed across restarts, and one it did not open is reported as *held but the bot did not open it*. | Sell them, or pin them again. |
+| X is held but not managed | Research off only (with research on, the next row covers it). The account holds X but X (or, for an option, its underlying) is not pinned, so the bot does not trade it. For an option that also means no expiry alerts and no sale before it expires. Once per symbol each time the bot starts (every morning on the schedule), and again if the position comes back after going flat. | If the bot bought it before it was unpinned, sell it yourself or pin it again. If the bot did not buy it, ignore this: pinning would hand it to the strategy, which may sell it. |
 | X is held but the bot did not open it | With research on, the account holds X but the bot's ledger has no record of buying it, and X is not pinned. | The bot leaves X alone, sells included. Sell it yourself, or pin it if the bot should manage it. Keep the bot's account to the bot. |
 | Position ledger not loaded | With research on, the bot has not been able to read its ledger (the record of the positions it opened) for two minutes. Sent once per outage. | No new positions open until it loads; exits the strategy asks for still work. Intraday positions are not flattened automatically meanwhile, so check them by hand before the close. Check the state table and the task role; the bot reloads the ledger by itself once it is readable. |
 | Position ledger not loaded at the close | The intraday flatten window (`research.intraday_flatten_min` before the close) has opened and the ledger still cannot be read, so the bot will not sell intraday positions. Once per outage. | Act now: sell intraday positions yourself at Schwab, or accept holding them overnight. |
@@ -189,19 +199,19 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `target` | The strategy changed what it wants to hold. |
 | `order_submitted` | An order went to the broker. |
 | `order_done` | An order finished: filled, cancelled, rejected or expired, with fill quantity and price. |
-| `order_blocked` | A risk check stopped an order. `codes` says which, for example `max_position_usd` or `unsettled_cash`. |
+| `order_blocked` | A risk check stopped an order. `codes` says which, for example `max_position_usd`, `unsettled_cash`, or with research on `no_pick` (no live pick for the symbol), `posture` (research says stand aside today) and `horizon_budget` (the intraday or swing budget is used up). Others are `pick_side`, `intraday_closing` and `foreign_holding`, which also blocks sells. |
 | `order_rejected` | The broker refused an order. |
 | `order_unconfirmed`, `order_adopted` | A reply was lost; later, the order was found at the broker. |
-| `unknown_order`, `symbol_frozen`, `entries_halted` | See the matching alerts above. |
+| `unknown_order`, `symbol_frozen`, `entries_halted` | See the matching alerts above. `entries_halted` has a `reason`; `settings not loaded` and `position ledger not loaded` are the ones that come from the matching alerts. |
 | `settings_applied` | A new settings version is in force. `diff` lists what changed. |
 | `settings_pending_restart` | A new version changes fields that only apply after a restart. `fields` names them. |
 | `settings_rejected` | The newest version does not validate, or pins no symbols while research is off. The bot kept the settings it had. |
 | `settings_unreadable` | The settings table stayed unreadable for five minutes. `since` says when it began, `detail` what went wrong. Recorded once per outage. |
-| `unmanaged_holding` | The account holds `symbol` (`quantity`) outside the bot's universe, so the bot does not manage it. Recorded with the alert. |
-| `unknown_holding` | The account holds `symbol` (`quantity`), a position the bot did not open (not in its ledger, not pinned). The bot will not trade it. The ledger tracks symbols, not lots, so shares added by hand to a symbol the bot holds are managed (and flattened) as the bot's. |
+| `unmanaged_holding` | Research off only. The account holds `symbol` (`quantity`) outside the bot's universe, so the bot does not manage it. Recorded with the alert. With research on, `unknown_holding` takes its place. |
+| `unknown_holding` | Research on only. The account holds `symbol` (`quantity`), a position the bot did not open (not in its ledger, not pinned). The bot will not trade it. The ledger tracks symbols, not lots, so shares added by hand to a symbol the bot holds are managed (and flattened) as the bot's. |
 | `unpinned_but_held` | A settings `version` unpinned `symbols` the bot still holds. Recorded with the alert. |
 | `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
-| `research_stale` | Research could not be read for longer than `research.max_stale_s`. No new entries until it can. |
+| `research_stale` | Research could not be read for longer than `research.max_stale_s`. No live picks and the posture is stand aside until it can be read; exits are not affected. `detail` says what went wrong. |
 | `research_restored` | Research is readable again. |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
@@ -238,11 +248,12 @@ uv run --env-file .env traider settings apply settings.json --note "why"
 uv run --env-file .env traider settings history
 ```
 
-Limits, order settings, flattening and the pinned symbols apply at once: the bot
-watches a newly pinned symbol straight away, and quotes for it start once the feed
-follows the bot's universe. A symbol you unpin while the bot holds it (or options on it)
-stays managed until it is sold or the bot next restarts (every morning on the
-schedule); sell it first or keep it pinned. The strategy, its parameters, the
+Limits, order settings, flattening, the research settings and the pinned symbols apply at
+once: the bot watches a newly pinned symbol straight away, its feed loads recent bars for
+it and subscribes, and the strategy hears it after that warm-up. A symbol you unpin while
+the bot holds it (or options on it) stays managed until it is sold or the bot next restarts
+(every morning on the schedule); sell it first or keep it pinned. With research off, a
+version that pins no symbols is rejected. The strategy, its parameters, the
 option-chain span and `allow_options` wait for a restart.
 `show` prints only the JSON on stdout (the version line goes to stderr), so the file
 can be given straight back to `apply`. To go back, print an older version and apply it
@@ -260,10 +271,30 @@ If the newest version is damaged and has no readable version number,
 `traider settings apply` refuses and tells you to delete that item from the settings
 table first.
 
-**Write research by hand** (paper testing, before the research jobs exist). With
-`TRAIDER_RESEARCH_TABLE` set in the `localEnv` output (it is there once the stack has
-`traider:research: true`, which creates the table and is off by default), write a file
-like this:
+**Change the code:** edit, then `pulumi up`. Same stop-then-start.
+
+**Stop for a while:** set the switch to `halt`. Scaling the service to zero by hand
+does not last with the default schedule, which starts it again at 09:00 New York
+time on the next weekday.
+
+**Remove everything:** `pulumi destroy`. The two secrets enter AWS's 30-day recovery
+window. A live stack's state and settings tables are protected against deletion; lift
+that first:
+
+```sh
+aws dynamodb update-table --table-name "$(pulumi stack output stateTable)" \
+  --no-deletion-protection-enabled
+aws dynamodb update-table --table-name "$(pulumi stack output settingsTable)" \
+  --no-deletion-protection-enabled
+```
+
+## Seeding research by hand
+
+For paper testing before the research jobs exist. It needs a stack with
+`traider:research: true`, which creates the research table and is off by default. The
+`localEnv` output carries `TRAIDER_RESEARCH_TABLE` **only when `traider:research` is
+true**; on a stack with research off the variable is missing and `traider research` prints
+`TRAIDER_RESEARCH_TABLE is not set` and exits 2. Load the output as in the README (step 5), then write a file like this:
 
 ```json
 {
@@ -285,26 +316,38 @@ named `manual-<UTC time>`; picks rank in list order, and `pre_score` defaults to
 Unless you give `expires_at` (an ISO time with a timezone), an intraday pick expires at
 today's 16:00 New York time and a swing pick at 16:00 five weekdays later (holidays are
 not skipped). `side` is `long` or `bearish`, `horizon` is `intraday` or `swing`,
-`level` is `trade`, `reduced` or `stand_aside`. `show` reads the table the way the bot
-does and prints the posture and the live picks; it exits 1 if the table cannot be read.
-A pick below `research.min_score` is written but not shown, because the bot ignores it.
+`level` is `trade`, `reduced` or `stand_aside`.
 
-**Change the code:** edit, then `pulumi up`. Same stop-then-start.
+**The bot trades only on a day that has a posture.** A file with picks and no `posture` adds
+the picks but no posture, so unless an earlier seed already wrote one today, the bot stands
+aside. The bot picks the new run up within `research.poll_s` (60 seconds by default).
 
-**Stop for a while:** set the switch to `halt`. Scaling the service to zero by hand
-does not last with the default schedule, which starts it again at 09:00 New York
-time on the next weekday.
-
-**Remove everything:** `pulumi destroy`. The two secrets enter AWS's 30-day recovery
-window. A live stack's state and settings tables are protected against deletion; lift
-that first:
+**Seeding again adds to what is there; it does not replace it.** Every seed is a run of its
+own, and the bot reads all of today's runs (and the unexpired swing picks of earlier days).
+For each symbol the pick with the **highest score** wins, so a later seed can add symbols or
+raise a score but cannot remove a pick or lower one. Only the posture is replaced: the
+**latest** one written wins, whatever its level. To stop new entries, seed
+`{"posture": {"level": "stand_aside"}}`. To take a pick away, delete its item from the
+research table (partition key `DAY#<date>`, sort key `PICK#<run id>#<rank>`, for example
+`PICK#manual-20261009T134500Z#001`), or let it expire.
 
 ```sh
-aws dynamodb update-table --table-name "$(pulumi stack output stateTable)" \
-  --no-deletion-protection-enabled
-aws dynamodb update-table --table-name "$(pulumi stack output settingsTable)" \
-  --no-deletion-protection-enabled
+# The table is named in TRAIDER_RESEARCH_TABLE in the localEnv output: <prefix>-research.
+aws dynamodb delete-item --table-name traider-dev-research \
+  --key '{"pk":{"S":"DAY#2026-10-09"},"sk":{"S":"PICK#manual-20261009T134500Z#001"}}'
 ```
+
+**`show` reads the table the way the bot does, but with the research settings from the
+`TRAIDER_*` environment** (`TRAIDER_RESEARCH`, which the stack sets from `researchSettings`),
+**not the settings table the live bot uses.** It prints the posture and the live picks, and
+exits 1 if the table cannot be read. A pick below `research.min_score` is written but not
+shown, because the bot ignores it. After a `traider settings apply` that changes
+`research.min_score` or `research.accept_partial_runs`, `show` can disagree with the bot
+until the stack's `researchSettings` match.
+
+To check it from the bot's side, look for a `universe_changed` event naming the symbols
+(see [Seeing what the bot did](#seeing-what-the-bot-did)) and for `order_blocked` events with
+`no_pick`, `posture` or `horizon_budget` in `codes`.
 
 ## Going live
 
@@ -320,10 +363,16 @@ Before you switch:
 - [ ] You have seen it handle a restart, a `halt`, and a sign-in renewal.
 - [ ] `traider check` passes during market hours, and you have read every line of
       it: the account it picked, the cash it may spend, the account type.
-- [ ] **The account holds no shares of the configured symbols that you want to
-      keep.** The bot treats the whole position in each configured symbol as its
-      own, and will sell it when the strategy says to hold none.
-- [ ] Nothing else trades the configured symbols in that account.
+- [ ] **The account holds no shares of the pinned symbols that you want to keep.** The
+      bot treats the whole position in each pinned symbol as its own, and will sell it
+      when the strategy says to hold none.
+- [ ] Nothing else trades the pinned symbols in that account.
+- [ ] With research on: research jobs are writing a posture every morning (otherwise the
+      bot stands aside every day), and the account holds nothing the bot did not buy.
+      A holding it did not open is left alone, but it is also a sign the account is not
+      the bot's alone, and the bot cannot tell your shares from its own in a symbol it
+      already holds. Check with `traider research show` before the open that the posture
+      and picks are what you expect.
 - [ ] If options are on: the account has options approval at Schwab, it holds no
       options on the configured symbols that you want to keep through their last
       day, and you have read [Options](../README.md#options).

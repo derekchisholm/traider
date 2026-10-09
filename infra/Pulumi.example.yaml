@@ -31,8 +31,8 @@ config:
   # With research on, pinnedSymbols may be empty. Without a table, the bot behaves
   # exactly as it did before research existed.
   # traider:research: false
-  # Give any subset; the rest keep their defaults. Unknown names are rejected. Only
-  # used when research is on.
+  # Give any subset; the rest keep their defaults. Unknown names are rejected.
+  # Validated always, used only when research is on.
   # traider:researchSettings:
   #   poll_s: 60                 # how often the bot reads research (10 to 600)
   #   max_stale_s: 600           # a failed read keeps the last one this long; after that, no new entries
@@ -52,6 +52,10 @@ config:
   #   fast: 5            # bars in the fast average (one-minute bars)
   #   slow: 20           # bars in the slow average
   #   position_usd: 500  # dollars to hold while the fast average is above the slow
+  #   require_pick: false  # true: want a symbol only while research has a live long pick for it,
+  #                        # and sell a held symbol once that pick is gone or expired, also when
+  #                        # research is off or stale. That is this strategy's choice; the engine
+  #                        # itself never blocks an exit or forces one because of research.
 
   # --- Paper or live ------------------------------------------------------------
   # paper: the bot reads real Schwab market data but fills orders itself. Nothing

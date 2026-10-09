@@ -35,6 +35,7 @@ flowchart LR
         control["Parameter Store<br/>control switch"]
         secrets["Secrets Manager<br/>app key, Schwab sign-in"]
         state[("DynamoDB<br/>lease, counters, audit log")]
+        research[("DynamoDB<br/>research picks<br/>(opt-in)")]
         alerts["SNS<br/>alerts"]
         signin["HTTP API + Lambda<br/>Schwab sign-in"]
         watchdog["Lambda, daily<br/>sign-in expiry check"]
@@ -45,6 +46,7 @@ flowchart LR
     control --> engine
     secrets --> engine
     engine <--> state
+    research -- "read only" --> engine
     engine --> alerts
     watchdog --> alerts
     alerts --> you
@@ -72,10 +74,10 @@ These are enforced in code and each has tests that fail if the rule stops workin
 | Kill switch | Set the control parameter to `halt` and the bot stops ordering and cancels its working orders, normally within 10 to 15 seconds; longer if Schwab or AWS is slow, and cancelling needs a working Schwab sign-in. `close_only` allows sells only. If the switch cannot be read for a minute, the bot halts itself. |
 | Small hard limits | Per-order, per-position and total exposure caps, a daily order count, a daily loss limit that stops new buys, a cooldown, and checks for wide spreads, stale or frozen quotes and halted securities. Defaults are deliberately small (500 / 1000 / 2000 dollars). |
 | Long only, cash only | It never shorts and, by default, never borrows: a buy must be covered by cash that no other order of the bot's has claimed, and not by money from a sale that has yet to settle (see [Settled cash](#settled-cash)). |
-| The broker is the truth | Positions are read from the broker before every order. The bot keeps no position book of its own to drift out of step. |
+| The broker is the truth | Positions are read from the broker before every order. The bot keeps no position book of its own to drift out of step. (With [research](#research-and-the-universe) on it also records which symbols it opened itself, never how many shares.) |
 | Never resend on doubt | If an order's fate is unknown (a timeout, a lost reply), the bot does not send it again. It looks the order up and waits for the position to show what happened. Only after a minute in which the broker shows no such order and the position has not moved does it treat the order as never placed. If things do not add up it freezes the symbol and alerts you. |
 | One bot at a time | A lease in DynamoDB lets exactly one instance trade or touch orders, and it is re-checked right before each order. Deploys stop the old task before starting the new one. |
-| Fail closed | No control value, no lease, no market hours, no fresh account data, no usable quote, no valid sign-in: no order. |
+| Fail closed | No control value, no lease, no market hours, no fresh account data, no usable quote, no valid sign-in: no order. With research on, also no research read yet or a stale one, no posture for today, no live pick, or an unreadable position ledger: no new position. |
 | A new day starts clean | What the strategy wanted yesterday is forgotten at midnight New York time. Nothing trades in the morning until the strategy has asked again. |
 | Exits are not capped | The limits that stop the bot taking risk (size caps, order count, loss halt, cooldown) do not stop it selling what it holds. A sell still needs an open market, a fresh quote, the lease and a valid sign-in, like any order. |
 
@@ -167,7 +169,7 @@ Other things to know:
 
 Verified, on the machine this was written on:
 
-- More than 850 automated tests for the bot pass. They run it against an in-process
+- More than 1,300 automated tests for the bot pass. They run it against an in-process
   fake of the Schwab API (sign-in, accounts, orders, quotes, price history, market
   hours, the streaming socket, and failures of each) and against a fake AWS.
 - More than 100 tests run the Pulumi program against provider mocks and check what it
@@ -193,6 +195,11 @@ Not verified. Treat each as something to watch on first contact:
   on, `traider check` reads a chain and one contract's quote and fails if the bot
   would refuse to trade on it. Paper
   trade options before anything else.
+- **Research has only run against fakes.** The research table, the position ledger and the
+  research rules were tested with in-memory stores, a fake DynamoDB (moto) and the fake
+  Schwab server. They have not met a real DynamoDB table or a real account, and the research
+  jobs that would fill the table are not built yet: until they exist, research is written by
+  hand (`traider research seed`).
 - **`pulumi up` has never been run.** The mocks prove the program is self-consistent
   and uses argument names the providers accept. They do not prove AWS accepts every
   value. Expect to fix something small on the first `pulumi preview`.
@@ -247,9 +254,11 @@ buildx, uv, and a Schwab brokerage account. The Schwab API is reported to need
 thinkorswim enabled on the account. The AWS CLI must point at the same account and
 region as the stack, or commands such as the kill switch will fail or miss.
 
-> **The bot treats the whole position in every configured symbol as its own.** If the
-> account already holds shares of a symbol you list, a live bot will sell them when
+> **The bot treats the whole position in every pinned symbol as its own.** If the
+> account already holds shares of a symbol you pin, a live bot will sell them when
 > the strategy says to hold none. Use an account, or symbols, that are the bot's alone.
+> With [research](#research-and-the-universe) on, any other holding is left alone, but
+> the account must still be the bot's: see the foreign-holdings rule there.
 
 **1. Create the stack.**
 
@@ -361,26 +370,100 @@ settings into its settings table as version 1. From then on that table is the so
 every change is a new numbered version, the running bot applies it within about 10
 seconds, and an alert lists what changed. `traider settings show | history | apply`
 reads and writes it (see the [runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
-Pinned symbols apply live: the bot watches a newly pinned symbol at once, and quotes
-for it start once the feed follows the bot's universe. An unpinned symbol the bot still
-holds stays managed until it is sold or the bot next restarts (every morning on the
-schedule); sell it first or keep it pinned. A few fields (strategy, its parameters,
-option-chain span, `allow_options`) wait for the next restart. Until the bot has read a valid version
-it opens no new positions; after that, an unreadable table or a bad version leaves
-the last good settings in force. `traider check` and `traider backtest` still use the
-`TRAIDER_*` environment values, not the settings table. With no pinned symbols,
-`traider check` reads price history (and the option chain, with `allow_options` on)
-for SPY and says so; with pinned symbols it uses the first one.
-`traider research seed FILE` writes research by hand for paper testing and
-`traider research show` prints what the bot would read (both need `traider:research: true`
-on the stack, which is off by default; see the
-[runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
+Pinned symbols apply live: the bot watches a newly pinned symbol at once, its feed loads
+recent bars for it and subscribes, and the strategy starts hearing it after that warm-up. An
+unpinned symbol the bot still holds stays managed until it is sold or the bot next restarts
+(every morning on the schedule); sell it first or keep it pinned. A few fields (strategy,
+its parameters, option-chain span, `allow_options`) wait for the next restart. Until the bot
+has read a valid version it opens no new positions; after that, an unreadable table or a
+bad version leaves the last good settings in force. With research off, a version with no
+pinned symbols is rejected, because the bot would have nothing to trade.
+
+`traider check`, `traider backtest` and `traider research show` use the `TRAIDER_*`
+environment values, not the settings table the live bot uses. For `research show` that
+means the research settings in `TRAIDER_RESEARCH` (the stack's `researchSettings`), so it
+can disagree with the bot after a `traider settings apply` that changed `research.min_score`
+or `research.accept_partial_runs`. With no pinned symbols, `traider check` reads price
+history (and the option chain, with `allow_options` on) for SPY and says so; with pinned
+symbols it uses the first one.
 
 To run the command line on your own machine against a deployed stack, use the
-`localEnv` output as in step 5. It leaves out the trading mode and the control
-switch on purpose, so nothing you run locally with it can send a live order. Do not
+`localEnv` output as in step 5. It leaves out the trading mode, the control
+switch and the state table on purpose, so nothing you run locally with it can send a live
+order, with research on or off. (With `traider:research: true` it also carries the research
+table's name, so `traider research seed` and `show` work; they never reach Schwab.) Do not
 run `traider run` locally while the deployed bot is running: Schwab allows one
 streaming connection per sign-in and the two would keep cutting each other off.
+
+## Research and the universe
+
+Instead of a fixed symbol list, the bot can trade what **research** picked. Research is
+a table of ranked picks and a "posture" for the day that something else writes each
+morning (the research jobs are a separate piece, not built yet; until then you write it by
+hand, see [below](#seeding-picks-by-hand)). It is **opt-in**: set `traider:research: true`
+on the stack, which creates the table and gives the bot read-only access to it. It is off by
+default because a bot with research on but nothing writing a posture would stand aside every
+day. With research off there is no table, no ledger and none of the rules below, and the
+bot trades its pinned symbols exactly as it always did.
+
+What the bot does with it:
+
+- **The universe.** The equity symbols the bot watches, in priority order: positions it
+  opened itself, symbols with an order working, the pinned symbols, then live picks by score,
+  up to `research.max_symbols` (25 at most). The set changes during the day; a symbol only
+  leaves once it is flat with nothing working, so an exit always has quotes. Each change is
+  a `universe_changed` event. New symbols get warm-up bars from price history before the
+  strategy hears them.
+- **A live pick** comes from a run that finished `ok` (a `partial` run only with
+  `research.accept_partial_runs`), has not expired, and scores at least `research.min_score`.
+  When a symbol has several, the highest score counts. A swing pick stays live on later days
+  until it expires (`research.swing_lookback_days` days back); an intraday pick ends at the
+  close.
+- **Entries need a pick, on the right side.** A `long` pick allows shares or long calls; a
+  `bearish` pick allows long puts only. The bot never shorts. Without a live pick, an entry
+  is blocked (`no_pick`).
+- **The posture** is `trade`, `reduced` or `stand_aside`. `stand_aside` blocks every new
+  entry. `reduced` multiplies `max_order_usd` and `max_position_usd` by
+  `research.reduced_factor` (0.5 by default) for entries. **No posture for today means
+  stand aside**, and so does a day's posture the bot cannot read.
+- **Intraday and swing budgets.** `max_total_exposure_usd` is split by
+  `research.intraday_share` (0.5): intraday positions may use that share, swing the rest. An
+  entry that would overrun its share is blocked (`horizon_budget`).
+- **Intraday positions are flattened.** `research.intraday_flatten_min` (15) minutes before
+  the close the bot sells the intraday positions it opened, whatever the strategy says, and
+  opens no new intraday ones. It is an ordinary sell and needs what any sell needs.
+- **Pinned symbols need no pick.** They are exempt from `no_pick` and the side rule, but
+  not from the posture, the budgets or the intraday flatten. Their horizon is `swing`
+  unless a live pick says otherwise.
+- **Exits never depend on research.** Posture and picks only stop or shrink entries.
+
+**Fail closed.** If the research table cannot be read, the bot keeps its last view for
+`research.max_stale_s` (10 minutes by default). After that there are no live picks and the
+posture is stand aside: no new positions, and an alert (`research_stale`); exits still work.
+A kept view never carries into a new trading day, so yesterday's posture does not trade
+today. If the bot cannot work out what research says about one order (a bug), that order is
+treated as having no pick and a stand-aside posture, so only an entry is blocked.
+
+**The position ledger, and why the account must be the bot's alone.** Because the bot can
+now trade any symbol, it records which positions it opened itself in the state table
+(symbols and horizon, not share counts). The entry is written before the first buy; if the
+write fails, there is no order. It is removed when the broker shows the position flat. Only
+the instance holding the lease writes it, and an instance reloads it when it wins the lease.
+If it cannot be read, no new positions open and intraday positions are not flattened, and
+you get an alert. Any holding that is neither in the ledger nor pinned is a **foreign
+holding**: the bot records `unknown_holding`, alerts once, and never trades it, sells
+included. It cannot tell your shares from its own in a symbol it holds, so the ledger tracks
+symbols, not lots: shares you add by hand to a symbol the bot holds are managed, and
+flattened, as the bot's. Keep the bot's account to the bot.
+
+### Seeding picks by hand
+
+Until the research jobs exist, write research yourself to see this work on paper.
+`traider research seed FILE` writes a run of picks and a posture for today and
+`traider research show` prints what the bot would read. Both need the stack to have
+`traider:research: true` and the `localEnv` output loaded; the file format and the
+details are in the [runbook](docs/runbook.md#seeding-research-by-hand). To replay picks
+over history, use [`traider backtest --picks`](#try-it-without-any-accounts).
 
 ## Writing a strategy
 
@@ -408,6 +491,40 @@ class MyStrategy(Strategy):
 Register it in `src/traider/strategy/__init__.py`, set `traider:strategy` to its
 name, write tests for it, backtest it, then run it on paper. `on_quote` is also
 available for decisions that cannot wait for the end of a bar.
+
+With [research](#research-and-the-universe) on, the strategy also sees what research
+says, and hears when the set of symbols changes:
+
+```python
+class MyStrategy(Strategy):
+    def on_bar(self, bar: Bar, ctx: StrategyContext) -> Sequence[Target]:
+        pick = ctx.pick(bar.symbol)  # the live Pick for this symbol, or None
+        if pick is None:
+            return []
+        # pick.side ("long" or "bearish"), pick.horizon ("intraday" or "swing"),
+        # pick.score (0 to 100), pick.invalidation. ctx.posture is "trade", "reduced"
+        # or "stand_aside" (None when research is off); ctx.picks has every live pick
+        # by symbol.
+        return [Target(bar.symbol, quantity=10, reason="why")]
+
+    def on_universe(self, symbols: Sequence[str]) -> None:
+        super().on_universe(symbols)  # self.symbols is the current universe
+```
+
+`on_universe` is optional: the default keeps `self.symbols` current. Bars only arrive for
+symbols in the universe, so a strategy should create its per-symbol state when it first
+sees one, as `sma_cross` does, and may drop it when a symbol leaves. A strategy does not
+need to check picks or the posture: the engine's risk checks enforce them on every entry
+whatever the strategy asks for. Reading them is for choosing what to want.
+
+The placeholder `sma_cross` has a `require_pick` parameter (default `false`, set under
+`traider:strategyParams`). With it on, the strategy only wants a symbol while research has a
+live `long` pick for it, and it asks for 0 of a held symbol once that pick is gone or
+expired. **That includes a held symbol when research is off or stale**: `require_pick` makes
+a research outage, or a pick running out, into a sale at the next bar. That is the
+strategy's choice and not the engine's, which never blocks an exit and never forces one
+because of research. Leave `require_pick` off if you would rather keep positions through a
+gap in research.
 
 With [options](#options) switched on, a target may name a contract instead of a
 share symbol, and the quantity is then a number of contracts:
@@ -458,7 +575,9 @@ src/traider/            the bot
   schwab/               Schwab client: OAuth, tokens, REST, stream, parsing
   state/                lease, counters and audit log (DynamoDB or in memory)
   lambdas/              sign-in endpoint and expiry watchdog
-  cli.py                run | check | login | backtest
+  universe.py           which symbols the bot watches (pinned, held, picked)
+  research/             picks, posture, the research table, the bot's view of it
+  cli.py                run | check | login | backtest | settings | research
 tests/                  unit tests, the fake Schwab server, whole-bot tests
 infra/                  the Pulumi program (Python) and its tests
 docs/runbook.md         operating instructions
@@ -480,6 +599,9 @@ policies name exact actions and resources.
   hours. [Options](#options) are long single calls and puts only: no spreads, no
   covered calls, no selling to open.
 - One Schwab account per stack.
+- At most 25 equity symbols are watched at once (pinned symbols and research picks
+  together); the pinned list is not the whole list when [research](#research-and-the-universe)
+  is on.
 - Bars are one minute. Quotes arrive faster and reach `on_quote`.
 - The bot starts each weekday at 09:00 and stops at 16:30 New York time unless
   `alwaysOn` is set. On market holidays it starts, sees there is no session, and
