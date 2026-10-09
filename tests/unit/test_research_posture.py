@@ -265,7 +265,7 @@ class SpyMeter(CostMeter):
         return super().reserve(model, input_tokens, max_tokens)
 
 
-async def test_the_input_estimate_is_at_least_half_the_request_size():
+async def test_the_input_estimate_covers_the_request_and_the_tool_overhead():
     import json
 
     prices = ResearchJobSettings().budget.prices
@@ -286,7 +286,7 @@ async def test_the_input_estimate_is_at_least_half_the_request_size():
     sent = llm.requests[0]
     size = len(sent["system"]) + len(json.dumps(sent["messages"])) + len(json.dumps(sent["tools"]))
     assert (model, max_tokens) == (MODEL, 2000)
-    assert estimate >= size // 2
+    assert estimate >= size // 2 + 1000  # half the characters, plus the tool-use overhead
 
 
 async def test_the_review_is_settled_whatever_happens():
@@ -357,8 +357,18 @@ async def test_an_unpriced_model_is_never_called():
 
 
 async def test_long_reasons_are_cut_to_what_the_posture_model_accepts():
-    long = PostureSettings(reduced_days=(TODAY,))
-    decision = await decide(
-        ScriptedLLM(posture=[posture_reply("reduced", "x" * 200)]), metrics(), settings=long
-    )
+    decision = await decide(ScriptedLLM(posture=[LLMError("x" * 600)]), metrics())
+    assert decision.level is REDUCED
+    assert len(decision.reasons[-1]) == 500
     assert all(len(r) <= 500 for r in decision.reasons)
+
+
+async def test_a_stricter_model_with_no_reasons_is_still_explained():
+    decision = await decide(ScriptedLLM(posture=[posture_reply("reduced")]), metrics())
+    assert decision.level is REDUCED
+    assert decision.reasons == ("code: no rule matched", "model: reduced (no reason given)")
+
+
+async def test_no_reason_is_added_when_the_model_changes_nothing():
+    decision = await decide(ScriptedLLM(posture=[posture_reply("trade")]), metrics())
+    assert decision.reasons == ("code: no rule matched",)

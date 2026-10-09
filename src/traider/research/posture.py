@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from traider.research.cost import CostMeter
 from traider.research.events import NewsItem
 from traider.research.job_settings import PostureSettings
-from traider.research.llm import LLM, LLMError
+from traider.research.llm import LLM, TOOL_OVERHEAD_TOKENS, LLMError
 from traider.research.market import DailyBar, MarketQuote
 from traider.research.models import PostureLevel
 from traider.research.screen import atr
@@ -209,14 +209,20 @@ async def review_posture(
         }
     )
     messages = [{"role": "user", "content": user}]
-    # An upper bound on the input tokens: half the serialized request's characters.
+    # An upper bound on the input tokens: half the serialized request's characters, plus the
+    # tool-use overhead the API adds that we do not send.
     estimate = (
-        len(POSTURE_SYSTEM) + len(json.dumps(messages)) + len(json.dumps(SUBMIT_POSTURE_TOOL))
-    ) // 2 + 1
+        (len(POSTURE_SYSTEM) + len(json.dumps(messages)) + len(json.dumps(SUBMIT_POSTURE_TOOL)))
+        // 2
+        + 1
+        + TOOL_OVERHEAD_TOKENS
+    )
     held = meter.reserve(model, estimate, max_tokens)
     if held is None:
         raise PostureReviewFailed("posture review skipped: budget", budget=True)
     try:
+        # Only LLMError is handled. Any other BaseException (cancellation, say) propagates
+        # on purpose: the run fails closed and writes no posture.
         answer = await llm.create(
             model=model,
             system=POSTURE_SYSTEM,
@@ -278,9 +284,10 @@ async def decide_posture(
             level, _clip(reasons), metrics, notes=(str(exc),), budget_hit=exc.budget
         )
     reasons += [f"model: {r}" for r in review.reasons]
-    return PostureDecision(
-        stricter(code_level, review.level), _clip(reasons), metrics, reviewed=True
-    )
+    level = stricter(code_level, review.level)
+    if level is not code_level and not review.reasons:
+        reasons.append(f"model: {level.value} (no reason given)")
+    return PostureDecision(level, _clip(reasons), metrics, reviewed=True)
 
 
 def _clip(reasons: Sequence[str]) -> tuple[str, ...]:

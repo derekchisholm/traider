@@ -11,10 +11,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 import anthropic
 from anthropic import AsyncAnthropicBedrockMantle
+
+# Input tokens added to every request estimate that forces a tool. With tools, the Messages
+# API puts its own tool-use system prompt in front of ours; it is not in what we send, and
+# its size on Bedrock is unmeasured. Generous on purpose: an estimate must be an upper bound.
+TOOL_OVERHEAD_TOKENS: Final = 1000
 
 
 class LLMError(Exception):
