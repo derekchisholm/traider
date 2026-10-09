@@ -234,6 +234,11 @@ async def review_posture(
     except LLMError as exc:
         meter.settle(model, held, None)
         raise PostureReviewFailed(f"posture review failed: {exc}") from None
+    except BaseException:
+        # Cancelled mid-call (the run's deadline): it may still be billed, so the whole
+        # reservation is charged before the exception propagates.
+        meter.settle(model, held, None)
+        raise
     try:
         meter.settle(model, held, answer.usage)
     except ValueError:  # unusable token counts: keep the reservation as spent

@@ -24,6 +24,7 @@ from tests.fakes.research import (
     news,
     posture_reply,
     reply,
+    rising_bars,
     submit,
     tool_use,
 )
@@ -213,9 +214,12 @@ async def test_a_day_already_done_is_skipped_unless_forced():
     d = deps()
     first = await run_premarket(d, NOW)
     again = deps(store=d.store)
+    before = set(d.store.keys)
     second = await run_premarket(again, NOW)
     assert (second.status, second.exit_code) == ("skipped", 0)
     assert first.run_id in second.detail
+    assert d.store.raw(f"RUN#{second.run_id}", "META") is None
+    assert d.store.keys == before  # the lock was taken and given back; nothing else
     assert again.llm.requests == [] and again.alerts.sent == []
     forced = await run_premarket(deps(store=d.store), NOW, force=True)
     assert forced.status == "ok"
@@ -323,10 +327,11 @@ async def test_what_is_already_spent_today_counts_against_the_day_budget():
 
 
 async def test_past_the_deadline_no_new_dives_start_and_finished_ones_are_ranked():
-    # The run starts at 0 and the first dive checks the clock at 0; later checks see 10^9.
+    # The run starts at 0, the check before the screen and the first dive see 0; later
+    # checks see 10^9.
     d = deps(
         settings=jobs(dive={"dive_concurrency": 1}),
-        monotonic=StepClock([0.0, 0.0], then=1e9),
+        monotonic=StepClock([0.0, 0.0, 0.0], then=1e9),
     )
     outcome = await run_premarket(d, NOW)
     assert outcome.status == "partial"
@@ -561,10 +566,10 @@ async def test_the_hard_stop_cancels_a_running_dive_and_charges_its_reservation(
     golden = golden_llm()
     llm = HangingLLM(posture=golden.posture, dives=golden.dives)
     monkeypatch.setattr(
-        run_module, "_loop_deadline", lambda max_run_s: asyncio.get_running_loop().time() + 0.3
+        run_module, "_dive_deadline", lambda max_run_s: asyncio.get_running_loop().time() + 0.3
     )
     d = deps(llm=llm)
-    outcome = await run_premarket(d, NOW)
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
     assert (outcome.status, outcome.exit_code) == ("partial", 0)
     assert [p.symbol for p in outcome.picks] == ["NVDA", "AMD", "PLTR"]
     assert "deadline passed: 1 deep-dive(s) cut short" in outcome.meta.notes
@@ -604,9 +609,17 @@ async def test_a_failed_put_chain_read_is_counted_and_noted():
 async def test_a_posture_failure_note_is_scrubbed_and_short():
     llm = golden_llm()
     llm.posture = [LLMError("denied: token d1c2b3a4e5f6a7b8c9d0e1f2 " + "x" * 600)]
-    outcome = await run_premarket(deps(llm=llm), NOW)
+    d = deps(llm=llm)
+    outcome = await run_premarket(d, NOW)
     (note,) = outcome.meta.notes
     assert "d1c2b3a4e5f6a7b8c9d0e1f2" not in note and len(note) <= 300
+    # The posture's reasons echo the failure: scrubbed and capped too, stored and in the trail.
+    reasons = outcome.posture.reasons
+    assert any(r.startswith("code: posture review failed: denied: token") for r in reasons)
+    assert all("d1c2b3a4e5f6a7b8c9d0e1f2" not in r and len(r) <= 500 for r in reasons)
+    assert "d1c2b3a4e5f6a7b8c9d0e1f2" not in json.dumps(d.trail.only().files["posture.json"])
+    view = await bot_view(d.store)
+    assert "d1c2b3a4e5f6a7b8c9d0e1f2" not in json.dumps(view.posture.model_dump(mode="json"))
 
 
 async def test_an_overrun_is_noted():
@@ -615,6 +628,159 @@ async def test_an_overrun_is_noted():
     outcome = await run_premarket(deps(llm=llm), NOW)
     assert outcome.status == "partial"
     assert "budget: a model call cost more than its reservation" in outcome.meta.notes
+
+
+# --- review fix 1: the whole run fits inside its lock -----------------------------------
+
+
+class SlowPostureLLM(ScriptedLLM):
+    """The posture review never answers."""
+
+    async def create(self, **request):
+        if "submit_posture" in {tool["name"] for tool in request["tools"]}:
+            self.requests.append(request)
+            await asyncio.Event().wait()
+        return await super().create(**request)
+
+
+async def test_a_run_that_outlives_its_box_fails_with_no_posture_and_frees_the_lock(monkeypatch):
+    monkeypatch.setattr(
+        run_module, "_run_deadline", lambda max_run_s: asyncio.get_running_loop().time() + 0.3
+    )
+    golden = golden_llm()
+    d = deps(llm=SlowPostureLLM(dives=golden.dives))
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert (outcome.status, outcome.exit_code) == ("failed", 1)
+    assert outcome.meta.error == "posture: RunDeadline: the run did not finish within 1740s"
+    meta = await stored_meta(d.store, outcome.run_id)
+    assert meta.status is RunStatus.FAILED
+    # The cancelled review may still be billed: its reservation is the run's cost.
+    assert meta.cost_usd > 0
+    assert await d.store.day_cost(DAY) == meta.cost_usd
+    assert (await bot_view(d.store)).posture is None
+    assert ("LOCK#premarket", "LOCK") not in d.store.keys
+    (alert,) = d.alerts.sent
+    assert alert[0] == "research_run_failed"
+
+
+async def test_the_box_ends_a_minute_before_the_lock_expires():
+    store = MemoryResearchStore()
+    d = deps(store=store)
+    loop = asyncio.get_running_loop()
+    box = run_module._Run(d, NOW, "premarket-x", dry_run=False).box - loop.time()
+    lock_ttl = Settings().research_jobs.max_run_s + run_module.LOCK_SPARE_S
+    assert lock_ttl - 61 < box <= lock_ttl - 60
+
+
+async def test_past_the_deadline_before_the_screen_the_posture_stands_with_no_picks():
+    # Collect and posture took longer than max_run_s: the start reads 0, the check before
+    # the screen reads 10^9.
+    d = deps(monotonic=StepClock([0.0], then=1e9))
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert (outcome.status, outcome.exit_code) == ("partial", 0)
+    assert outcome.picks == ()
+    assert outcome.posture.level is PostureLevel.REDUCED
+    assert "deadline passed before the screen: no deep-dives" in outcome.meta.notes
+    assert len(d.llm.requests) == 1  # the posture review only
+    assert "screen.json" not in d.trail.only().files
+
+
+# --- review fixes 4-6 and 8: history errors, siblings, every failure, stale SPY ----------
+
+
+class FlakyBars(FakeMarketData):
+    def __init__(self, base: FakeMarketData, broken: set[str]) -> None:
+        super().__init__()
+        self.__dict__.update(base.__dict__)
+        self.broken = broken
+
+    async def daily_bars(self, symbol, before, days):
+        if symbol in self.broken:
+            self._enter("daily_bars", symbol)
+            raise SchwabUnavailable(f"GET /marketdata/v1/pricehistory {symbol}: HTTP 503")
+        return await super().daily_bars(symbol, before, days)
+
+
+async def test_a_few_history_errors_are_noted_but_the_run_stays_ok():
+    market, events = market_day()
+    d = deps(market=FlakyBars(market, {"MSFT"}), events=events)
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "ok"
+    assert outcome.meta.counts["drop_history_error"] == 1
+    # Five names passed the quote filter: NVDA, AMD, PLTR, NEWCO and MSFT.
+    assert "daily history unavailable for 1 of 5 name(s)" in outcome.meta.notes
+
+
+async def test_history_errors_for_half_the_names_make_the_run_partial():
+    market, events = market_day()
+    d = deps(market=FlakyBars(market, {"MSFT", "NEWCO", "PLTR"}), events=events)
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "partial"
+    assert "daily history unavailable for 3 of 5 name(s)" in outcome.meta.notes
+
+
+async def test_an_unexpected_history_error_cancels_the_other_reads_and_fails_the_run():
+    cancelled: list[str] = []
+
+    class Breaks(FakeMarketData):
+        async def daily_bars(self, symbol, before, days):
+            if symbol == "AMD":
+                raise RuntimeError("bug")
+            if symbol == "NVDA":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.append(symbol)
+                    raise
+            return await super().daily_bars(symbol, before, days)
+
+    market, events = market_day()
+    broken = Breaks()
+    broken.__dict__.update(market.__dict__)
+    d = deps(market=broken, events=events)
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert (outcome.status, outcome.meta.error) == ("failed", "screen: RuntimeError: bug")
+    assert cancelled == ["NVDA"]
+
+
+async def test_every_failure_in_a_group_is_logged_scrubbed_and_the_first_kept(caplog):
+    class TwoBreaks(FakeMarketData):
+        async def daily_bars(self, symbol, before, days):
+            if symbol == "AMD":
+                raise RuntimeError("first")
+            if symbol == "NVDA":
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # A sibling that fails while it is being cancelled.
+                    # Built at run time: the logged frames show this source line.
+                    key = "AKIA" + "ABCDEFGHIJKLMNOP"
+                    raise RuntimeError(f"second, key {key}") from None
+            return await super().daily_bars(symbol, before, days)
+
+    market, events = market_day()
+    broken = TwoBreaks()
+    broken.__dict__.update(market.__dict__)
+    d = deps(market=broken, events=events)
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert outcome.meta.error == "screen: RuntimeError: first"
+    failures = [r.getMessage() for r in caplog.records if "failed in screen" in r.getMessage()]
+    assert len(failures) == 2
+    assert "RuntimeError: first" in failures[0]
+    assert "RuntimeError: second, key ***" in failures[1]
+    assert "AKIAABCDEFGHIJKLMNOP" not in caplog.text
+
+
+async def test_stale_spy_history_means_stand_aside():
+    market, events = market_day()
+    market.bars["SPY"] = rising_bars(400.0, 0.4, before=date(2026, 10, 1))
+    d = deps(market=market, events=events)
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "ok"
+    assert outcome.posture.level is PostureLevel.STAND_ASIDE
+    assert outcome.posture.reasons == ("code: missing data: spy_vs_sma50_pct, spy_atr_pct",)
+    assert "SPY daily history is stale (last bar 2026-09-30)" in outcome.meta.notes
+    assert d.llm.requests == [] and outcome.picks == ()
 
 
 def test_the_run_flow_never_imports_order_code():

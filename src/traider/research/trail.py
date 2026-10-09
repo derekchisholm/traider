@@ -3,7 +3,8 @@
 Per run, under ``runs/<day>/<run_id>/``: ``snapshot.json``, ``posture.json``,
 ``screen.json``, ``dives/<symbol>.json`` and ``result.json``. In S3 when the stack has a
 trail bucket (private, encrypted by the bucket, expiring after 400 days); in a local
-directory otherwise and for dry runs. A failed write fails the run.
+directory otherwise and for dry runs. A failed write does not stop the run, but
+the audit trail is then incomplete, so the run is marked partial (and the failure noted).
 
 A write never leaves the trail: names may not be empty, absolute, or hold ``.``, ``..``
 or empty parts, and a local write also refuses to follow a symlink out of the directory.

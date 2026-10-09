@@ -13,9 +13,13 @@ A run is ``partial`` when planned work did not happen: a budget stopped calls, t
 deadline passed, the events vendor failed, or a trail file could not be written. The bot
 ignores partial runs by default.
 
-The deadline is ``research_jobs.max_run_s`` from the start. Past it no new deep-dive
-starts (checked on ``RunDeps.monotonic``), and a hard stop on the event loop's clock
-cancels dives still running; a cancelled dive's reservation is charged in full.
+Time: the lock lives ``max_run_s + LOCK_SPARE_S`` from the start. The whole run is boxed
+to end ``RUN_BOX_MARGIN_S`` before that; hitting the box fails the run (no posture, the
+cost recorded, the lock released). The soft deadline is ``max_run_s``: past it before the
+screen, the posture is written with no picks; past it during the dives, no new dive starts
+(both checked on ``RunDeps.monotonic``) and a hard stop on the event loop's clock cancels
+dives still running. A cancelled model call's reservation is charged in full. Ranking gets
+whatever time is left in the box.
 
 Every text that reaches META or an alert (errors, notes) goes through ``scrub`` first:
 vendor errors and model-written text can carry secrets or injected words.
@@ -49,7 +53,12 @@ from traider.research.events import (
 from traider.research.llm import LLM
 from traider.research.market import DailyBar, MarketData, MarketQuote, QuoteBatch
 from traider.research.models import Pick, Posture, PostureLevel, RunMeta, RunStatus
-from traider.research.posture import PostureDecision, decide_posture, posture_metrics
+from traider.research.posture import (
+    REASON_MAX_CHARS,
+    PostureDecision,
+    decide_posture,
+    posture_metrics,
+)
 from traider.research.rank import RankInput, RankResult, Rejection, rank_and_validate
 from traider.research.screen import (
     DROP_HISTORY,
@@ -87,6 +96,7 @@ log = logging.getLogger(__name__)
 KIND: Final = "premarket"
 LOCK_NAME = "premarket"
 LOCK_SPARE_S = 600  # the lock outlives the deadline by this much
+RUN_BOX_MARGIN_S = 60  # the whole run ends this long before the lock expires
 HISTORY_DAYS = 260
 NEWS_DAYS = 3
 BARS_CONCURRENCY = 8
@@ -172,9 +182,19 @@ def _describe(exc: BaseException) -> str:
     return scrub(f"{type(exc).__name__}: {exc}")
 
 
-def _loop_deadline(max_run_s: float) -> float:
+class RunDeadline(Exception):
+    """The whole run did not finish inside its time box."""
+
+
+def _dive_deadline(max_run_s: float) -> float:
     """The hard stop for running deep-dives, on the event loop's clock."""
     return asyncio.get_running_loop().time() + max_run_s
+
+
+def _run_deadline(max_run_s: float) -> float:
+    """The time box for the whole run, on the event loop's clock: it ends a minute before
+    the lock expires, so the failure can be recorded while the lock is still held."""
+    return asyncio.get_running_loop().time() + max_run_s + LOCK_SPARE_S - RUN_BOX_MARGIN_S
 
 
 async def run_premarket(
@@ -220,7 +240,9 @@ class _Run:
         self.dry_run = dry_run
         self.jobs = deps.settings.research_jobs
         self.started = deps.monotonic()
-        self.hard_stop = _loop_deadline(self.jobs.max_run_s)
+        # Both from the same start as the lock's lifetime (the lock is taken right after).
+        self.hard_stop = _dive_deadline(self.jobs.max_run_s)
+        self.box = _run_deadline(self.jobs.max_run_s)
         self.stage = "start"
         self.notes: list[str] = []
         self.partial = False
@@ -277,8 +299,15 @@ class _Run:
     # --------------------------------------------------------------------- flow
 
     async def execute(self, *, force: bool) -> RunOutcome:
+        box = asyncio.timeout_at(self.box)
         try:
-            return await self._execute(force=force)
+            async with box:
+                return await self._execute(force=force)
+        except TimeoutError as exc:
+            if not box.expired():
+                return await self.fail(exc)
+            limit = self.jobs.max_run_s + LOCK_SPARE_S - RUN_BOX_MARGIN_S
+            return await self.fail(RunDeadline(f"the run did not finish within {limit:.0f}s"))
         except Exception as exc:
             return await self.fail(exc)
 
@@ -319,13 +348,20 @@ class _Run:
         decision = await self.decide(snapshot)
         posture = Posture(
             level=decision.level,
-            reasons=decision.reasons,
+            # Model-written reasons can echo injected news: scrubbed like every other text.
+            reasons=tuple(scrub(r, REASON_MAX_CHARS) for r in decision.reasons),
             run_id=self.run_id,
             at=self.now,
             metrics=decision.metrics.as_dict(),
         )
-        await self.put_trail("posture.json", {"posture": posture, "notes": decision.notes})
+        await self.put_trail(
+            "posture.json", {"posture": posture, "notes": [scrub(n) for n in decision.notes]}
+        )
         if decision.level is PostureLevel.STAND_ASIDE:
+            self.stage = "write"
+            return await self.finish(posture, RankResult((), ()), {})
+        if deps.monotonic() >= self.started + self.jobs.max_run_s:
+            self.note("deadline passed before the screen: no deep-dives", partial=True)
             self.stage = "write"
             return await self.finish(posture, RankResult((), ()), {})
 
@@ -428,12 +464,18 @@ class _Run:
 
     async def decide(self, snapshot: Snapshot) -> PostureDecision:
         assert self.meter is not None
+        spy_bars = snapshot.spy_bars
+        if spy_bars and _stale(spy_bars, self.today):
+            # Old bars would describe an old market: the SPY metrics count as missing, so
+            # the code posture stands aside with "missing data" as its reason.
+            self.note(f"SPY daily history is stale (last bar {spy_bars[-1].day.isoformat()})")
+            spy_bars = []
         decision = await decide_posture(
             self.deps.llm,
             self.meter,
             model=self.jobs.dive.posture_model,
             max_tokens=self.jobs.dive.max_tokens,
-            metrics=posture_metrics(snapshot.context, snapshot.spy_bars),
+            metrics=posture_metrics(snapshot.context, spy_bars),
             today=self.today,
             settings=self.jobs.posture,
             sector_gaps=_sector_gaps(snapshot.context),
@@ -477,7 +519,7 @@ class _Run:
             if len(history) < MIN_BARS:
                 dropped[symbol] = DROP_HISTORY
                 continue
-            if weekdays_between(history[-1].day, today) > MAX_BAR_AGE_WEEKDAYS:
+            if _stale(history, today):
                 dropped[symbol] = DROP_STALE_HISTORY
                 continue
             reason = history_filter(q, history, settings)
@@ -497,6 +539,13 @@ class _Run:
             near = snapshot.earnings_ok and earnings_near(events, today)
             rows.append(ScreenRow(symbol, q.last, atr, features, near))
             bars[symbol] = history
+
+        if errors := sum(1 for r in dropped.values() if r == DROP_HISTORY_ERROR):
+            # Half or more unreadable looks like an outage, not a few odd names.
+            self.note(
+                f"daily history unavailable for {errors} of {len(passing)} name(s)",
+                partial=2 * errors >= len(passing),
+            )
 
         news_counts = await self._news_counts(
             top_k(score_rows(rows, settings.weights), 2 * settings.deep_dive_count)
@@ -537,8 +586,10 @@ class _Run:
                     log.warning("no history for %s: %s", symbol, _describe(exc))
                     return None
 
-        found = await asyncio.gather(*(one(s) for s in symbols))
-        return dict(zip(symbols, found, strict=True))
+        # A TaskGroup: an unexpected error cancels the other reads, then fails the run.
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(one(s)) for s in symbols]
+        return {s: task.result() for s, task in zip(symbols, tasks, strict=True)}
 
     async def _news_counts(self, rows: Sequence[ScreenRow]) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -691,11 +742,15 @@ class _Run:
         )
 
     async def fail(self, exc: BaseException) -> RunOutcome:
-        cause = exc.exceptions[0] if isinstance(exc, BaseExceptionGroup) and exc.exceptions else exc
+        leaves = _leaves(exc)
+        cause = leaves[0]
         error = scrub(f"{self.stage}: {type(cause).__name__}: {cause}")
-        # Frames only: the exception's own text may carry vendor words, so it is scrubbed.
-        frames = "".join(traceback.format_tb(cause.__traceback__))
-        log.error("research run %s failed: %s\n%s", self.run_id, error, frames)
+        # Every failure is logged, scrubbed; the first goes to META. Frames only: the
+        # exception's own text may carry vendor words.
+        for leaf in leaves:
+            frames = "".join(traceback.format_tb(leaf.__traceback__))
+            log.error("research run %s failed in %s: %s\n%s", self.run_id, self.stage,
+                      _describe(leaf), frames)  # fmt: skip
         meta = self.meta(RunStatus.FAILED, error=error)
         if not self.dry_run:
             if self.meter is not None and not self.cost_added and self.meter.spent > 0:
@@ -728,6 +783,17 @@ def _sector_gaps(context: Mapping[str, MarketQuote]) -> dict[str, float]:
         for s in SECTOR_ETFS
         if (q := context.get(s)) is not None and (gap := q.gap_pct) is not None
     }
+
+
+def _leaves(exc: BaseException) -> list[BaseException]:
+    """Every exception inside ``exc``, groups opened (in order), or ``exc`` itself."""
+    if isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        return [leaf for sub in exc.exceptions for leaf in _leaves(sub)]
+    return [exc]
+
+
+def _stale(bars: Sequence[DailyBar], today: date) -> bool:
+    return weekdays_between(bars[-1].day, today) > MAX_BAR_AGE_WEEKDAYS
 
 
 def _events_for(events: Sequence[EarningsEvent], symbol: str) -> tuple[EarningsEvent, ...]:
