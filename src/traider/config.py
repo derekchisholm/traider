@@ -89,6 +89,20 @@ class RiskLimits(BaseModel):
         return self
 
 
+def check_symbols(value: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
+    """The rules every list of equity symbols follows."""
+    if not value and not allow_empty:
+        raise ValueError("at least one symbol is required")
+    if len(value) > 25:
+        raise ValueError("at most 25 symbols")
+    for symbol in value:
+        if not _SYMBOL.match(symbol):
+            raise ValueError(f"not a valid equity symbol: {symbol!r}")
+    if len(set(value)) != len(value):
+        raise ValueError("duplicate symbols")
+    return value
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -143,16 +157,7 @@ class Config(BaseModel):
     @field_validator("symbols")
     @classmethod
     def _symbols_ok(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("at least one symbol is required")
-        if len(value) > 25:
-            raise ValueError("at most 25 symbols")
-        for symbol in value:
-            if not _SYMBOL.match(symbol):
-                raise ValueError(f"not a valid equity symbol: {symbol!r}")
-        if len(set(value)) != len(value):
-            raise ValueError("duplicate symbols")
-        return value
+        return check_symbols(value)
 
     @field_validator("account_last4")
     @classmethod
