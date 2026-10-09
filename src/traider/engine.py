@@ -116,6 +116,7 @@ class Engine:
     BLOCK_LOG_INTERVAL_S = 60.0
     DAY_RETRY_S = 5.0
     LEDGER_RETRY_S = 5.0
+    LEDGER_ALERT_AFTER_S = 120.0
     HEARTBEAT_S = 2.0
     IDLE_TICK_S = 1.0
     MAX_OPTION_SYMBOLS = 20  # contracts tracked at once; each one is polled for quotes
@@ -167,6 +168,11 @@ class Engine:
         self._ledger: dict[str, LedgerEntry] = {}
         self._ledger_ok = False
         self._ledger_attempt_at: datetime | None = None
+        self._ledger_error = ""
+        self._ledger_down_since: datetime | None = None  # start of the current outage
+        self._ledger_down_noted = False  # entries_halted recorded for this outage
+        self._ledger_down_alerted = False
+        self._ledger_close_alerted = False
         self._foreign: set[str] = set()  # held, not opened by the bot, not pinned
 
         # The equity symbols the bot trades right now: see _refresh_universe.
@@ -221,7 +227,8 @@ class Engine:
         """Load today's counters. Open orders are picked up when the lease is won."""
         now = self._clock.now()
         await self._roll_day(now)
-        await self._load_ledger(now)
+        if not await self._load_ledger(now):
+            await self._ledger_outage(now)
         if self._live_settings is not None:
             for update in self._live_settings.start_updates:
                 await self._on_settings(update, now)
@@ -308,13 +315,12 @@ class Engine:
                 self._settings_unreadable_reported = False
             for update in updates:
                 await self._on_settings(update, now)
-        if (
-            self._research is not None
-            and not self._ledger_ok
-            and _due(self._ledger_attempt_at, now, self.LEDGER_RETRY_S)
-            and await self._load_ledger(now)
-        ):
-            await self._refresh_universe(now)  # the bot's positions rejoin the universe
+        if self._research is not None and not self._ledger_ok:
+            retry = _due(self._ledger_attempt_at, now, self.LEDGER_RETRY_S)
+            if retry and await self._load_ledger(now):
+                await self._refresh_universe(now)  # the bot's positions rejoin the universe
+            else:
+                await self._ledger_outage(now)
         if self._research is not None and _due(
             self._research_at, now, self._settings.research.poll_s
         ):
@@ -473,13 +479,17 @@ class Engine:
                 self._lease_until = now + timedelta(seconds=self.LEASE_TTL_S)
                 if not self._leader:
                     await self._adopt_open_orders()
+                    # The previous holder may have opened or closed positions since this
+                    # process last read the ledger.
+                    await self._load_ledger(now)
         except Exception as exc:
             self._log_throttled("lease", now, "lease check failed, not trading: %s", exc)
             leader = False
         if not leader and self._leader:
-            # Whoever holds the lease now owns the open orders.
+            # Whoever holds the lease now owns the open orders, and the ledger.
             for st in self._symbols.values():
                 st.working = None
+            self._foreign = set()
         if self._leader and not leader:
             await self._alerts.send(
                 "lease_lost",
@@ -562,6 +572,9 @@ class Engine:
             self._ledger = dict(await self._state.ledger())
         except Exception as exc:
             self._ledger_ok = False
+            self._ledger_error = f"{type(exc).__name__}: {exc}"
+            if self._ledger_down_since is None:
+                self._ledger_down_since = now
             self._log_throttled(
                 "ledger",
                 now,
@@ -571,11 +584,46 @@ class Engine:
             )
             return False
         self._ledger_ok = True
+        self._ledger_down_since = None
+        self._ledger_down_noted = self._ledger_down_alerted = self._ledger_close_alerted = False
         return True
 
+    async def _ledger_outage(self, now: datetime) -> None:
+        """Say so while the ledger cannot be read: no entries, and no intraday flatten."""
+        if self._research is None or self._ledger_ok:
+            return
+        if not self._ledger_down_noted:
+            self._ledger_down_noted = True
+            await self._event("entries_halted", {"reason": "position ledger not loaded"}, now)
+        since = self._ledger_down_since or now
+        down_s = (now - since).total_seconds()
+        if not self._ledger_down_alerted and down_s >= self.LEDGER_ALERT_AFTER_S:
+            self._ledger_down_alerted = True
+            await self._alerts.send(
+                "ledger_not_loaded",
+                "Position ledger not loaded",
+                f"The bot has not been able to read its position ledger for {down_s:.0f}s "
+                f"({self._ledger_error}). No new positions are being opened. Intraday "
+                "positions are not flattened automatically until the ledger loads, so check "
+                "them by hand before the close. Exits the strategy asks for still work. "
+                "Check the state table and the task role.",
+            )
+        if not self._ledger_close_alerted and self._intraday_closing(now):
+            self._ledger_close_alerted = True
+            minutes = self._settings.research.intraday_flatten_min
+            await self._alerts.send(
+                "ledger_not_loaded_close",
+                "Position ledger not loaded at the close",
+                f"The close is under {minutes} minutes away and the bot still cannot read "
+                "its position ledger, so it does not know which positions are intraday and "
+                "will not sell them. Sell intraday positions yourself now, or accept holding "
+                "them overnight. No new positions are being opened.",
+            )
+
     async def _update_ledger(self, account: AccountSnapshot, now: datetime) -> None:
-        """Forget positions the bot has closed, and spot holdings it did not open."""
-        if self._research is None or not self._ledger_ok:
+        """Forget positions the bot has closed, and spot holdings it did not open. Only
+        the lease holder does this: a standby's ledger may be out of date."""
+        if self._research is None or not self._ledger_ok or not self._leader:
             return
         for symbol in list(self._ledger):
             st = self._symbols.get(symbol)
@@ -849,6 +897,8 @@ class Engine:
             if position == pending.expected:
                 st.pending = None
                 request = pending.order  # only there when the order's fate was unknown
+                if request is not None and request.side is Side.BUY:
+                    await self._ensure_booked(symbol, now)  # so the fill is never foreign
                 if request is not None and request.side is Side.SELL:
                     # The order was never seen, but the shares are gone: it sold.
                     await self._note_sale(
@@ -906,6 +956,8 @@ class Engine:
                 st.working = record
                 st.last_poll_at = None
                 self._seen_order_ids.add(found.order_id)
+                if request.side is Side.BUY:
+                    await self._ensure_booked(symbol, now)  # so the fill is never foreign
                 await self._save_order(record)
                 await self._event(
                     "order_adopted",
@@ -1307,7 +1359,7 @@ class Engine:
     ) -> Decision:
         since = None if st.last_order_at is None else (now - st.last_order_at).total_seconds()
         try:
-            gate = self._gate(order, now)
+            gate = self._gate(order, account, now)
         except Exception as exc:
             # Fail closed for entries only: exits never depend on research.
             self._log_throttled(
@@ -1338,7 +1390,9 @@ class Engine:
             )
         )
 
-    def _gate(self, order: OrderRequest, now: datetime) -> ResearchGate | None:
+    def _gate(
+        self, order: OrderRequest, account: AccountSnapshot, now: datetime
+    ) -> ResearchGate | None:
         """What research says about the order's symbol (or its underlying). None without
         research, so the research rules do not apply."""
         if self._research is None:
@@ -1355,15 +1409,13 @@ class Engine:
         else:
             horizon = pick.horizon.value if pick is not None else "swing"
         share = s.intraday_share if horizon == "intraday" else 1 - s.intraday_share
-        account = self._account
-        held = self._exposure(account, horizon=horizon) if account is not None else Decimal(0)
         return ResearchGate(
             pick_side=pick.side.value if pick else None,
             pinned=root in self._settings.pinned_symbols,
             posture=level.value,
             foreign=order.symbol in self._foreign,
             horizon=horizon,
-            horizon_exposure_usd=held,
+            horizon_exposure_usd=self._exposure(account, horizon=horizon),
             horizon_cap_usd=self._risk.limits.max_total_exposure_usd * share,
             cap_factor=factor,
             intraday_closing=horizon == "intraday" and self._intraday_closing(now),
@@ -1595,9 +1647,20 @@ class Engine:
     ) -> bool:
         """With research on, record a buy in the ledger before it is sent: a position the
         bot cannot prove it opened would be foreign after a restart. False: do not send."""
-        if self._research is None or order.side is not Side.BUY or symbol in self._ledger:
+        if order.side is not Side.BUY:
             return True
-        pick = self._research.view.pick(root_symbol(symbol), now)
+        if await self._ensure_booked(symbol, now):
+            return True
+        st.hold_until = now + timedelta(seconds=self.PRETRADE_RETRY_S)
+        return False
+
+    async def _ensure_booked(self, symbol: str, now: datetime) -> bool:
+        """Make sure the ledger has an entry for a symbol the bot is buying or has bought.
+        True when it has one (always, without research)."""
+        research = self._research
+        if research is None or symbol in self._ledger:
+            return True
+        pick = research.view.pick(root_symbol(symbol), now)
         entry = LedgerEntry(
             symbol,
             horizon=pick.horizon.value if pick is not None else "swing",
@@ -1610,9 +1673,8 @@ class Engine:
             await self._state.put_ledger(entry)
         except Exception as exc:
             self._log_throttled(
-                "ledger-write", now, "%s: could not write the ledger, not buying: %s", symbol, exc
+                "ledger-write", now, "%s: could not write the ledger entry: %s", symbol, exc
             )
-            st.hold_until = now + timedelta(seconds=self.PRETRADE_RETRY_S)
             return False
         self._ledger[symbol] = entry
         return True

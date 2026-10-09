@@ -235,7 +235,7 @@ async def test_a_gate_that_cannot_be_built_stops_entries_but_not_exits(tmp_path,
     await h.settle()
     assert h.position("NVDA") == 2
 
-    def broken(order, now):
+    def broken(order, account, now):
         raise ValueError("unknown posture 'bogus'")
 
     monkeypatch.setattr(h.engine, "_gate", broken)

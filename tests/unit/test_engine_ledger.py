@@ -4,8 +4,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from tests.unit.engine_harness import Harness
-from tests.unit.test_engine_research import researched
+from tests.unit.test_engine_research import researched, write
 from traider.broker.paper import _Holding
+from traider.research.store import MemoryResearchStore
 
 
 async def test_a_buy_is_booked_in_the_ledger_before_it_is_sent(tmp_path):
@@ -104,7 +105,7 @@ async def test_a_foreign_holding_stays_untouched_when_the_gate_cannot_be_built(
     await h.tick(31)
     assert "unknown_holding:NVDA" in h.alert_keys()
 
-    def broken(order, now):
+    def broken(order, account, now):
         raise ValueError("unknown posture 'bogus'")
 
     monkeypatch.setattr(h.engine, "_gate", broken)
@@ -218,3 +219,154 @@ async def test_no_intraday_entries_inside_the_closing_window(tmp_path):
     await h.settle()
     assert h.position("NVDA") == 0
     assert "intraday_closing" in (await h.events("order_blocked"))[-1]["data"]["codes"]
+
+
+# --- fixes after review -----------------------------------------------------------------
+
+
+async def test_a_buy_still_working_keeps_its_ledger_entry(tmp_path):
+    h = await researched(tmp_path, picks=[("NVDA",)], config={"order_timeout_s": 120})
+    h.broker.hold_fills = True
+    h.price("NVDA", "100.00", "100.02")
+    await h.target("NVDA", 2)
+    assert h.broker.calls["place"] == 1
+    snapshots = h.broker.calls["get_account"]
+    await h.run_for(35)  # an account refresh while the buy works and nothing is held yet
+    assert h.broker.calls["get_account"] > snapshots
+    assert h.position("NVDA") == 0
+    assert "NVDA" in await h.store.ledger()
+    h.broker.hold_fills = False
+    await h.settle()
+    assert h.position("NVDA") == 2
+    assert not await h.events("unknown_holding")
+
+
+async def _broken_ledger():
+    raise RuntimeError("no table")
+
+
+async def without_ledger(tmp_path, *, step=True, **kwargs) -> tuple[Harness, object]:
+    """A bench whose position ledger cannot be read from start-up on."""
+    store = MemoryResearchStore()
+    h = await Harness.create(tmp_path, symbols=(), research_store=store, begin=False, **kwargs)
+    await write(h, store, [("NVDA",)])
+    assert h.research is not None
+    await h.research.refresh(h.clock.now())
+    working = h.store.ledger
+    h.store.ledger = _broken_ledger
+    await h.engine.start()
+    if step:
+        await h.engine.step()
+    return h, working
+
+
+def ledger_alerts(h, key="ledger_not_loaded"):
+    return [a for a in h.alerts.sent if a[0] == key]
+
+
+async def test_a_ledger_outage_is_recorded_and_alerted_once_per_outage(tmp_path):
+    h, working = await without_ledger(tmp_path, step=False)
+    halts = [e["data"] for e in await h.events("entries_halted")]
+    assert halts == [{"reason": "position ledger not loaded"}]  # recorded by start()
+    await h.run_for(100, step=5)
+    assert ledger_alerts(h) == []  # not before LEDGER_ALERT_AFTER_S
+    await h.run_for(300, step=5)
+    [(_, subject, body)] = ledger_alerts(h)
+    assert subject == "Position ledger not loaded"
+    assert "No new positions are being opened" in body
+    assert "not flattened automatically" in body and "by hand before the close" in body
+    assert "Check the state table and the task role" in body
+    assert len(await h.events("entries_halted")) == 1
+
+    h.store.ledger = working  # it loads: the outage is over
+    await h.run_for(10)
+
+    # A new outage: the lease moves away and back, and the reload on winning it fails.
+    h.store.ledger = _broken_ledger
+    lease = h.store.acquire_lease
+
+    async def refuse(*_args, **_kwargs):
+        return False
+
+    h.store.acquire_lease = refuse
+    await h.run_for(15)
+    assert not h.engine.is_leader
+    h.store.acquire_lease = lease
+    await h.run_for(15)
+    assert h.engine.is_leader
+    assert len(await h.events("entries_halted")) == 2
+    await h.run_for(130, step=5)
+    assert len(ledger_alerts(h)) == 2
+
+
+async def test_a_ledger_outage_at_the_close_gets_a_louder_alert(tmp_path):
+    h, _ = await without_ledger(tmp_path)
+    h.clock.set(datetime(2026, 10, 8, 19, 30, tzinfo=UTC))  # 30 minutes to the close
+    await h.run_for(5)
+    assert ledger_alerts(h, "ledger_not_loaded_close") == []
+    h.clock.set(datetime(2026, 10, 8, 19, 46, tzinfo=UTC))  # inside the 15-minute window
+    await h.run_for(30)
+    [(_, subject, body)] = ledger_alerts(h, "ledger_not_loaded_close")
+    assert subject == "Position ledger not loaded at the close"
+    assert "Sell intraday positions yourself" in body
+
+
+async def test_the_ledger_follows_the_lease(tmp_path):
+    a = await researched(tmp_path, picks=[("NVDA",)])
+    b = await Harness.create(
+        tmp_path,
+        symbols=(),
+        research_store=a.research._store,
+        restart_of=a,
+        instance="bot-2",
+        begin=False,
+    )
+    b.price("NVDA", "100.00", "100.02")
+    await b.engine.start()  # reads the ledger now, before A buys anything
+    await b.engine.step()
+    assert not b.engine.is_leader
+    a.price("NVDA", "100.00", "100.02")
+    await a.target("NVDA", 2)
+    await a.settle()
+    assert a.position("NVDA") == 2
+    await b.run_for(65)  # A has stopped; its lease runs out and B takes over
+    assert b.engine.is_leader
+    assert not await b.events("unknown_holding")
+    assert not [k for k in b.alert_keys() if k.startswith("unknown_holding")]
+    b._bars = a._bars  # the shared market data drops bars it has already seen
+    await b.target("NVDA", 0)
+    await b.settle()
+    assert b.position("NVDA") == 0
+
+
+async def _lose_the_entry(h, symbol):
+    """The entry goes missing after the order went out (to test that it is booked again)."""
+    await h.store.delete_ledger(symbol)
+    h.engine._ledger.pop(symbol)
+
+
+async def test_an_adopted_buy_is_booked_again(tmp_path):
+    h = await researched(tmp_path, picks=[("NVDA",)])
+    h.broker.drop_order_id = True  # accepted with no id: the engine looks the order up
+    h.price("NVDA", "100.00", "100.02")
+    await h.target("NVDA", 2)
+    await _lose_the_entry(h, "NVDA")
+    await h.settle(35)
+    assert await h.events("order_adopted")
+    assert h.position("NVDA") == 2
+    assert "NVDA" in await h.store.ledger()
+    assert not await h.events("unknown_holding")
+
+
+async def test_an_unconfirmed_buy_that_filled_is_booked_again(tmp_path):
+    h = await researched(tmp_path, picks=[("NVDA",)])
+    h.broker.place_error_after_accepting = RuntimeError("connection reset")
+    h.broker.find_error = RuntimeError("lookup down")  # so the fill is only seen in the account
+    h.price("NVDA", "100.00", "100.02")
+    await h.target("NVDA", 2)
+    await _lose_the_entry(h, "NVDA")
+    await h.settle(35)
+    assert not await h.events("order_adopted")
+    assert h.position("NVDA") == 2
+    assert "NVDA" in await h.store.ledger()
+    assert not await h.events("unknown_holding")
