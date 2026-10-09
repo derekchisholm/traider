@@ -185,13 +185,22 @@ class Bot:
         if crashed:
             raise RuntimeError(f"background task stopped: {', '.join(crashed)}")
 
+    def _symbols_line(self) -> str:
+        """The symbols the bot trades at start, or who chooses them."""
+        universe = self.engine.universe
+        if universe:
+            return ", ".join(universe)
+        if self.config.research_table:
+            return "chosen by research"
+        return "none"
+
     async def _announce(self) -> None:
         summary = describe(self.config, self.settings)
         log.info("starting: %s", summary)
         if self.config.trading_mode == "live":
             body = (
                 "Real orders go out once the control switch is set to live.\n"
-                f"Symbols: {', '.join(self.settings.pinned_symbols)}\n"
+                f"Symbols: {self._symbols_line()}\n"
                 f"Strategy: {self.settings.strategy} {self.settings.strategy_params}\n"
                 f"Limits: {summary['risk']}"
             )
@@ -354,7 +363,7 @@ async def build_bot(
         instance_id=f"{socket.gethostname()}-{os.getpid()}",
         auth_seconds_left=tokens.seconds_left,
         settings=live_settings,
-        on_universe=feed.set_symbols if research is not None else None,
+        on_universe=feed.set_symbols,
         research=research,
     )
     return Bot(
