@@ -34,6 +34,10 @@ class FakeMessages:
 class FakeClient:
     def __init__(self, result):
         self.messages = FakeMessages(result)
+        self.closed = 0
+
+    async def close(self):
+        self.closed += 1
 
 
 MESSAGE = Message.model_validate(
@@ -120,3 +124,9 @@ async def test_any_other_exception_becomes_an_llm_error_without_its_text():
     assert str(caught.value) == "RuntimeError"
     assert "secret" not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+async def test_closing_closes_the_sdk_client():
+    fake = FakeClient(MESSAGE)
+    await MantleLLM("us-west-2", client=fake).aclose()
+    assert fake.closed == 1

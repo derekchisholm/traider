@@ -87,6 +87,10 @@ class MantleLLM:
             aws_region=region, timeout=timeout_s, max_retries=0
         )
 
+    async def aclose(self) -> None:
+        """Close the SDK's HTTP client. The run's owner calls this once, when it is done."""
+        await self._client.close()
+
     async def create(
         self,
         *,
