@@ -371,9 +371,12 @@ every change is a new numbered version, the running bot applies it within about 
 seconds, and an alert lists what changed. `traider settings show | history | apply`
 reads and writes it (see the [runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
 Pinned symbols apply live: the bot watches a newly pinned symbol at once, its feed loads
-recent bars for it and subscribes, and the strategy starts hearing it after that warm-up. An
-unpinned symbol the bot still holds stays managed until it is sold or the bot next restarts
-(every morning on the schedule); sell it first or keep it pinned. A few fields (strategy,
+recent bars for it and subscribes, and the strategy starts hearing it after that warm-up.
+With research off, an unpinned symbol the bot still holds stays managed until it is sold or
+the bot next restarts (every morning on the schedule); sell it first or keep it pinned. With
+research on, the bot books what it holds on pinned symbols in its
+[position ledger](#research-and-the-universe), so an unpinned holding stays managed, across
+restarts, until it is flat. A few fields (strategy,
 its parameters, option-chain span, `allow_options`) wait for the next restart. Until the bot
 has read a valid version it opens no new positions; after that, an unreadable table or a
 bad version leaves the last good settings in force. With research off, a version with no
@@ -452,7 +455,9 @@ the instance holding the lease writes it, and an instance reloads it when it win
 If it cannot be read, no new positions open and intraday positions are not flattened, and
 you get an alert. Any holding that is neither in the ledger nor pinned is a **foreign
 holding**: the bot records `unknown_holding`, alerts once, and never trades it, sells
-included. It cannot tell your shares from its own in a symbol it holds, so the ledger tracks
+included. Holdings on pinned symbols are booked in the ledger at the next account read
+(as `swing`), even ones that were there before research was switched on, so they stay the
+bot's after they are unpinned, until they are flat. It cannot tell your shares from its own in a symbol it holds, so the ledger tracks
 symbols, not lots: shares you add by hand to a symbol the bot holds are managed, and
 flattened, as the bot's. Keep the bot's account to the bot.
 

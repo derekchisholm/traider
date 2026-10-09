@@ -158,7 +158,8 @@ once every 15 minutes.
 | Order on X is not finishing / Cannot read order status for X | An order has been open for five minutes, or its status has been unreadable for about 30 seconds. | Look at the order at Schwab. Cancel it there if needed. |
 | X expires today | The account holds an option on its last day. Sent once, when the bot first sees it that day. | Decide whether to leave it to the bot, which tries to sell in the last hour if it is allowed to trade, or to close it yourself. |
 | X expires today and is still held | It is the last hour and the option is still in the account. Repeats while that is so. | One alert is normal: the sale is in progress. If it repeats, the bot is not getting it sold (halt, no bid, stale quote, frozen symbol). Sell it at Schwab or tell Schwab not to exercise it: an option that expires in the money becomes 100 shares per contract. |
-| Unpinned symbols are still held | A settings version unpinned symbols the bot still holds (shares, or options on them). The alert names them. With research off, the bot keeps managing them until they are flat or the next restart (every morning on the schedule); after that it does not. With research on, a position the bot opened is in its ledger and stays managed across restarts, and one it did not open is reported as *held but the bot did not open it*. | Sell them, or pin them again. |
+| Unpinned symbols are still held | Research off only. A settings version unpinned symbols the bot still holds (shares, or options on them). The alert names them. The bot keeps managing them until they are flat or the next restart (every morning on the schedule); after that it does not. (With research on, held pinned positions are booked in the ledger and stay managed across restarts until they are flat, so there is no alert unless the next row applies.) | Sell them, or pin them again. |
+| Unpinned symbols are not in the ledger | Research on only. A settings version unpinned symbols the bot holds whose ledger entry could not be written (the bot books held pinned positions at each account read, and that write has failed so far). Once unpinned, the bot leaves them alone, sells included. | Pin them again (the bot retries the write) or sell them yourself. Check the state table and the task role. |
 | X is held but not managed | Research off only (with research on, the next row covers it). The account holds X but X (or, for an option, its underlying) is not pinned, so the bot does not trade it. For an option that also means no expiry alerts and no sale before it expires. Once per symbol each time the bot starts (every morning on the schedule), and again if the position comes back after going flat. | If the bot bought it before it was unpinned, sell it yourself or pin it again. If the bot did not buy it, ignore this: pinning would hand it to the strategy, which may sell it. |
 | X is held but the bot did not open it | With research on, the account holds X but the bot's ledger has no record of buying it, and X is not pinned. | The bot leaves X alone, sells included. Sell it yourself, or pin it if the bot should manage it. Keep the bot's account to the bot. |
 | Position ledger not loaded | With research on, the bot has not been able to read its ledger (the record of the positions it opened) for two minutes. Sent once per outage. | No new positions open until it loads; exits the strategy asks for still work. Intraday positions are not flattened automatically meanwhile, so check them by hand before the close. Check the state table and the task role; the bot reloads the ledger by itself once it is readable. |
@@ -209,7 +210,7 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `settings_unreadable` | The settings table stayed unreadable for five minutes. `since` says when it began, `detail` what went wrong. Recorded once per outage. |
 | `unmanaged_holding` | Research off only. The account holds `symbol` (`quantity`) outside the bot's universe, so the bot does not manage it. Recorded with the alert. With research on, `unknown_holding` takes its place. |
 | `unknown_holding` | Research on only. The account holds `symbol` (`quantity`), a position the bot did not open (not in its ledger, not pinned). The bot will not trade it. The ledger tracks symbols, not lots, so shares added by hand to a symbol the bot holds are managed (and flattened) as the bot's. |
-| `unpinned_but_held` | A settings `version` unpinned `symbols` the bot still holds. Recorded with the alert. |
+| `unpinned_but_held` | A settings `version` unpinned `symbols` the bot still holds. With research on, only those not in the ledger (their booking failed). Recorded with the alert. |
 | `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
 | `research_stale` | Research could not be read for longer than `research.max_stale_s`. No live picks and the posture is stand aside until it can be read; exits are not affected. `detail` says what went wrong. |
 | `research_restored` | Research is readable again. |
@@ -250,9 +251,11 @@ uv run --env-file .env traider settings history
 
 Limits, order settings, flattening, the research settings and the pinned symbols apply at
 once: the bot watches a newly pinned symbol straight away, its feed loads recent bars for
-it and subscribes, and the strategy hears it after that warm-up. A symbol you unpin while
-the bot holds it (or options on it) stays managed until it is sold or the bot next restarts
-(every morning on the schedule); sell it first or keep it pinned. With research off, a
+it and subscribes, and the strategy hears it after that warm-up. With research off, a
+symbol you unpin while the bot holds it (or options on it) stays managed until it is sold or
+the bot next restarts (every morning on the schedule); sell it first or keep it pinned. With
+research on, the bot books what it holds on pinned symbols in its position ledger, so an
+unpinned holding stays managed, across restarts, until it is flat. With research off, a
 version that pins no symbols is rejected. The strategy, its parameters, the
 option-chain span and `allow_options` wait for a restart.
 `show` prints only the JSON on stdout (the version line goes to stderr), so the file

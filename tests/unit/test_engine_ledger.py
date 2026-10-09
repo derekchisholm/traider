@@ -5,8 +5,10 @@ from decimal import Decimal
 
 from tests.unit.engine_harness import Harness
 from tests.unit.test_engine_research import researched, write
+from tests.unit.test_engine_universe import pin
 from traider.broker.paper import _Holding
 from traider.research.store import MemoryResearchStore
+from traider.settings_store import MemorySettingsStore
 
 
 async def test_a_buy_is_booked_in_the_ledger_before_it_is_sent(tmp_path):
@@ -370,3 +372,128 @@ async def test_an_unconfirmed_buy_that_filled_is_booked_again(tmp_path):
     assert h.position("NVDA") == 2
     assert "NVDA" in await h.store.ledger()
     assert not await h.events("unknown_holding")
+
+
+# --- unpinning a held symbol with research on -------------------------------------------
+
+
+async def _pinned_researched(tmp_path, settings_store, **kwargs) -> Harness:
+    """Research on, SPY and QQQ pinned, settings read from ``settings_store``."""
+    return await researched(
+        tmp_path, picks=[], symbols_extra=("SPY", "QQQ"), settings_store=settings_store, **kwargs
+    )
+
+
+def unpinned_alerts(h) -> list[str]:
+    return [k for k in h.alert_keys() if k.startswith("unpinned_")]
+
+
+async def test_unpinning_a_booked_symbol_keeps_it_managed_across_a_restart(tmp_path):
+    store = MemorySettingsStore()
+    h = await _pinned_researched(tmp_path, store)
+    h.price("QQQ", "50.00", "50.02")
+    await h.target("QQQ", 2)
+    await h.settle()
+    assert h.position("QQQ") == 2
+    assert "QQQ" in await h.store.ledger()
+    await pin(h, store, ("SPY",))
+    assert unpinned_alerts(h) == []
+    assert not await h.events("unpinned_but_held")
+    assert "QQQ" in h.engine.universe
+
+    h2 = await Harness.create(
+        tmp_path,
+        symbols=(),
+        research_store=h.research._store,
+        settings_store=store,
+        restart_of=h,
+        begin=False,
+    )
+    h2.price("QQQ", "50.00", "50.02")
+    await h2.engine.start()
+    await h2.engine.step()
+    await h2.run_for(35)
+    assert h2.engine.settings.pinned_symbols == ("SPY",)
+    assert "QQQ" in h2.engine.universe
+    assert not await h2.events("unknown_holding")
+    await h2.target("QQQ", 0)
+    await h2.settle()
+    assert h2.position("QQQ") == 0
+
+
+async def test_a_pinned_holding_the_bot_never_booked_is_booked_and_stays_managed(tmp_path):
+    store = MemorySettingsStore()
+    h = await _pinned_researched(tmp_path, store)
+    h.broker._holdings["QQQ"] = _Holding(5, Decimal(45))  # held before research was on
+    h.price("QQQ", "50.00", "50.02")
+    await h.tick(31)  # the next account snapshot books it
+    entry = (await h.store.ledger())["QQQ"]
+    assert (entry.horizon, entry.side, entry.pick_run_id, entry.pick_rank) == (
+        "swing",
+        "long",
+        "",
+        0,
+    )
+    await pin(h, store, ("SPY",))
+    await h.tick(31)
+    assert not await h.events("unknown_holding")
+    assert unpinned_alerts(h) == []
+    assert "QQQ" in h.engine.universe
+    await h.target("QQQ", 0)
+    await h.settle()
+    assert h.position("QQQ") == 0
+    await h.tick(31)
+    assert "QQQ" not in await h.store.ledger()
+    assert "QQQ" not in h.engine.universe
+
+
+async def test_a_pinned_put_is_booked_bearish_and_a_call_long(tmp_path):
+    put, call = "QQQ   261016P00400000", "QQQ   261016C00400000"
+    h = await researched(tmp_path, picks=[], symbols_extra=("QQQ",), risk={"allow_options": True})
+    h.broker._holdings[put] = _Holding(1, Decimal(2))
+    h.broker._holdings[call] = _Holding(1, Decimal(2))
+    await h.tick(31)
+    ledger = await h.store.ledger()
+    assert ledger[put].side == "bearish" and ledger[call].side == "long"
+    assert ledger[put].horizon == ledger[call].horizon == "swing"
+
+
+async def test_a_failed_booking_is_retried_and_unpinning_meanwhile_says_so(tmp_path):
+    store = MemorySettingsStore()
+    h = await _pinned_researched(tmp_path, store)
+    h.broker._holdings["QQQ"] = _Holding(5, Decimal(45))
+    h.price("QQQ", "50.00", "50.02")
+    working = h.store.put_ledger
+
+    async def refuse(entry):
+        raise RuntimeError("throttled")
+
+    h.store.put_ledger = refuse
+    await h.tick(31)
+    assert "QQQ" not in await h.store.ledger()
+    await pin(h, store, ("SPY",))
+    [(key, subject, body)] = [a for a in h.alerts.sent if a[0].startswith("unpinned_")]
+    assert key == "unpinned_not_in_ledger:2"
+    assert subject == "Unpinned symbols are not in the ledger"
+    assert body.startswith(
+        "QQQ are not in the bot's ledger; once unpinned, the bot leaves them alone, sells "
+        "included. Pin them again or sell them yourself."
+    )
+    assert [e["data"] for e in await h.events("unpinned_but_held")] == [
+        {"version": 2, "symbols": ["QQQ"]}
+    ]
+
+    # Pinned again, the next snapshot retries the booking and it goes through.
+    h.store.put_ledger = working
+    await pin(h, store, ("SPY", "QQQ"))
+    await h.tick(31)
+    assert "QQQ" in await h.store.ledger()
+
+
+async def test_without_research_unpinning_still_warns_about_the_restart(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, symbols=("SPY", "QQQ"), settings_store=store)
+    await h.target("QQQ", 2)
+    await h.settle()
+    await pin(h, store, ("SPY",))
+    assert [k for k in h.alert_keys() if k.startswith("unpinned_")] == ["unpinned_but_held:2"]

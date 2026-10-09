@@ -113,8 +113,9 @@ switch. A new version is validated with the same pydantic model.
 * Fields that can apply at once: `risk` (except `allow_options`), order parameters,
   `research`, `cancel_unknown_orders`, flatten timing, and **`pinned_symbols`**. A newly
   pinned symbol joins the universe at once. A symbol that is unpinned stays in the
-  universe while the bot holds it or has an order working on it (A.5), and the bot raises
-  `unpinned_but_held` if it still holds it. They take effect on the next engine step, and
+  universe while the bot holds it or has an order working on it (A.5). With research off
+  the bot raises `unpinned_but_held` if it still holds it; with research on, held pinned
+  positions are in the ledger (A.6), so it does not. They take effect on the next engine step, and
   a `settings_applied` event records the version.
 * Fields that need a restart: `strategy`, `strategy_params`, option chain span,
   `risk.allow_options`. The
@@ -250,7 +251,11 @@ Stored in the state table: `POS#<ns>` / `<symbol>` with `horizon`, `side`
   pending.
 * Options use the contract symbol, carrying the underlying's pick.
 * **Pinned symbols** are always the bot's (today's rule), with horizon `swing`
-  unless a live pick says otherwise.
+  unless a live pick says otherwise. On every account snapshot the leader books any held
+  position on a pinned symbol that has no entry (horizon `swing`, side `long` for shares
+  and calls, `bearish` for puts, no pick), including holdings from before research was on.
+  So a pinned holding stays the bot's after it is unpinned, until it is flat. A failed
+  write is logged and retried on the next snapshot.
 * **At start-up and on every account snapshot**, a holding that is neither in the
   ledger nor pinned is foreign. The bot records `unknown_holding`, alerts once per
   symbol, and never trades it, sells included. The runbook keeps saying: use an
@@ -270,7 +275,9 @@ Stored in the state table: `POS#<ns>` / `<symbol>` with `horizon`, `side`
   holds) and `unmanaged_holding` (a holding outside the universe) belong to the world
   without a ledger: `unmanaged_holding` is raised only with research off, and the
   "managed until the next restart" warning in `unpinned_but_held` describes research off.
-  With research on, a position the bot opened is in its ledger and stays managed.
+  With research on, held pinned positions are in the ledger and stay managed, so there is
+  no such warning; the one exception is a holding whose booking write has not gone through,
+  which gets an alert saying that once unpinned the bot leaves it alone, sells included.
 
 ### A.7 Engine-enforced rules
 

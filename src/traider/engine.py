@@ -639,6 +639,7 @@ class Engine:
                 continue
             del self._ledger[symbol]
         pinned = set(self._settings.pinned_symbols)
+        await self._book_pinned(account, pinned, now)
         foreign = {
             symbol: held.quantity
             for symbol, held in account.positions.items()
@@ -658,6 +659,27 @@ class Engine:
                 "The bot will not trade it, sells included. Use an account that is the "
                 "bot's alone.",
             )
+
+    async def _book_pinned(self, account: AccountSnapshot, pinned: set[str], now: datetime) -> None:
+        """Book held positions on pinned symbols that the ledger does not have yet (say,
+        held before research was on). They are the bot's to manage, and booked they stay
+        so after they are unpinned, until they are flat. A failed write is tried again on
+        the next snapshot."""
+        for symbol, held in account.positions.items():
+            if held.quantity == 0 or root_symbol(symbol) not in pinned or symbol in self._ledger:
+                continue
+            put = is_option_symbol(symbol) and parse_option_symbol(symbol).right == "P"
+            entry = LedgerEntry(
+                symbol, horizon="swing", side="bearish" if put else "long", opened_at=now
+            )
+            try:
+                await self._state.put_ledger(entry)
+            except Exception as exc:
+                self._log_throttled(
+                    "ledger-book", now, "could not book pinned %s in the ledger: %s", symbol, exc
+                )
+                continue
+            self._ledger[symbol] = entry
 
     def _ledger_horizon(self, symbol: str) -> str:
         entry = self._ledger.get(symbol)
@@ -769,12 +791,30 @@ class Engine:
     async def _warn_unpinned_but_held(
         self, unpinned: set[str], version: int | None, now: datetime
     ) -> None:
-        """A version unpinned symbols the bot still holds. They stay managed for now, but
-        a new process starts from the pinned symbols and will not pick them up."""
+        """A version unpinned symbols the bot still holds. With research off they stay
+        managed for now, but a new process starts from the pinned symbols and will not pick
+        them up. With research on, held pinned positions are booked in the ledger and stay
+        managed until they are flat; only one whose booking has not gone through is lost."""
         account = self._account
         if account is None or not unpinned:
             return
         held = self._held_on(account, unpinned & set(self._universe))
+        if self._research is not None:
+            # A standby, or a process without its ledger, cannot tell what is booked.
+            if not (self._leader and self._ledger_ok):
+                return
+            held = [symbol for symbol in held if symbol not in self._ledger]
+            if not held:
+                return
+            await self._event("unpinned_but_held", {"version": version, "symbols": held}, now)
+            await self._alerts.send(
+                f"unpinned_not_in_ledger:{version}",
+                "Unpinned symbols are not in the ledger",
+                f"{', '.join(held)} are not in the bot's ledger; once unpinned, the bot leaves "
+                "them alone, sells included. Pin them again or sell them yourself. Writing "
+                "them to the ledger has not worked yet; the bot's log says why.",
+            )
+            return
         if not held:
             return
         await self._event("unpinned_but_held", {"version": version, "symbols": held}, now)
