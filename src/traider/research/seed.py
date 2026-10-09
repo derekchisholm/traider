@@ -7,6 +7,7 @@ only what it returns never writes half a file.
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -83,7 +84,8 @@ def build_manual_run(
         raise ValueError("now must carry a timezone")
     root = _mapping(data, "the seed file", _TOP_KEYS)
     now = now.astimezone(UTC)
-    run_id = run_id or f"manual-{now:%Y%m%dT%H%M%SZ}"
+    # The random suffix keeps two seeds in the same second from sharing a run id.
+    run_id = run_id or f"manual-{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(2)}"
     today = trading_date(now)
 
     raw_picks = root.get("picks", [])

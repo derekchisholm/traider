@@ -2,6 +2,7 @@
 
 import io
 import json
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -15,6 +16,7 @@ from traider.research.source import ResearchSource
 from traider.research.store import MemoryResearchStore
 
 NOW = datetime(2026, 10, 8, 13, 0, tzinfo=UTC)  # 09:00 New York (EDT, UTC-4)
+RUN_ID = re.compile(r"manual-20261008T130000Z-[0-9a-f]{4}")
 
 
 def seed_file(tmp_path, body) -> str:
@@ -61,7 +63,7 @@ async def test_seed_writes_a_manual_run_the_bot_will_read(tmp_path):
     nvda = source.view.pick("NVDA", NOW)
     assert nvda.expires_at == datetime(2026, 10, 8, 20, 0, tzinfo=UTC)  # 16:00 New York
     assert source.view.pick("AMD", NOW).expires_at == datetime(2026, 10, 15, 20, 0, tzinfo=UTC)
-    assert "manual-20261008T130000Z" in out.getvalue()
+    assert RUN_ID.search(out.getvalue())
 
 
 async def test_a_bad_seed_file_writes_nothing(tmp_path):
@@ -164,7 +166,7 @@ def test_a_bad_seed_file_through_main_exits_1(monkeypatch, tmp_path, capsys):
 
 def test_build_names_the_run_after_the_time_and_ranks_in_list_order():
     meta, picks, posture = build_manual_run(GOOD, NOW)
-    assert meta.run_id == "manual-20261008T130000Z"
+    assert RUN_ID.fullmatch(meta.run_id)
     assert (meta.kind, meta.status.value) == ("manual", "ok")
     assert meta.trading_day.isoformat() == "2026-10-08"
     assert [(p.rank, p.symbol, p.run_id) for p in picks] == [
@@ -249,3 +251,9 @@ def test_a_posture_alone_is_a_valid_seed():
     meta, picks, posture = build_manual_run({"posture": {"level": "stand_aside"}}, NOW)
     assert picks == [] and posture is not None and posture.reasons == ()
     assert meta.run_id.startswith("manual-")
+
+
+def test_two_seeds_in_the_same_second_get_different_run_ids():
+    ids = {build_manual_run(GOOD, NOW)[0].run_id for _ in range(20)}
+    assert len(ids) > 1
+    assert all(RUN_ID.fullmatch(run_id) for run_id in ids)

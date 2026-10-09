@@ -315,7 +315,7 @@ uv run --env-file .env traider research show
 ```
 
 `seed` checks the whole file and writes nothing if any part is wrong. It writes one run
-named `manual-<UTC time>`; picks rank in list order, and `pre_score` defaults to `score`.
+named `manual-<UTC time>-<4 hex digits>`; picks rank in list order, and `pre_score` defaults to `score`.
 Unless you give `expires_at` (an ISO time with a timezone), an intraday pick expires at
 today's 16:00 New York time and a swing pick at 16:00 five weekdays later (holidays are
 not skipped). `side` is `long` or `bearish`, `horizon` is `intraday` or `swing`,
@@ -332,12 +332,12 @@ raise a score but cannot remove a pick or lower one. Only the posture is replace
 **latest** one written wins, whatever its level. To stop new entries, seed
 `{"posture": {"level": "stand_aside"}}`. To take a pick away, delete its item from the
 research table (partition key `DAY#<date>`, sort key `PICK#<run id>#<rank>`, for example
-`PICK#manual-20261009T134500Z#001`), or let it expire.
+`PICK#manual-20261009T134500Z-3f2a#001`), or let it expire.
 
 ```sh
 # The table is named in TRAIDER_RESEARCH_TABLE in the localEnv output: <prefix>-research.
 aws dynamodb delete-item --table-name traider-dev-research \
-  --key '{"pk":{"S":"DAY#2026-10-09"},"sk":{"S":"PICK#manual-20261009T134500Z#001"}}'
+  --key '{"pk":{"S":"DAY#2026-10-09"},"sk":{"S":"PICK#manual-20261009T134500Z-3f2a#001"}}'
 ```
 
 **`show` reads the table the way the bot does, but with the research settings from the
