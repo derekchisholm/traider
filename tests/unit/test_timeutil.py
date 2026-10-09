@@ -77,3 +77,14 @@ def test_weekday_steps_skip_weekends():
     assert weekdays_between(friday, date(2026, 10, 23)) == 10
     assert weekdays_between(monday, friday) == -1
     assert weekdays_between(date(2026, 10, 8), friday) == 1
+
+
+def test_weekdays_after_refuses_a_negative_count():
+    from datetime import date
+
+    import pytest
+
+    from traider.timeutil import weekdays_after
+
+    with pytest.raises(ValueError, match="negative"):
+        weekdays_after(date(2026, 10, 9), -1)

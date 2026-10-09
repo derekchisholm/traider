@@ -79,6 +79,8 @@ def test_earnings_candidates_reported_yesterday_after_the_close_or_today_before_
         ("$VIX", quote("$VIX", 20, 19, asset_type="INDEX"), "symbol"),
         ("NVDA", None, "no_quote"),
         ("NVDA", quote("NVDA", None, 99), "no_quote"),
+        ("NVDA", quote("NVDA", 0, 99), "no_quote"),
+        ("NVDA", quote("NVDA", -5, 99), "no_quote"),
         ("SPY", quote("SPY", 500, 499, asset_type="COLLECTIVE_INVESTMENT"), "asset_type"),
         ("TQQQ", quote("TQQQ", 50, 49, sub_type="ETF"), "asset_type"),
         ("TVIX", quote("TVIX", 50, 49, sub_type="ETN"), "asset_type"),
@@ -310,3 +312,37 @@ def test_a_missing_price_is_dropped_by_the_history_filter_and_refused_by_feature
             earnings_ok=True,
             lookahead=10,
         )
+
+
+def test_an_exact_half_rounds_up_despite_float_error():
+    weights = ScreenWeights(
+        move=0.05, participation=0.05, liquidity=0.075, catalyst=0.05, alignment=0.775
+    )
+    only = score_rows([row("A", 0, 1, 1, 0, 0, near=True)], weights)
+    assert 100 * (0.05 + 0.05 + 0.075 + 0.05) < 22.5  # the float sum is 22.499999999999996
+    assert only[0].pre_score == 23
+
+
+@pytest.mark.parametrize("bad", ["price", "recent_close", "old_close"])
+def test_features_refuse_non_positive_prices_and_closes(bad):
+    bars = flat_bars(100.0, 1_000_000)
+    price = 0.0 if bad == "price" else 100.0
+    if bad == "recent_close":
+        bars[-1] = bars[-1].model_copy(update={"close": 0.0})
+    if bad == "old_close":
+        bars[-50] = bars[-50].model_copy(update={"close": -1.0})
+    with pytest.raises(ValueError, match="positive"):
+        compute_features(
+            quote("NVDA", price, 100.0),
+            bars,
+            today=TODAY,
+            events=[],
+            earnings_ok=True,
+            lookahead=10,
+        )
+
+
+def test_a_zero_quoted_average_volume_falls_back_to_the_bars():
+    q = quote("NVDA", 100, 100, avg_volume=0)
+    assert history_filter(q, flat_bars(100, 200_000, n=60), SETTINGS) is None
+    assert history_filter(q, flat_bars(100, 199_999, n=60), SETTINGS) == "dollar_volume"

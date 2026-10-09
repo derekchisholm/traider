@@ -79,6 +79,8 @@ def next_weekday(day: date) -> date:
 
 def weekdays_after(day: date, n: int) -> date:
     """The ``n``-th weekday after ``day``. Holidays are not known here."""
+    if n < 0:
+        raise ValueError("n must not be negative")
     for _ in range(n):
         day = next_weekday(day)
     return day

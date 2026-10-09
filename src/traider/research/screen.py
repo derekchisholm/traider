@@ -227,7 +227,9 @@ def compute_features(
         raise ValueError("features need a quote price and 60 bars: run the filters first")
     price = quote.last
     closes = [b.close for b in bars]
-    prev_close = quote.prev_close or closes[-1]
+    if price <= 0 or any(close <= 0 for close in closes[-50:]):
+        raise ValueError("features need a positive price and positive recent closes")
+    prev_close = quote.prev_close if quote.prev_close and quote.prev_close > 0 else closes[-1]
     sma20 = _mean(closes[-20:])
     sma50 = _mean(closes[-50:])
     base_volume = _mean([b.volume for b in bars[-21:-1]])
@@ -274,7 +276,8 @@ def percentile_ranks(values: Sequence[float]) -> list[float]:
 
 
 def _round_half_up(value: float) -> int:
-    return math.floor(value + 0.5)
+    # Round to 9 places first: float error must not turn an exact .5 into .4999...
+    return math.floor(round(value, 9) + 0.5)
 
 
 def score_rows(rows: Sequence[ScreenRow], weights: ScreenWeights) -> list[ScreenRow]:
