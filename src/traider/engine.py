@@ -818,8 +818,8 @@ class Engine:
                 f"unpinned_not_in_ledger:{version}",
                 "Unpinned symbols are not in the ledger",
                 f"{', '.join(held)} are not in the bot's ledger; once unpinned, the bot leaves "
-                "them alone, sells included. Pin them again or sell them yourself. Writing "
-                "them to the ledger has not worked yet; the bot's log says why.",
+                "them alone, sells included. Pin them again or sell them yourself. If the bot "
+                "tried to book them and could not, its log says why.",
             )
             return
         if not held:

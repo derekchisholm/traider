@@ -530,3 +530,53 @@ async def test_a_stale_ledger_flattens_nothing_but_keeps_the_universe(tmp_path):
     assert not [o for o in h.broker.placed if o.side.value == "SELL"]
     assert ledger_alerts(h, "ledger_not_loaded_close")
     assert "NVDA" in h.engine.universe  # still the bot's for universe purposes
+
+
+def count_ledger_writes(h) -> list:
+    """Record every ledger write made through ``h``'s store, and let it through."""
+    writes: list = []
+    original = h.store.put_ledger
+
+    async def put(entry):
+        writes.append(entry.symbol)
+        await original(entry)
+
+    h.store.put_ledger = put
+    return writes
+
+
+async def test_a_standby_books_no_pinned_holding(tmp_path):
+    a = await _pinned_researched(tmp_path, MemorySettingsStore())
+
+    async def refuse(entry):
+        raise RuntimeError("throttled")
+
+    a.store.put_ledger = refuse  # the leader cannot book it either, so it stays unbooked
+    a.broker._holdings["QQQ"] = _Holding(5, Decimal(45))
+    b = await Harness.create(
+        tmp_path,
+        symbols=("SPY", "QQQ"),
+        research_store=a.research._store,
+        restart_of=a,
+        instance="bot-2",
+        begin=False,
+    )
+    writes = count_ledger_writes(b)
+    await b.engine.start()
+    for _ in range(40):  # A keeps the lease; B sees account snapshots as a standby
+        await a.tick(1)
+        await b.engine.step()
+    assert a.engine.is_leader and not b.engine.is_leader
+    assert b.broker.calls["get_account"] > 0
+    assert writes == []
+    assert "QQQ" not in await b.store.ledger()
+
+
+async def test_a_leader_without_its_ledger_books_no_pinned_holding(tmp_path):
+    h, _ = await without_ledger(tmp_path, symbols_extra=("QQQ",))
+    writes = count_ledger_writes(h)
+    h.broker._holdings["QQQ"] = _Holding(5, Decimal(45))
+    h.price("QQQ", "50.00", "50.02")
+    await h.run_for(35)
+    assert h.engine.is_leader
+    assert writes == []
