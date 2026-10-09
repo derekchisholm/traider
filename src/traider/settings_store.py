@@ -323,8 +323,7 @@ class LiveSettings:
         self.version: int | None = None
         self.loaded = False
         #: The newest stored settings, as written, while they differ from the running ones in
-        #: a restart-only field; None otherwise. The engine reads it to say what a restart
-        #: would change.
+        #: a restart-only field; None otherwise: what a restart would change to.
         self.pending: Settings | None = None
         self._rejected: set[tuple[int, str | None]] = set()
         self.start_updates: list[SettingsUpdate] = []

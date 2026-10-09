@@ -152,7 +152,7 @@ once every 15 minutes.
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
 | Settings version N applied | A new version of the settings is in force; the alert lists each change. | Nothing, if you made it. If you did not, set `halt` and look at `traider settings history`. |
-| Settings version N needs a restart | The version changes the strategy, its parameters, the pinned symbols, the option-chain span or whether options are allowed. Those wait for a restart; the rest applies now. | Restart when convenient (see below), or tomorrow's 09:00 start does it. If the version drops a pinned symbol you still hold (or hold options on), the alert names it: after the restart the bot no longer manages it, so sell it first or keep it pinned. |
+| Settings version N needs a restart | The version changes the strategy, its parameters, the option-chain span or whether options are allowed. Those wait for a restart; the rest applies now. | Restart when convenient (see below), or tomorrow's 09:00 start does it. |
 | Settings version N rejected | The newest version does not validate. If settings had already loaded, the bot keeps the settings it was running with. If none have loaded in this process, no new positions open until a valid version is written; exits still work. | Fix it with `traider settings apply`, start from the last good version: find it with `traider settings history`, print it with `traider settings show --version N`. |
 | Settings not loaded | At start-up the bot could not read the settings table. (A version that is stored but invalid gets the "rejected" alert instead.) No new positions open until it can; exits still work. | Check the settings table and the task role (a missing table or a denied read is the usual cause). The bot loads the settings by itself once they are readable. |
 | Settings table unreadable | The settings table has been unreadable for five minutes. If settings had loaded, the last good version stays in force and newer versions, tighter limits included, do not apply. If not, no new positions open. Sent once per outage. | Check the table and the task role. If you need tighter limits now, set the control switch to `close_only` or `halt`. |
@@ -190,6 +190,7 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `settings_pending_restart` | A new version changes fields that only apply after a restart. `fields` names them. |
 | `settings_rejected` | The newest version does not validate. The bot kept the settings it had. |
 | `settings_unreadable` | The settings table stayed unreadable for five minutes. `since` says when it began, `detail` what went wrong. Recorded once per outage. |
+| `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
 restarts. To start it over, set `halt`, delete it and restart the bot. If the old
@@ -225,8 +226,9 @@ uv run --env-file .env traider settings apply settings.json --note "why"
 uv run --env-file .env traider settings history
 ```
 
-Limits, order settings and flattening apply at once. The strategy, its parameters,
-the pinned symbols, the option-chain span and `allow_options` wait for a restart.
+Limits, order settings, flattening and the pinned symbols apply at once. A symbol you
+unpin while the bot holds it (or options on it) stays managed until it is sold. The
+strategy, its parameters, the option-chain span and `allow_options` wait for a restart.
 `show` prints only the JSON on stdout (the version line goes to stderr), so the file
 can be given straight back to `apply`. To go back, print an older version and apply it
 as a new version:

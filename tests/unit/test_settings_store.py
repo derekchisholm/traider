@@ -368,12 +368,15 @@ async def test_refresh_keeps_restart_fields_and_says_a_restart_is_needed():
     store = MemorySettingsStore()
     live = LiveSettings(store, settings())
     await live.start(T0)
-    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    changed = settings(max_order_usd=Decimal(250)).model_copy(
+        update={"option_chain_days": 30, "pinned_symbols": ("QQQ",)}
+    )
     await store.write(changed, expected_version=1, author="cli", note="", now=T0)
     updates = await live.refresh(T0)
     assert [u.kind for u in updates] == ["applied", "pending_restart"]
-    assert updates[1].detail == "pinned_symbols"
-    assert live.current.pinned_symbols == ("SPY",)
+    assert updates[1].detail == "option_chain_days"
+    assert live.current.option_chain_days == 45
+    assert live.current.pinned_symbols == ("QQQ",)  # live: the engine's universe follows it
     assert live.current.risk.max_order_usd == Decimal(250)
 
 
@@ -488,11 +491,13 @@ async def test_pending_holds_the_stored_settings_while_a_restart_field_differs()
     live = LiveSettings(store, settings())
     await live.start(T0)
     assert live.pending is None
-    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    changed = settings(max_order_usd=Decimal(250)).model_copy(
+        update={"option_chain_days": 30, "pinned_symbols": ("QQQ",)}
+    )
     await store.write(changed, expected_version=1, author="cli", note="", now=T0)
     await live.refresh(T0)
     assert live.pending == changed  # as written, not merged
-    assert live.current.pinned_symbols == ("SPY",)
+    assert live.current.option_chain_days == 45
     # A later version that puts the restart field back clears it.
     await store.write(
         settings(max_order_usd=Decimal(100)), expected_version=2, author="cli", note="", now=T0
@@ -541,12 +546,14 @@ async def test_a_refresh_after_an_unreadable_start_keeps_the_running_restart_fie
     store.error = RuntimeError("no network")
     live = LiveSettings(store, settings())
     await live.start(T0)
-    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    changed = settings(max_order_usd=Decimal(250)).model_copy(
+        update={"option_chain_days": 30, "pinned_symbols": ("QQQ",)}
+    )
     await store.write(changed, expected_version=0, author="cli", note="", now=T0)
     store.error = None
     updates = await live.refresh(T0)
     assert live.loaded
-    assert live.current.pinned_symbols == ("SPY",)
+    assert live.current.option_chain_days == 45
     assert live.current.risk.max_order_usd == Decimal(250)
     assert [u.kind for u in updates] == ["applied", "pending_restart"]
 

@@ -53,6 +53,7 @@ from traider.settings_store import LiveSettings, SettingsUpdate
 from traider.state.base import DayState, StateStore
 from traider.strategy.base import Strategy, StrategyContext
 from traider.timeutil import Clock, previous_weekday, trades_without_settling, trading_date
+from traider.universe import compute_universe, root_symbol
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +131,7 @@ class Engine:
         instance_id: str,
         auth_seconds_left: Callable[[], float | None] | None = None,
         settings: LiveSettings | None = None,
+        on_universe: Callable[[tuple[str, ...]], None] | None = None,
     ) -> None:
         self._config = config
         self._clock = clock
@@ -152,9 +154,10 @@ class Engine:
         self._settings_unreadable_since: datetime | None = None
         self._settings_unreadable_reported = False
 
-        self._symbols: dict[str, _SymbolState] = {
-            s: _SymbolState() for s in self._settings.pinned_symbols
-        }
+        # The equity symbols the bot trades right now: see _refresh_universe.
+        self._on_universe = on_universe
+        self._universe: tuple[str, ...] = self._settings.pinned_symbols
+        self._symbols: dict[str, _SymbolState] = {s: _SymbolState() for s in self._universe}
         self._perms = _HALTED
         self._leader = False
         self._day = DayState(trading_date(clock.now()).isoformat(), halted_reason="not loaded yet")
@@ -188,6 +191,10 @@ class Engine:
     @property
     def settings(self) -> Settings:
         return self._settings
+
+    @property
+    def universe(self) -> tuple[str, ...]:
+        return self._universe
 
     def target(self, symbol: str) -> Target | None:
         st = self._symbols.get(symbol)
@@ -332,25 +339,16 @@ class Engine:
                 f"Settings version {version} applied",
                 changes or "No change to the settings in force.",
             )
+            await self._refresh_universe(now)
         elif update.kind == "pending_restart":
             await self._event(
                 "settings_pending_restart", {"version": version, "fields": update.detail}, now
             )
-            body = (
-                f"These fields only change when the bot restarts: {update.detail}. "
-                "Everything else in the version is in force now."
-            )
-            if "pinned_symbols" in update.detail.split(", ") and live.pending is not None:
-                orphaned = self._orphaned_by(live.pending)
-                if orphaned:
-                    body += (
-                        f" After the restart the bot will no longer manage: "
-                        f"{', '.join(orphaned)}. Sell them first or keep them pinned."
-                    )
             await self._alerts.send(
                 f"settings_restart:{version}",
                 f"Settings version {version} needs a restart",
-                body,
+                f"These fields only change when the bot restarts: {update.detail}. "
+                "Everything else in the version is in force now.",
             )
         elif update.kind == "rejected":
             await self._event(
@@ -404,22 +402,6 @@ class Engine:
             f"The settings table has been unreadable since {since.isoformat()} "
             f"({update.detail}). {in_force} Check the settings table and the task role.",
         )
-
-    def _orphaned_by(self, stored: Settings) -> list[str]:
-        """Held positions (by their own symbol) that the running bot manages through a pinned
-        symbol which ``stored`` drops: shares of it, or options on it."""
-        account = self._account
-        if account is None:
-            return []
-        running, kept = self._settings.pinned_symbols, stored.pinned_symbols
-        orphaned = []
-        for symbol, held in account.positions.items():
-            if held.quantity == 0:
-                continue
-            root = parse_option_symbol(symbol).underlying if is_option_symbol(symbol) else symbol
-            if root in running and root not in kept:
-                orphaned.append(symbol)
-        return sorted(orphaned)
 
     async def _renew_lease(self, now: datetime) -> None:
         try:
@@ -501,12 +483,69 @@ class Engine:
                     await self._warn_of_expiry(symbol, held.quantity, now)
         await self._settle_pending(account, now)
         await self._check_daily_loss(account, now)
+        await self._refresh_universe(now)
+
+    # ---------------------------------------------------------------- universe
+
+    def _required_symbols(self) -> set[str]:
+        """Roots that must stay in the universe: anything in it with an order working or
+        unsettled (or frozen), and anything in it the bot holds, shares or options."""
+        required = {
+            root
+            for symbol, st in self._symbols.items()
+            if self._busy(st) and (root := root_symbol(symbol)) in self._universe
+        }
+        account = self._account
+        if account is None:
+            # Nothing is known to be flat before the first account read: drop nothing.
+            return required | set(self._universe)
+        for symbol, held in account.positions.items():
+            root = root_symbol(symbol)
+            if held.quantity != 0 and root in self._universe:
+                required.add(root)
+        return required
+
+    def _wanted_picks(self, now: datetime) -> list[tuple[str, int]]:
+        return []  # research picks arrive in Task 9
+
+    async def _refresh_universe(self, now: datetime) -> None:
+        """Recompute the universe and, when its members change, tell everyone. A dropped
+        symbol's state, and that of options on it, goes only when it is idle and flat."""
+        new = compute_universe(
+            required=self._required_symbols(),
+            pinned=self._settings.pinned_symbols,
+            picks=self._wanted_picks(now),
+            cap=self._settings.research.max_symbols,
+        )
+        old = self._universe
+        if set(new) == set(old):
+            return  # at most the order differs: nothing to add, drop or tell
+        self._universe = new
+        added = [s for s in new if s not in old]
+        dropped = [s for s in old if s not in new]
+        for symbol in added:
+            self._symbols.setdefault(symbol, _SymbolState())
+        for symbol, st in list(self._symbols.items()):
+            if root_symbol(symbol) in dropped and not self._busy(st):
+                del self._symbols[symbol]
+                if is_option_symbol(symbol):
+                    self._market.unwatch(symbol)
+        await self._event(
+            "universe_changed", {"added": added, "dropped": dropped, "universe": list(new)}, now
+        )
+        try:
+            self._strategy.on_universe(new)
+        except Exception as exc:
+            log.exception("strategy raised in on_universe")
+            await self._strategy_failed(exc)
+        if self._on_universe is not None:
+            self._on_universe(new)
 
     def _is_our_option(self, symbol: str) -> bool:
-        """An option contract on one of the configured symbols."""
-        if symbol in self._settings.pinned_symbols or not is_option_symbol(symbol):
+        """An option contract on one of the universe's symbols."""
+        if symbol in self._universe or not is_option_symbol(symbol):
             return False
-        return parse_option_symbol(symbol).underlying in self._settings.pinned_symbols
+        return parse_option_symbol(symbol).underlying in self._universe
 
     def _track_option(self, symbol: str, *, held: bool = False) -> _SymbolState | None:
         """The state for an option contract on one of the bot's symbols, created on first
@@ -870,21 +909,25 @@ class Engine:
             targets = list(call())
         except Exception as exc:
             log.exception("strategy raised")
-            if self._strategy_error is None:
-                self._strategy_error = f"{type(exc).__name__}: {exc}"
-            await self._alerts.send(
-                "strategy_error",
-                "Strategy error",
-                f"{self._strategy_error}. New entries are off until the bot is restarted. "
-                "Exits still work.",
-            )
+            await self._strategy_failed(exc)
             return
         for target in targets:
             await self._apply_target(target, now)
 
+    async def _strategy_failed(self, exc: Exception) -> None:
+        """No new entries until a restart. Exits keep working."""
+        if self._strategy_error is None:
+            self._strategy_error = f"{type(exc).__name__}: {exc}"
+        await self._alerts.send(
+            "strategy_error",
+            "Strategy error",
+            f"{self._strategy_error}. New entries are off until the bot is restarted. "
+            "Exits still work.",
+        )
+
     async def _apply_target(self, target: Target, now: datetime) -> None:
-        if target.symbol in self._settings.pinned_symbols:
-            st: _SymbolState | None = self._symbols[target.symbol]
+        if target.symbol in self._universe:
+            st: _SymbolState | None = self._symbols.setdefault(target.symbol, _SymbolState())
         else:
             st = self._track_option(target.symbol)
         if st is None:
@@ -928,6 +971,8 @@ class Engine:
             st.hold_until = now + timedelta(seconds=self.PRETRADE_RETRY_S)
             return
         account, open_orders = fresh
+        if self._symbols.get(symbol) is not st:
+            return  # the refresh dropped the symbol from the universe: it is not ours now
         known = {s.working.order_id for s in self._symbols.values() if s.working is not None}
         unknown = [o for o in open_orders if o.symbol == symbol and o.order_id not in known]
         if unknown:

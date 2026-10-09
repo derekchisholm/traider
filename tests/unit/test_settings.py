@@ -95,6 +95,7 @@ def test_restart_changes_lists_only_restart_fields():
     new = old.model_copy(
         update={
             "strategy_params": {"fast": 3, "slow": 9},
+            "pinned_symbols": ("QQQ",),  # live, so not listed
             "order_timeout_s": 5.0,
             "risk": old.risk.model_copy(update={"allow_options": True}),
         }
@@ -107,6 +108,7 @@ def test_merge_live_keeps_running_restart_fields_and_takes_the_rest():
     new = running.model_copy(
         update={
             "pinned_symbols": ("QQQ",),
+            "option_chain_days": 30,
             "order_timeout_s": 5.0,
             "risk": running.risk.model_copy(
                 update={"allow_options": True, "max_order_usd": Decimal(250)}
@@ -114,7 +116,8 @@ def test_merge_live_keeps_running_restart_fields_and_takes_the_rest():
         }
     )
     merged = merge_live(running, new)
-    assert merged.pinned_symbols == ("SPY",)
+    assert merged.pinned_symbols == ("QQQ",)  # live: the engine's universe follows it
+    assert merged.option_chain_days == running.option_chain_days
     assert merged.risk.allow_options is False
     assert merged.order_timeout_s == 5.0
     assert merged.risk.max_order_usd == Decimal(250)
@@ -124,7 +127,6 @@ def test_restart_fields_are_the_ones_the_process_cannot_change_under_itself():
     assert {
         "strategy",
         "strategy_params",
-        "pinned_symbols",
         "option_chain_days",
         "option_chain_strikes",
     } == RESTART_FIELDS

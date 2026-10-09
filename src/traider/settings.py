@@ -22,10 +22,11 @@ from traider.config import (
     check_symbols,
 )
 
-#: Fields a running bot keeps until it restarts: the strategy is built once, and the
-#: feed subscribes to its symbols and option chains at start-up.
+#: Fields a running bot keeps until it restarts: the strategy is built once, and the feed
+#: sets up its option chains at start-up. Pinned symbols apply live, through the engine's
+#: universe.
 RESTART_FIELDS = frozenset(
-    {"strategy", "strategy_params", "pinned_symbols", "option_chain_days", "option_chain_strikes"}
+    {"strategy", "strategy_params", "option_chain_days", "option_chain_strikes"}
 )
 #: Risk limits that are also fixed at start-up (the feed decides then whether to load chains).
 _RESTART_RISK_FIELDS = ("allow_options",)

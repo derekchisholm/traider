@@ -215,6 +215,7 @@ class Harness:
         begin=True,
         restart_of: Harness | None = None,
         settings_store=None,
+        on_universe=None,
     ) -> Harness:
         """``restart_of`` models a new process: same broker account, same durable state and
         the same wall clock, but an engine with empty memory."""
@@ -238,6 +239,7 @@ class Harness:
         self.control_source = MutableControl(control)
         self.alerts = LogAlerter()
         self.auth_seconds_left: float | None = None
+        self.universe_calls: list[tuple[str, ...]] = []
         fields: dict[str, Any] = {
             "symbols": tuple(symbols),
             "trading_mode": trading_mode,
@@ -275,6 +277,7 @@ class Harness:
             instance_id=instance,
             auth_seconds_left=lambda: self.auth_seconds_left,
             settings=self.live_settings,
+            on_universe=on_universe or self.universe_calls.append,
         )
         self.requote()
         if begin:
