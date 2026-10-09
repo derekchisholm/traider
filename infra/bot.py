@@ -98,6 +98,65 @@ def _image(settings: Settings) -> pulumi.Output[str]:
     return pulumi.Output.concat(repository.repository_url, "@", image.digest)
 
 
+def _alert_when_the_task_dies(
+    prefix: str, tags: dict[str, str], cluster: aws.ecs.Cluster, data: Data
+) -> None:
+    """Send an alert when a task crashes or cannot start. The bot cannot report its own
+    death, and a deploy made outside market hours is not exercised until the next open.
+    Clean stops (the evening schedule, a deploy) exit 0 and stay quiet."""
+    rule = aws.cloudwatch.EventRule(
+        "bot-stopped",
+        name=f"{prefix}-bot-stopped",
+        description="traider: the bot's task crashed or could not start",
+        event_pattern=pulumi.Output.json_dumps(
+            {
+                "source": ["aws.ecs"],
+                "detail-type": ["ECS Task State Change"],
+                "detail": {
+                    "clusterArn": [cluster.arn],
+                    "lastStatus": ["STOPPED"],
+                    "$or": [
+                        {"stopCode": ["TaskFailedToStart"]},
+                        {"containers": {"exitCode": [{"anything-but": 0}]}},
+                    ],
+                },
+            }
+        ),
+        tags=tags,
+    )
+    aws.cloudwatch.EventTarget(
+        "bot-stopped",
+        rule=rule.name,
+        arn=data.topic.arn,
+        input_transformer=aws.cloudwatch.EventTargetInputTransformerArgs(
+            input_paths={"reason": "$.detail.stoppedReason", "code": "$.detail.stopCode"},
+            input_template=(
+                "\"[traider] The bot's task stopped unexpectedly (<code>): <reason>. "
+                'ECS will try to start it again; check the logs if this repeats."'
+            ),
+        ),
+    )
+    aws.sns.TopicPolicy(
+        "alerts",
+        arn=data.topic.arn,
+        policy=pulumi.Output.json_dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "TaskStoppedAlarm",
+                        "Effect": "Allow",
+                        "Principal": {"Service": "events.amazonaws.com"},
+                        "Action": "sns:Publish",
+                        "Resource": data.topic.arn,
+                        "Condition": {"ArnEquals": {"aws:SourceArn": rule.arn}},
+                    }
+                ],
+            }
+        ),
+    )
+
+
 def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ssm.Parameter) -> Bot:
     prefix, tags = settings.prefix, settings.tags
     region = aws.get_region_output().region
@@ -221,7 +280,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
             "retries": 3,
             "startPeriod": 60,
         },
-        "stopTimeout": 60,  # time to cancel working orders on SIGTERM
+        "stopTimeout": 120,  # the most Fargate allows: time to cancel working orders
         "linuxParameters": {"initProcessEnabled": True},
     }
     task = aws.ecs.TaskDefinition(
@@ -237,11 +296,14 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
         execution_role_arn=execution_role.arn,
         task_role_arn=task_role.arn,
         container_definitions=pulumi.Output.json_dumps([container]),
+        # Keep old revisions registered: a rollback after a failed deploy needs one.
+        skip_destroy=True,
         tags=tags,
         opts=pulumi.ResourceOptions(depends_on=[execution_policy, task_policy]),
     )
 
     cluster = aws.ecs.Cluster("bot", name=prefix, tags=tags)
+    _alert_when_the_task_dies(prefix, tags, cluster, data)
     scheduled = not settings.always_on
     service = aws.ecs.Service(
         "bot",

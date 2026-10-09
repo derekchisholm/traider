@@ -250,7 +250,7 @@ def test_a_prebuilt_image_skips_the_docker_build():
 def test_container_has_a_liveness_check_and_time_to_shut_down(paper):
     definition = container(paper)
     assert definition["healthCheck"]["command"] == ["CMD", "python", "-m", "traider.health"]
-    assert definition["stopTimeout"] >= 30
+    assert definition["stopTimeout"] == 120  # the most Fargate allows: time to cancel orders
     assert definition["essential"] is True
     assert definition["command"] == ["run"]
 
@@ -652,21 +652,23 @@ def test_watchdog_runs_daily_and_is_given_the_sign_in_link(paper):
     env = environment(paper)
     assert variables["TOKEN_SECRET_ID"] == env["TRAIDER_SCHWAB_TOKEN_SECRET_ID"]
     assert variables["ALERT_TOPIC_ARN"] == env["TRAIDER_ALERT_TOPIC_ARN"]
-    rule = paper.one("aws:cloudwatch/eventRule:EventRule").inputs
+    rule = paper.one("aws:cloudwatch/eventRule:EventRule", "watchdog").inputs
     assert rule["scheduleExpression"].startswith("cron(")
-    target = paper.one("aws:cloudwatch/eventTarget:EventTarget").inputs
+    target = paper.one("aws:cloudwatch/eventTarget:EventTarget", "watchdog").inputs
     assert target["rule"] == rule["name"]
     assert target["arn"].endswith(f":Function/{function['name']}")
     permission = paper.one("aws:lambda/permission:Permission", "watchdog-schedule").inputs
     assert permission["principal"] == "events.amazonaws.com"
     assert permission["function"] == function["name"]
-    assert permission["sourceArn"] == paper.one("aws:cloudwatch/eventRule:EventRule").arn
+    assert (
+        permission["sourceArn"] == paper.one("aws:cloudwatch/eventRule:EventRule", "watchdog").arn
+    )
 
 
 def test_watchdog_timing_can_be_changed():
     custom = deploy({"reauthWarnHours": 72, "watchdogSchedule": "cron(0 13 * * ? *)"})
     assert custom.one(FUNCTION, "watchdog").inputs["environment"]["variables"]["WARN_HOURS"] == "72"
-    rule = custom.one("aws:cloudwatch/eventRule:EventRule").inputs
+    rule = custom.one("aws:cloudwatch/eventRule:EventRule", "watchdog").inputs
     assert rule["scheduleExpression"] == "cron(0 13 * * ? *)"
 
 
@@ -770,10 +772,61 @@ def test_stacks_do_not_share_names(paper, live):
     assert paper.one(SERVICE).inputs["name"] != live.one(SERVICE).inputs["name"]
 
 
+# --- noticing a bot that will not stay up -------------------------------------------------
+
+
+def test_a_task_that_crashes_or_cannot_start_raises_an_alert(paper):
+    rule = paper.one("aws:cloudwatch/eventRule:EventRule", "bot-stopped")
+    pattern = json.loads(rule.inputs["eventPattern"])
+    assert pattern["source"] == ["aws.ecs"]
+    assert pattern["detail-type"] == ["ECS Task State Change"]
+    detail = pattern["detail"]
+    assert detail["clusterArn"] == [paper.one("aws:ecs/cluster:Cluster").arn]
+    assert detail["lastStatus"] == ["STOPPED"]
+    # A clean stop (the 16:30 schedule, a deploy) exits 0 and must not page anyone.
+    assert detail["$or"] == [
+        {"stopCode": ["TaskFailedToStart"]},
+        {"containers": {"exitCode": [{"anything-but": 0}]}},
+    ]
+    target = paper.one("aws:cloudwatch/eventTarget:EventTarget", "bot-stopped").inputs
+    assert target["rule"] == rule.inputs["name"]
+    assert target["arn"] == paper.one(TOPIC).arn
+    assert "[traider]" in target["inputTransformer"]["inputTemplate"]
+
+
+def test_only_the_bot_its_functions_and_that_alarm_may_publish_alerts(paper):
+    policy = paper.one("aws:sns/topicPolicy:TopicPolicy").inputs
+    topic = paper.one(TOPIC).arn
+    assert policy["arn"] == topic
+    (statement,) = json.loads(policy["policy"])["Statement"]
+    assert statement["Effect"] == "Allow"
+    assert statement["Principal"] == {"Service": "events.amazonaws.com"}
+    assert statement["Action"] == "sns:Publish"
+    assert statement["Resource"] == topic
+    rule = paper.one("aws:cloudwatch/eventRule:EventRule", "bot-stopped").arn
+    assert statement["Condition"] == {"ArnEquals": {"aws:SourceArn": rule}}
+
+
+def test_old_task_definitions_are_kept_so_a_failed_deploy_can_roll_back(paper):
+    assert paper.one(TASK).inputs["skipDestroy"] is True
+
+
+def test_the_bot_stops_after_it_starts():
+    with pytest.raises(Exception, match="stopTime"):
+        deploy({"startTime": "16:30", "stopTime": "09:00"})
+
+
 # --- the example configuration ----------------------------------------------------------
 
 # Settings the example shows with a value that is not the default.
-NOT_DEFAULTS = {"flattenBeforeCloseMin", "accountLast4", "alertEmail", "schwabCallbackUrl", "image"}
+NOT_DEFAULTS = {
+    "flattenBeforeCloseMin",
+    "accountLast4",
+    "accountHash",
+    "alertEmail",
+    "schwabCallbackUrl",
+    "image",
+}
 
 
 def example_config(*, everything: bool) -> dict[str, Any]:
