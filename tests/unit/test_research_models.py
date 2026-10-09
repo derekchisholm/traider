@@ -64,6 +64,82 @@ def test_bad_picks_are_rejected(bad):
         pick(**bad)
 
 
+def run_meta(**overrides) -> RunMeta:
+    fields = {
+        "run_id": "r1",
+        "kind": "premarket",
+        "status": "ok",
+        "started_at": T0.isoformat(),
+        "trading_day": "2026-10-09",
+    }
+    return RunMeta.model_validate(fields | overrides)
+
+
+def posture(**overrides) -> Posture:
+    fields = {"level": "trade", "run_id": "r1", "at": T0.isoformat()}
+    return Posture.model_validate(fields | overrides)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"rank": True},
+        {"rank": 1.0},
+        {"rank": "1"},
+        {"score": True},
+        {"score": 80.0},
+        {"score": "80"},
+        {"pre_score": 70.0},
+        {"pre_score": "70"},
+    ],
+)
+def test_pick_numbers_are_strict_ints(bad):
+    with pytest.raises(ValidationError):
+        pick(**bad)
+
+
+def test_pick_numbers_still_parse_from_json():
+    assert Pick.model_validate_json(pick().model_dump_json()) == pick()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_pick_features_reject_nan_and_inf(bad):
+    with pytest.raises(ValidationError):
+        pick(features={"gap_pct": bad})
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_posture_metrics_reject_nan_and_inf(bad):
+    with pytest.raises(ValidationError):
+        posture(metrics={"vix": bad})
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_run_cost_rejects_nan_and_infinity(bad):
+    with pytest.raises(ValidationError):
+        run_meta(cost_usd=bad)
+
+
+def test_naive_posture_time_is_rejected():
+    with pytest.raises(ValidationError, match="timezone"):
+        posture(at="2026-10-09T12:00:00")
+
+
+def test_naive_run_start_is_rejected():
+    with pytest.raises(ValidationError, match="timezone"):
+        run_meta(started_at="2026-10-09T12:00:00")
+
+
+def test_naive_run_finish_is_rejected():
+    with pytest.raises(ValidationError, match="timezone"):
+        run_meta(finished_at="2026-10-09T12:00:00")
+
+
+def test_aware_run_finish_is_accepted_and_may_be_absent():
+    assert run_meta(finished_at=T0.isoformat()).finished_at == T0
+    assert run_meta().finished_at is None
+
+
 def test_posture_and_run_meta_parse():
     posture = Posture.model_validate(
         {"level": "stand_aside", "reasons": ["CPI at 08:30"], "run_id": "r1", "at": T0.isoformat()}

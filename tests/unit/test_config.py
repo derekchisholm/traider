@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from traider.config import Config, ConfigError
+from traider.config import Config, ConfigError, ResearchSettings
 
 BASE = {"TRAIDER_SYMBOLS": "spy, qqq"}
 LIVE = {
@@ -143,8 +143,31 @@ def test_research_settings_come_from_json():
 
 
 @pytest.mark.parametrize(
-    "bad", ['{"max_symbols": 26}', '{"intraday_share": 1.5}', '{"reduced_factor": 0}', '{"x": 1}']
+    "bad",
+    [
+        '{"max_symbols": 26}',
+        '{"intraday_share": 1.5}',
+        '{"reduced_factor": 0}',
+        '{"reduced_factor": 1.5}',
+        '{"intraday_share": -0.1}',
+        '{"max_stale_s": 59}',
+        '{"max_stale_s": 3601}',
+        '{"x": 1}',
+    ],
 )
 def test_bad_research_settings_are_rejected(bad):
     with pytest.raises(ConfigError):
         Config.from_env({**BASE, "TRAIDER_RESEARCH": bad})
+
+
+def test_research_settings_defaults_match_the_brief():
+    s = ResearchSettings()
+    assert s.poll_s == 60.0
+    assert s.max_stale_s == 600.0
+    assert s.min_score == 60
+    assert s.max_symbols == 25
+    assert s.accept_partial_runs is False
+    assert s.intraday_share == Decimal("0.5")
+    assert s.reduced_factor == Decimal("0.5")
+    assert s.intraday_flatten_min == 15
+    assert s.swing_lookback_days == 10

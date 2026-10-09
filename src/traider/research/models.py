@@ -15,7 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from traider.config import check_symbols
 
-Score = Annotated[int, Field(ge=0, le=100)]
+Score = Annotated[int, Field(strict=True, ge=0, le=100)]
+Finite = Annotated[float, Field(allow_inf_nan=False)]
 RunKind = Literal[
     "premarket",
     "intraday",
@@ -61,7 +62,7 @@ class Pick(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     run_id: str = Field(min_length=1, max_length=100)
-    rank: int = Field(ge=1, le=999)
+    rank: int = Field(strict=True, ge=1, le=999)
     symbol: str
     side: PickSide
     horizon: Horizon
@@ -71,7 +72,7 @@ class Pick(BaseModel):
     invalidation: Decimal = Field(gt=0)
     earnings_date: date | None = None
     expires_at: datetime
-    features: dict[str, float] = Field(default_factory=dict)
+    features: dict[str, Finite] = Field(default_factory=dict)
 
     @field_validator("symbol")
     @classmethod
@@ -91,7 +92,7 @@ class Posture(BaseModel):
     reasons: tuple[Annotated[str, Field(max_length=500)], ...] = ()
     run_id: str = Field(min_length=1, max_length=100)
     at: datetime
-    metrics: dict[str, float] = Field(default_factory=dict)
+    metrics: dict[str, Finite] = Field(default_factory=dict)
 
     @field_validator("at")
     @classmethod
@@ -117,3 +118,8 @@ class RunMeta(BaseModel):
     @classmethod
     def _started_aware(cls, value: datetime) -> datetime:
         return _aware(value)
+
+    @field_validator("finished_at")
+    @classmethod
+    def _finished_aware(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _aware(value)
