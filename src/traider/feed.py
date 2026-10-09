@@ -5,8 +5,8 @@
 * One-minute bars come from the stream's chart service, or from price history
   when polling. ``MarketData`` drops duplicates, so both may deliver a minute.
 * Option contracts are not on the stream. The ones the engine is watching are
-  always quoted by polling, and with options switched on each symbol's option
-  chain is reloaded once a minute for the strategy to choose from.
+  always quoted by polling. With options switched on, a separate task reloads
+  each symbol's option chain once a minute for the strategy to choose from.
 * Only regular-session bars reach the strategy, which matches the history it
   is warmed up and backtested on.
 """
@@ -71,7 +71,7 @@ class Feed:
         self._chains_wanted = config.risk.allow_options
         self._chain_span = timedelta(days=config.option_chain_days)
         self._chain_strikes = config.option_chain_strikes
-        self._chains_at: datetime | None = None
+        self._chain_tried_at: dict[str, datetime] = {}
         self._bars_fetched_for: datetime | None = None
         self._complained_at: datetime | None = None
 
@@ -119,15 +119,17 @@ class Feed:
         while not await self.warmup(warmup_bars):
             await self._sleep(warmup_retry_s)
         interval = self._poll_interval_s if poll_interval_s is None else poll_interval_s
-        stream_task = asyncio.create_task(self._stream.run()) if self._stream is not None else None
+        tasks = [asyncio.create_task(self._stream.run())] if self._stream is not None else []
+        if self._chains_wanted:
+            tasks.append(asyncio.create_task(self._keep_chains_fresh(interval)))
         try:
             while True:
                 await self._sleep(interval)  # the stream gets the first chance
                 await self.poll_once()
         finally:
-            if stream_task is not None:
-                stream_task.cancel()
-                await asyncio.gather(stream_task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def warmup(self, bars_wanted: int) -> bool:
         """Replay recent history so the strategy does not start cold. False means try again."""
@@ -184,14 +186,20 @@ class Feed:
                     self._market.on_quote(quote)
             except SchwabError as exc:
                 self._complain(now, "option quote poll failed: %s", exc)
-        if not self._chains_wanted:
-            return
-        last = self._chains_at
-        if last is not None and (now - last).total_seconds() < self.CHAIN_REFRESH_S:
+
+    async def refresh_chains(self) -> None:
+        """Reload the option chain of every symbol whose chain is a minute old. Kept apart
+        from the quote polls: chains only help a strategy choose, and a slow or failing
+        chain endpoint must not delay the quotes that orders depend on."""
+        now = self._clock.now()
+        if not self._chains_wanted or not self._session.view(now).is_open:
             return
         today = trading_date(now)
-        complete = True
         for symbol in self._symbols:
+            last = self._chain_tried_at.get(symbol)
+            if last is not None and (now - last).total_seconds() < self.CHAIN_REFRESH_S:
+                continue
+            self._chain_tried_at[symbol] = now  # failures wait their turn too
             try:
                 raw = await self._client.option_chain(
                     symbol, today, today + self._chain_span, strikes=self._chain_strikes
@@ -200,9 +208,12 @@ class Feed:
             except SchwabError as exc:
                 # A strategy must not choose from prices that are no longer being updated.
                 self._market.set_chain(symbol, ())
-                complete = False
-                self._complain(now, "option chain not available: %s", exc)
-        self._chains_at = now if complete else None
+                self._complain(now, "option chain for %s not available: %s", symbol, exc)
+
+    async def _keep_chains_fresh(self, interval: float) -> None:
+        while True:
+            await self.refresh_chains()
+            await self._sleep(interval)
 
     def _complain(self, now: datetime, message: str, *args: object) -> None:
         if self._complained_at is None or (now - self._complained_at).total_seconds() >= 60:

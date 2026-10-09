@@ -162,6 +162,7 @@ class Engine:
         self._pretrade: tuple[datetime, AccountSnapshot, list[BrokerOrder]] | None = None
         self._throttled: dict[str, datetime] = {}
         self._seen_order_ids: set[str] = set()  # every order this process has tracked
+        self._expiry_noticed: set[str] = set()  # contracts already announced as expiring today
 
     # ------------------------------------------------------------------ public
 
@@ -170,7 +171,8 @@ class Engine:
         return self._leader
 
     def target(self, symbol: str) -> Target | None:
-        return self._symbols[symbol].target
+        st = self._symbols.get(symbol)
+        return st.target if st is not None else None
 
     async def start(self) -> None:
         """Load today's counters. Open orders are picked up when the lease is won."""
@@ -181,7 +183,7 @@ class Engine:
         instance that holds the lease may touch them, so this runs on gaining it."""
         for record in await self._state.open_orders():
             st = self._symbols.setdefault(record.symbol, _SymbolState())
-            if is_option_symbol(record.symbol):
+            if self._is_our_option(record.symbol):
                 self._market.watch(record.symbol)
             if st.working is None:
                 self._seen_order_ids.add(record.order_id)
@@ -305,6 +307,7 @@ class Engine:
             for st in self._symbols.values():
                 st.target = None
             self._forget_idle_options()
+            self._expiry_noticed.clear()
             self._unsaved_sold, self._unsaved_halt = Decimal(0), None
         try:
             loaded = await self._state.get_day(day)
@@ -343,23 +346,28 @@ class Engine:
         self._account_dirty = False
         if self._risk.limits.allow_options:
             for symbol, held in account.positions.items():
-                if held.quantity > 0:
-                    self._track_option(symbol)
+                if held.quantity > 0 and self._track_option(symbol, held=True) is not None:
+                    await self._warn_of_expiry(symbol, held.quantity, now)
         await self._settle_pending(account, now)
         await self._check_daily_loss(account, now)
 
-    def _track_option(self, symbol: str) -> _SymbolState | None:
+    def _is_our_option(self, symbol: str) -> bool:
+        """An option contract on one of the configured symbols."""
+        if symbol in self._config.symbols or not is_option_symbol(symbol):
+            return False
+        return parse_option_symbol(symbol).underlying in self._config.symbols
+
+    def _track_option(self, symbol: str, *, held: bool = False) -> _SymbolState | None:
         """The state for an option contract on one of the bot's symbols, created on first
-        sight. None for anything else, or when too many contracts are in play already."""
+        sight. None for anything else, or when too many contracts are in play already.
+        A contract that is in the account is always tracked: it may need selling."""
+        if not self._is_our_option(symbol):
+            return None
         st = self._symbols.get(symbol)
         if st is not None:
-            return st if symbol not in self._config.symbols else None
-        if not is_option_symbol(symbol):
-            return None
-        if parse_option_symbol(symbol).underlying not in self._config.symbols:
-            return None
-        options = sum(1 for known in self._symbols if known not in self._config.symbols)
-        if options >= self.MAX_OPTION_SYMBOLS:
+            return st
+        options = sum(1 for known in self._symbols if self._is_our_option(known))
+        if options >= self.MAX_OPTION_SYMBOLS and not held:
             self._log_throttled(
                 "options-cap",
                 self._clock.now(),
@@ -372,11 +380,39 @@ class Engine:
         self._market.watch(symbol)
         return st
 
+    async def _warn_of_expiry(self, symbol: str, quantity: int, now: datetime) -> None:
+        """Tell the operator about a held option on its last day. This runs on every
+        account snapshot and does not depend on the bot being able to sell: a halt, a
+        frozen symbol or unknown market hours are exactly when a person has to act."""
+        if parse_option_symbol(symbol).days_to_expiry(trading_date(now)) > 0:
+            return
+        exercise = (
+            "An option left to expire in the money is exercised into 100 shares per contract."
+        )
+        if symbol not in self._expiry_noticed:
+            self._expiry_noticed.add(symbol)
+            await self._alerts.send(
+                f"option_expiring:{symbol}",
+                f"{symbol} expires today",
+                f"The account holds {quantity} contract(s) of {symbol}, which expire today. "
+                f"The bot will try to sell them in the last "
+                f"{self._risk.limits.option_expiry_exit_min} minutes before the close, if it "
+                f"is allowed to trade then. {exercise}",
+            )
+        if self._expiring_now(symbol, now):
+            await self._alerts.send(
+                f"option_unsold:{symbol}",
+                f"{symbol} expires today and is still held",
+                f"{quantity} contract(s) of {symbol} are still in the account and the close "
+                "is near. The bot sells them if it can; if this alert repeats, it is not "
+                f"getting it done. Sell them at Schwab or tell Schwab not to exercise. {exercise}",
+            )
+
     def _forget_idle_options(self) -> None:
         """Stop tracking contracts that are not being traded. The ones still held are
         picked up again from the next account snapshot."""
         for symbol, st in list(self._symbols.items()):
-            if symbol in self._config.symbols or self._busy(st):
+            if not self._is_our_option(symbol) or self._busy(st):
                 continue
             del self._symbols[symbol]
             self._market.unwatch(symbol)
@@ -722,23 +758,6 @@ class Engine:
         if target is None or account is None:
             return
         position = account.position(symbol)
-        if position > 0 and self._expiring_now(symbol, now):
-            await self._alerts.send(
-                f"option_expiring:{symbol}",
-                f"Selling {symbol} before it expires",
-                f"{position} contract(s) of {symbol} expire today and the bot is selling them "
-                "before the close. If they are still in the account at the close, deal with "
-                "them yourself: an option left to expire in the money is exercised.",
-            )
-        if position < 0:
-            self._log_throttled(
-                f"short:{symbol}",
-                now,
-                "%s: account is short %s; the bot does not manage shorts",
-                symbol,
-                position,
-            )
-            return
         if target == position:
             return
 
@@ -792,7 +811,7 @@ class Engine:
         because one left to expire in the money is exercised into a hundred shares per
         contract, which no limit here was sized for."""
         limits = self._risk.limits
-        if not limits.allow_options or symbol in self._config.symbols:
+        if not limits.allow_options or not self._is_our_option(symbol):
             return False
         if parse_option_symbol(symbol).days_to_expiry(trading_date(now)) > 0:
             return False
@@ -822,7 +841,7 @@ class Engine:
         now = self._clock.now()
         if self._flatten_now(now) and side is Side.SELL:
             reason = "flatten before close"
-        option = symbol not in self._config.symbols
+        option = is_option_symbol(symbol)
         if option and self._expiring_now(symbol, now) and side is Side.SELL:
             reason = "option expires today"
         if self._config.order_type == "MARKET" and not option:

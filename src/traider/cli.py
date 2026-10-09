@@ -267,7 +267,8 @@ async def _check_options(
     report.ok("option chain", f"{len(chain)} contracts for {symbol}")
     contract = chain[len(chain) // 2].symbol
     try:
-        quote = parse_quotes(await client.quotes([contract]), now).get(contract)
+        raw_quotes = await client.quotes([contract])
+        quote = parse_quotes(raw_quotes, now).get(contract)
     except SchwabError as exc:
         report.fail("option quote", str(exc))
         return
@@ -278,6 +279,18 @@ async def _check_options(
             "option quote",
             f"{contract}: {quote.bid:.2f} x {quote.ask:.2f} but delayed; "
             "the bot only trades on real-time quotes",
+        )
+    elif quote.halted:
+        status = raw_quotes.get(contract, {}).get("quote", {}).get("securityStatus")
+        report.fail(
+            "option quote",
+            f"{contract}: Schwab reports its status as {status!r}, not 'Normal'; "
+            "the bot would not trade it",
+        )
+    elif quote.bid <= 0:
+        report.fail(
+            "option quote",
+            f"{contract}: no bid ({quote.bid:.2f} x {quote.ask:.2f}); the bot would not trade it",
         )
     else:
         report.ok("option quote", f"{contract}: {quote.bid:.2f} x {quote.ask:.2f}")

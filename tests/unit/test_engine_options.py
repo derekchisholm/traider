@@ -36,6 +36,12 @@ async def ask_for(h: Harness, symbol: str, quantity: int, reason: str = "test") 
     await h.engine.step()
 
 
+async def ask_for_on(h: Harness, underlying: str, symbol: str, quantity: int) -> None:
+    h.strategy.bar_targets.append(Target(symbol, quantity, "test"))
+    h.bar(underlying)
+    await h.engine.step()
+
+
 async def hold(h: Harness, symbol: str, quantity: int = 1) -> None:
     """Put contracts in the account without the engine having bought them."""
     await h.broker.place(OrderRequest(symbol, Side.BUY, quantity, OrderType.LIMIT, Decimal("2.10")))
@@ -182,7 +188,6 @@ async def test_an_option_is_sold_on_its_last_day_before_the_close(tmp_path):
         )
     ]
     assert h.position(TODAY_CALL) == 0
-    assert f"option_expiring:{TODAY_CALL}" in h.alert_keys()
 
 
 async def test_the_exit_window_before_expiry_can_be_changed(tmp_path):
@@ -278,3 +283,124 @@ async def test_the_strategy_can_read_the_option_chain(h):
     await h.engine.step()
     ctx = h.strategy.contexts[-1]
     assert (ctx.chain("SPY"), ctx.chain("QQQ")) == ((line,), ())
+
+
+# --- being told about an expiring option, whether or not the bot can sell it ------
+
+
+def expiry_alerts(h: Harness, kind: str = "option_expiring") -> list[str]:
+    return [key for key in h.alert_keys() if key.startswith(kind + ":")]
+
+
+async def test_you_are_told_once_early_in_the_day_that_an_option_expires_today(tmp_path):
+    h = await bench(tmp_path, start=TWO_PM)
+    await hold(h, TODAY_CALL)
+    await h.run_for(65)  # three account snapshots
+    assert expiry_alerts(h) == [f"option_expiring:{TODAY_CALL}"]
+    assert h.broker.placed == []
+
+
+async def test_no_expiry_notice_for_an_option_with_days_left(tmp_path):
+    h = await bench(tmp_path, start=TWO_PM)
+    await hold(h, CALL)
+    await h.run_for(65)
+    assert expiry_alerts(h) == []
+
+
+async def test_no_expiry_notice_while_options_are_off(tmp_path):
+    h = await bench(tmp_path, start=TWO_PM, options=False)
+    await hold(h, TODAY_CALL)
+    await h.run_for(65)
+    assert expiry_alerts(h) == []
+
+
+async def test_the_expiry_notice_does_not_depend_on_knowing_market_hours(tmp_path):
+    class NoHours:
+        async def session_for(self, day):
+            return None
+
+    h = await bench(tmp_path, start=TWO_PM, session_provider=NoHours())
+    await hold(h, TODAY_CALL)
+    await h.run_for(35)
+    assert expiry_alerts(h) == [f"option_expiring:{TODAY_CALL}"]
+
+
+async def test_in_the_exit_window_you_are_alerted_for_as_long_as_the_option_is_held(tmp_path):
+    h = await bench(tmp_path, start=TWO_PM, control="halt")  # the bot may not sell
+    await hold(h, TODAY_CALL)
+    await h.run_for(35)
+    assert expiry_alerts(h, "option_unsold") == []
+    h.clock.advance(3600)
+    await h.run_for(65)
+    assert h.position(TODAY_CALL) == 1
+    assert len(expiry_alerts(h, "option_unsold")) >= 2  # the alerter spaces repeats out
+    message = next(m for key, _, m in h.alerts.sent if key.startswith("option_unsold:"))
+    assert "still" in message and "exercised" in message
+
+
+async def test_no_unsold_alert_once_the_expiring_option_is_gone(tmp_path):
+    h = await bench(tmp_path, start=TWO_PM)
+    await hold(h, TODAY_CALL)
+    h.clock.advance(3600)
+    await h.run_for(15)
+    assert h.position(TODAY_CALL) == 0
+    sent = len(expiry_alerts(h, "option_unsold"))
+    await h.run_for(65)
+    assert len(expiry_alerts(h, "option_unsold")) == sent
+
+
+# --- symbols that are not the bot's ---------------------------------------------
+
+
+async def restart_with_symbols(tmp_path, old: Harness, symbols) -> Harness:
+    return await Harness.create(
+        tmp_path, restart_of=old, symbols=symbols, risk={"allow_options": True}
+    )
+
+
+async def test_an_order_resumed_on_a_symbol_no_longer_traded_does_no_harm(tmp_path):
+    old = await bench(tmp_path, symbols=("SPY", "QQQ"))
+    old.broker.hold_fills = True
+    await old.target("QQQ", 3)
+    h = await restart_with_symbols(tmp_path, old, ("SPY",))
+    h.prices = {"SPY": ("100.00", "100.02"), "QQQ": ("100.00", "100.02")}
+    h.broker.hold_fills = False
+    await h.run_for(30)  # the old order finishes; nothing may raise
+    assert h.position("QQQ") == 3
+    await h.target("QQQ", 5)  # and the strategy cannot trade it
+    await h.settle()
+    assert h.position("QQQ") == 3
+    assert h.alert_keys() == []
+
+
+async def test_a_resumed_order_on_another_symbols_option_does_not_make_it_ours(tmp_path):
+    expiring = "QQQ   261008C00400000"
+    old = await bench(tmp_path, symbols=("SPY", "QQQ"), start=TWO_PM)
+    old.price(expiring, "2.00", "2.10")
+    await hold(old, expiring, 2)
+    await old.run_for(31)
+    old.broker.hold_fills = True
+    await ask_for_on(old, "QQQ", expiring, 1)  # a sell of one is left working
+    h = await restart_with_symbols(tmp_path, old, ("SPY",))
+    h.prices = dict(old.prices)
+    h.broker.hold_fills = False
+    await h.run_for(30)
+    assert h.position(expiring) == 1
+    h.clock.advance(3600)  # into the exit window
+    await h.run_for(40)
+    assert h.position(expiring) == 1
+    assert expiry_alerts(h) == []
+
+
+async def test_a_held_contract_is_tracked_even_when_the_list_is_full(tmp_path):
+    h = await bench(tmp_path, start=TWO_PM)
+    for strike in range(400, 400 + h.engine.MAX_OPTION_SYMBOLS):
+        await ask_for(h, f"SPY   261016C00{strike}000", 0)
+    await hold(h, TODAY_CALL)
+    h.clock.advance(3600)
+    await h.run_for(40)
+    assert h.position(TODAY_CALL) == 0
+
+
+async def test_asking_what_the_target_is_for_an_unknown_contract_is_not_an_error(h):
+    assert h.engine.target(CALL) is None

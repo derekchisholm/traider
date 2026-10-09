@@ -233,9 +233,10 @@ def parse_option_chain(raw: Any) -> list[OptionQuote]:
                         continue
                     if bid is None or ask is None or not isinstance(days, int):
                         continue
-                    found[symbol] = OptionQuote(
-                        symbol, bid, ask, _decimal(entry.get("delta")), days
-                    )
+                    delta = _decimal(entry.get("delta"))
+                    if delta is not None and abs(delta) > 1:
+                        delta = None  # Schwab sends -999 for a delta it has not computed
+                    found[symbol] = OptionQuote(symbol, bid, ask, delta, days)
     return [found[symbol] for symbol in sorted(found)]
 
 

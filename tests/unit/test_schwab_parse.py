@@ -679,3 +679,13 @@ def test_option_market_orders_are_never_built():
 def test_share_orders_are_built_as_before():
     request = OrderRequest("SPY", Side.BUY, 3, OrderType.LIMIT, Decimal("512.34"))
     assert build_order(request) == build_equity_order(request)
+
+
+@pytest.mark.parametrize("junk", [-999.0, -999, 1.5, -1.01, "NaN"])
+def test_a_delta_that_cannot_be_a_delta_is_read_as_unknown(junk):
+    payload = chain_payload()
+    first_expiry = next(iter(payload["callExpDateMap"].values()))
+    for entries in first_expiry.values():
+        for entry in entries:
+            entry["delta"] = junk
+    assert {q.delta for q in parse_option_chain(payload) if q.contract.right == "C"} == {None}

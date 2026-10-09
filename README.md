@@ -129,15 +129,19 @@ What changes when a target names an option contract instead of a share symbol:
   an option may have left when bought.
 - **Sold before expiry.** On its last day an option is sold in the final hour
   (`option_expiry_exit_min`, default 60 minutes before the close), whatever the
-  strategy says, and you get an alert. This applies to every long option on a
-  configured symbol in the account, not only ones the bot bought.
+  strategy says. This applies to every long option on a configured symbol in the
+  account, not only ones the bot bought. You get one alert when the bot first sees
+  such a holding that day, and repeated alerts during the final hour for as long
+  as it is still in the account.
 
 That last rule exists because of the one way a long option can cost more than its
 premium: **an option left to expire in the money is exercised automatically**, which
 buys (call) or sells (put) 100 shares per contract at the strike. No limit here is
-sized for that. The exit is a limit order at the bid and can fail: no bid, a halt, a
-lapsed sign-in, the bot not running. If you get the alert and the contracts are
-still in the account near the close, sell them or tell Schwab not to exercise.
+sized for that. The exit is a limit order at the bid and can fail: no bid, a stale
+quote, the control switch on `halt`, a lapsed sign-in. The alerts are sent whether
+or not the bot is able to sell, but not if the bot is not running at all. If the
+contracts are still in the account near the close, sell them or tell Schwab not to
+exercise.
 
 Other things to know:
 
@@ -151,7 +155,9 @@ Other things to know:
 - A thinly traded contract can go minutes without a new quote. The frozen-quote
   check (`max_quote_lag_s`, 120 seconds) then blocks orders on it, sells included.
   Stick to liquid contracts or raise it.
-- At most 20 contracts are tracked at once.
+- At most 20 contracts are tracked at once. Every contract a strategy names counts,
+  even with a target of 0, until the next day; contracts actually in the account
+  are always tracked.
 - **Backtests do not cover options.** There is no historical option data in a bar
   file, so option targets in a backtest never trade.
 - Option proceeds settle the next business day, like shares, and the
@@ -184,7 +190,8 @@ Not verified. Treat each as something to watch on first contact:
   Schwab reports an option position are all taken from the same two libraries, and
   none of it has met the real API. Whether Schwab marks option quotes as real-time
   for your app decides whether the bot will trade them at all; with `allow_options`
-  on, `traider check` reads a chain and one contract's quote and tells you. Paper
+  on, `traider check` reads a chain and one contract's quote and fails if the bot
+  would refuse to trade on it. Paper
   trade options before anything else.
 - **`pulumi up` has never been run.** The mocks prove the program is self-consistent
   and uses argument names the providers accept. They do not prove AWS accepts every
@@ -372,6 +379,8 @@ With [options](#options) switched on, a target may name a contract instead of a
 share symbol, and the quantity is then a number of contracts:
 
 ```python
+        if any(held for symbol, held in ctx.positions.items() if symbol != bar.symbol):
+            return []  # already in a contract
         calls = [c for c in ctx.chain(bar.symbol) if c.contract.right == "C"]
         picks = [c for c in calls if 20 <= c.days_to_expiry <= 40 and c.delta is not None]
         if picks:
@@ -379,8 +388,11 @@ share symbol, and the quantity is then a number of contracts:
             return [Target(best.symbol, quantity=1, reason="why")]
 ```
 
-To close it, return a target of 0 for the same contract symbol; `ctx.positions`
-lists what is held. Quotes for held contracts reach `on_quote` too.
+A target belongs to one contract and stands until the strategy changes it or the day
+ends. Asking for a different contract does not cancel the first: a strategy that
+names a new "best" contract on every bar ends up holding several. To close a
+position, return a target of 0 for that contract's symbol; `ctx.positions` lists
+what is held. Quotes for held contracts reach `on_quote` too.
 
 Keep a strategy deterministic and free of I/O. On a restart it is rebuilt from
 recent bars, and the engine only ever trades the difference between its target and

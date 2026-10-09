@@ -399,7 +399,7 @@ async def test_option_chains_are_loaded_when_options_are_on(schwab, client, sign
     async with make_feed(
         schwab, client, signed_in, options=True, option_chain_days=30, option_chain_strikes=12
     ) as feed:
-        await feed.poll_once()
+        await feed.refresh_chains()
         chain = feed.market.chain("SPY")
     assert [(line.symbol, line.delta, line.days_to_expiry) for line in chain] == [
         (CALL, Decimal("0.45"), 8),
@@ -416,20 +416,20 @@ async def test_option_chains_are_loaded_when_options_are_on(schwab, client, sign
 async def test_no_chains_are_loaded_while_options_are_off(schwab, client, signed_in):
     schwab.add_option(CALL, 2.00, 2.10)
     async with make_feed(schwab, client, signed_in) as feed:
-        await feed.poll_once()
+        await feed.refresh_chains()
         assert feed.market.chain("SPY") == ()
     assert schwab.calls("GET", "/marketdata/v1/chains") == []
 
 
-async def test_chains_are_refreshed_once_a_minute_not_on_every_poll(schwab, client, signed_in):
+async def test_chains_are_refreshed_once_a_minute(schwab, client, signed_in):
     schwab.add_option(CALL, 2.00, 2.10)
     async with make_feed(schwab, client, signed_in, options=True) as feed:
-        await feed.poll_once()
+        await feed.refresh_chains()
         feed.clock.advance(30)
-        await feed.poll_once()
+        await feed.refresh_chains()
         assert len(schwab.calls("GET", "/marketdata/v1/chains")) == 1
         feed.clock.advance(30)
-        await feed.poll_once()
+        await feed.refresh_chains()
         assert len(schwab.calls("GET", "/marketdata/v1/chains")) == 2
 
 
@@ -438,15 +438,64 @@ async def test_a_chain_that_cannot_be_refreshed_is_dropped_not_kept_stale(
 ):
     schwab.add_option(CALL, 2.00, 2.10)
     async with make_feed(schwab, client, signed_in, options=True) as feed:
-        await feed.poll_once()
+        await feed.refresh_chains()
         assert feed.market.chain("SPY") != ()
         feed.clock.advance(60)
-        schwab.fail("GET", "/marketdata/v1/chains", 500, times=4)
-        await feed.poll_once()
+        schwab.fail("GET", "/marketdata/v1/chains", 500, times=3)
+        await feed.refresh_chains()
         assert feed.market.chain("SPY") == ()
-        feed.clock.advance(5)  # and it is tried again on the next poll, not a minute later
-        await feed.poll_once()
+
+
+async def test_a_failing_chain_is_not_hammered(schwab, client, signed_in):
+    schwab.fail("GET", "/marketdata/v1/chains", 500, times=99)
+    async with make_feed(schwab, client, signed_in, options=True, symbols=("SPY", "QQQ")) as feed:
+        for _ in range(6):  # half a minute of polls
+            await feed.refresh_chains()
+            feed.clock.advance(5)
+        asked = [c["query"]["symbol"] for c in schwab.calls("GET", "/marketdata/v1/chains")]
+        assert sorted(set(asked)) == ["QQQ", "SPY"]
+        assert len(asked) == 6  # one round for each symbol: three tries apiece
+        feed.clock.advance(30)
+        schwab.add_option(CALL, 2.00, 2.10)
+        schwab._faults.clear()
+        await feed.refresh_chains()
         assert feed.market.chain("SPY") != ()
+
+
+async def test_one_symbols_chain_failing_does_not_cost_the_others_theirs(schwab, client, signed_in):
+    schwab.add_option(CALL, 2.00, 2.10)
+    schwab.fail("GET", "/marketdata/v1/chains", 500, times=3)  # QQQ is asked first
+    async with make_feed(schwab, client, signed_in, options=True, symbols=("QQQ", "SPY")) as feed:
+        await feed.refresh_chains()
+        assert (feed.market.chain("QQQ"), len(feed.market.chain("SPY"))) == ((), 1)
+
+
+async def test_a_dead_chain_endpoint_does_not_hold_up_option_quotes(schwab, client, signed_in):
+    schwab.add_option(CALL, 2.00, 2.10)
+    schwab.fail("GET", "/marketdata/v1/chains", 500, times=99)
+    async with make_feed(schwab, client, signed_in, options=True) as feed:
+        feed.market.watch(CALL)
+        await feed.poll_once()
+        assert feed.market.quote(CALL) is not None
+    assert schwab.calls("GET", "/marketdata/v1/chains") == []  # polling does not load chains
+
+
+async def test_no_chains_are_loaded_while_the_market_is_closed(schwab, client, signed_in):
+    schwab.add_option(CALL, 2.00, 2.10)
+    night = datetime(2026, 10, 8, 2, 0, tzinfo=UTC)
+    async with make_feed(schwab, client, signed_in, options=True, now=night) as feed:
+        await feed.refresh_chains()
+    assert schwab.calls("GET", "/marketdata/v1/chains") == []
+
+
+async def test_run_keeps_the_chains_loaded(schwab, client, signed_in):
+    schwab.add_option(CALL, 2.00, 2.10)
+    async with make_feed(schwab, client, signed_in, options=True) as feed:
+        task = asyncio.create_task(feed.run(warmup_bars=0, poll_interval_s=0.01))
+        await until(lambda: feed.market.chain("SPY") != ())
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def test_no_option_data_is_polled_while_the_market_is_closed(schwab, client, signed_in):

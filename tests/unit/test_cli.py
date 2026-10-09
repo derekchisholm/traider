@@ -221,6 +221,21 @@ async def test_check_fails_on_delayed_option_quotes(schwab, tmp_path):
     assert "delayed" in text
 
 
+async def test_check_fails_on_an_option_quote_schwab_does_not_call_normal(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10)
+    schwab.quotes[CALL]["quote"]["securityStatus"] = "Unknown"
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "Unknown" in text and "would not trade" in text
+
+
+async def test_check_fails_on_an_option_with_no_bid(schwab, tmp_path):
+    schwab.add_option(CALL, 0.0, 0.05)
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "no bid" in text
+
+
 async def test_check_fails_when_an_option_has_no_quote(schwab, tmp_path):
     schwab.add_option(CALL, 2.00, 2.10)
     del schwab.quotes[CALL]
