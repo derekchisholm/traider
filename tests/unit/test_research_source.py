@@ -301,3 +301,24 @@ async def test_a_view_that_cannot_be_built_goes_stale_like_a_failed_read(monkeyp
     assert src.view.stale and src.view.picks == {}
     assert await src.refresh(NOW + timedelta(seconds=700)) == []  # still failing: no "restored"
     assert src.view.stale
+
+
+async def test_settings_that_cannot_be_read_count_towards_staleness():
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1"), [pick("NVDA", hours=30)], posture())
+    calls = []
+
+    def settings():
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("settings gone")
+        return ResearchSettings(max_stale_s=120)  # not the default 600: the last good one
+
+    src = ResearchSource(store, settings)
+    assert await src.refresh(NOW) == []
+    assert "NVDA" in src.view.picks
+    assert await src.refresh(NOW + timedelta(seconds=60)) == []  # kept, within the window
+    assert "NVDA" in src.view.picks
+    updates = await src.refresh(NOW + timedelta(seconds=121))
+    assert [(u.kind, u.detail) for u in updates] == [("stale", "RuntimeError: settings gone")]
+    assert src.view.stale and src.view.picks == {}

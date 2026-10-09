@@ -64,6 +64,8 @@ class ResearchSource:
         self._last_ok: datetime | None = None
         self._first_try: datetime | None = None
         self._stale_reported = False
+        # The last settings read that worked, for judging staleness when they cannot be read.
+        self._last_settings: ResearchSettings | None = None
 
     def _days(self, now: datetime, settings: ResearchSettings) -> list[date]:
         today = trading_date(now)
@@ -73,16 +75,19 @@ class ResearchSource:
         return days
 
     async def refresh(self, now: datetime) -> list[ResearchUpdate]:
-        settings = self._settings()
         if self._first_try is None:
             self._first_try = now
+        # Any error counts as a failed read, so it counts towards staleness.
         try:
+            settings = self._settings()
+            self._last_settings = settings
             results = [await self._store.day(d.isoformat()) for d in self._days(now, settings)]
             # Built before anything counts as a success: a view that cannot be built is
             # no better than a table that cannot be read.
             view = self._build(now, results, settings)
         except Exception as exc:
-            return self._failed(now, settings, f"{type(exc).__name__}: {exc}")
+            fallback = self._last_settings or ResearchSettings()
+            return self._failed(now, fallback, f"{type(exc).__name__}: {exc}")
         updates: list[ResearchUpdate] = []
         if self._stale_reported:
             updates.append(ResearchUpdate("restored", "research table readable again"))
