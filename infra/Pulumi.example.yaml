@@ -39,6 +39,9 @@ config:
   # model access first: see docs/runbook.md, "Research jobs". How it runs (thresholds,
   # models, budgets) is research_jobs in the versioned settings, not a stack setting.
   # traider:researchJobs: false
+  # The schedule is created disabled, so nothing runs until you turn it on, after the
+  # key, model access and a dry run (needs traider:researchJobs: true).
+  # traider:researchScheduleEnabled: false
 
   # Give any subset; the rest keep their defaults. Unknown names are rejected.
   # Validated always, used only when research is on.

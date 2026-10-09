@@ -483,9 +483,10 @@ flattened, as the bot's. Keep the bot's account to the bot.
 
 Every weekday at 08:00 New York time a separate Fargate task, started from the bot's own
 image, runs `traider research run --kind premarket`. It is **opt-in**: set
-`traider:researchJobs: true` (which needs `traider:research: true`). **The schedule is live
-as soon as that is deployed**, so follow the order in the
-[runbook](docs/runbook.md#research-jobs) (key, model access, dry run). In order, the run:
+`traider:researchJobs: true` (which needs `traider:research: true`). The schedule is
+created **disabled**; it fires only once you also set `traider:researchScheduleEnabled: true`,
+after the steps in the [runbook](docs/runbook.md#research-jobs) (key, model access, dry
+run). In order, the run:
 
 1. reads the market from Schwab (VIX, SPY, QQQ, IWM and the sector ETFs, the day's movers,
    daily price history) and from Finnhub's free tier (the earnings calendar, company and

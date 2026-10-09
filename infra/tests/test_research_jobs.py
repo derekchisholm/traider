@@ -71,6 +71,23 @@ def test_research_jobs_without_research_are_refused():
         deploy({"researchJobs": True})
 
 
+def test_the_schedule_starts_disabled(jobs):
+    assert jobs.one(SCHEDULE).inputs["state"] == "DISABLED"
+
+
+def test_the_schedule_runs_only_once_you_enable_it():
+    enabled = deploy({"research": True, "researchJobs": True, "researchScheduleEnabled": True})
+    assert enabled.one(SCHEDULE).inputs["state"] == "ENABLED"
+    disabled = deploy({"research": True, "researchJobs": True, "researchScheduleEnabled": False})
+    assert disabled.one(SCHEDULE).inputs["state"] == "DISABLED"
+
+
+@pytest.mark.parametrize("config", [{}, {"research": True}], ids=["default", "research-only"])
+def test_enabling_the_schedule_without_the_jobs_is_refused(config):
+    with pytest.raises(Exception, match="researchScheduleEnabled needs traider:researchJobs"):
+        deploy({**config, "researchScheduleEnabled": True})
+
+
 # --- the trail bucket --------------------------------------------------------------------
 
 

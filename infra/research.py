@@ -325,6 +325,9 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
         description="traider: the pre-market research run",
         schedule_expression=SCHEDULE,
         schedule_expression_timezone=TIMEZONE,
+        # Created disabled: nothing fires until you have stored the Finnhub key, enabled
+        # Bedrock access and done a dry run, then set traider:researchScheduleEnabled.
+        state="ENABLED" if settings.research_schedule_enabled else "DISABLED",
         # Exactly on time. A start that fails is retried briefly (the lock and
         # skip-if-done make a duplicate harmless); one that still fails goes to the
         # dead-letter queue.

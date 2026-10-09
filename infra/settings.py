@@ -46,6 +46,7 @@ class Settings:
     symbols: tuple[str, ...]  # the pinned symbols; may be empty when research is on
     research: bool
     research_jobs: bool  # the scheduled research runs; needs research
+    research_schedule_enabled: bool  # the schedule fires; needs research_jobs
     bot_env: dict[str, str]  # everything the bot needs that is known before deploy
     alert_email: str | None
     callback_url: str | None  # override; None means "the hosted callback"
@@ -123,6 +124,12 @@ def load() -> Settings:
         )
     if research_jobs:
         _check_trail_bucket_name(prefix)
+    research_schedule_enabled = bool(config.get_bool("researchScheduleEnabled"))
+    if research_schedule_enabled and not research_jobs:
+        raise ValueError(
+            "traider:researchScheduleEnabled needs traider:researchJobs: true: there is no "
+            "research schedule to enable without the research jobs"
+        )
     symbols = _symbols(config, research=research)
     mode = config.get("tradingMode") or "paper"
 
@@ -176,6 +183,7 @@ def load() -> Settings:
         symbols=symbols,
         research=research,
         research_jobs=research_jobs,
+        research_schedule_enabled=research_schedule_enabled,
         bot_env=env,
         alert_email=alert_email,
         callback_url=config.get("schwabCallbackUrl"),

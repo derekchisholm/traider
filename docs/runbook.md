@@ -315,8 +315,8 @@ aws dynamodb update-table --table-name "$(pulumi stack output researchTable)" \
 
 The pre-market research run reads the market at 08:00 New York time on weekdays and
 writes the day's posture and ranked picks (README, "The pre-market research run"). Its
-picks feed a strategy you choose; this is not financial advice. It is opt-in. **The
-schedule is live as soon as `traider:researchJobs` is deployed,** so do these in order.
+picks feed a strategy you choose; this is not financial advice. It is opt-in, and its
+schedule is created disabled: nothing runs on its own until step 4. Do these in order.
 
 **1. Bedrock model access.** In the AWS console, in the stack's region, open Amazon
 Bedrock and request access to the Claude model in `research_jobs.dive.model`
@@ -328,10 +328,9 @@ the default prices against AWS's Bedrock price list either way: the budgets are 
 as those numbers. Settings change with `traider settings show` and `traider settings apply`
 (see [Restarting, changing settings, tearing down](#restarting-changing-settings-tearing-down)).
 
-**2. Deploy and store the Finnhub key, in one sitting.** Create a free account at
-finnhub.io and copy the API key from its dashboard. The secret that holds it is created by
-the same `pulumi up` that creates the schedule, so do both after 08:00 on a weekday or on a
-weekend: no run can fire before the key is in. From `infra/`:
+**2. Deploy and store the Finnhub key.** Create a free account at finnhub.io and copy the
+API key from its dashboard. The secret that holds it is created by the same `pulumi up`
+that creates the (disabled) schedule. From `infra/`:
 
 ```sh
 pulumi config set traider:research true
@@ -348,7 +347,7 @@ ticket. If it ever leaks (pasted anywhere else, even by accident), make a new on
 and store it the same way. A run with no key stored does not start; the stopped-with-an-error
 alert says so.
 
-**3. A dry run, before the next 08:00.** With the `localEnv` output loaded (README, step 5;
+**3. A dry run.** With the `localEnv` output loaded (README, step 5;
 reload it, it now carries the Finnhub secret) and AWS credentials that can read the secrets
 and tables and call Bedrock, from the repository root:
 
@@ -375,6 +374,16 @@ Finnhub and Bedrock. What the first dry run may show:
 - **A Bedrock error:** no model access, an id the region does not serve, or tool use the
   endpoint does not support. Each failed attempt is counted against the budget; there are
   no retries.
+
+**4. Enable the schedule.** Once a dry run looks right, from `infra/`:
+
+```sh
+pulumi config set traider:researchScheduleEnabled true
+pulumi up
+```
+
+From then on the run fires every weekday at 08:00 New York time. Setting it back to false
+(and `pulumi up`) pauses the schedule and keeps everything else.
 
 **What the bot does with each outcome**
 
@@ -451,7 +460,9 @@ pick's expiry can land on a holiday.
 
 **Switching it off:** set `research_jobs.enabled` to false with `traider settings apply`
 (the next run exits without a posture, so the bot stands aside), or set
-`traider:researchJobs false` and `pulumi up` to remove the schedule. On a live stack,
+`traider:researchScheduleEnabled false` and `pulumi up` to pause the schedule, or
+`traider:researchJobs false` (and `traider:researchScheduleEnabled` unset or false) and
+`pulumi up` to remove it. On a live stack,
 `pulumi destroy` cannot remove the trail bucket until you empty it:
 `aws s3 rm "s3://$(pulumi stack output researchBucket)" --recursive`.
 
@@ -535,8 +546,8 @@ Before you switch:
       when the strategy says to hold none.
 - [ ] Nothing else trades the pinned symbols in that account.
 - [ ] With research on: something writes a posture every morning (the research run with
-      `traider:researchJobs`, finishing `ok`; otherwise the bot stands aside every
-      day), and the account holds nothing the bot did not buy.
+      `traider:researchJobs` and `traider:researchScheduleEnabled`, finishing `ok`;
+      otherwise the bot stands aside every day), and the account holds nothing the bot did not buy.
       A holding it did not open is left alone, but it is also a sign the account is not
       the bot's alone, and the bot cannot tell your shares from its own in a symbol it
       already holds. Check with `traider research show` before the open that the posture
