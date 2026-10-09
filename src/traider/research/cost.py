@@ -37,6 +37,8 @@ class CostMeter:
         self.models: set[str] = set()
         # Set once a call was refused for budget: the run did not do all it planned.
         self.exhausted = False
+        # Set when a call cost more than was reserved for it (the input estimate was low).
+        self.overrun = False
 
     @property
     def limit(self) -> Decimal:
@@ -59,7 +61,12 @@ class CostMeter:
         return self.spent + self.reserved + worst > self.limit
 
     def reserve(self, model: str, input_tokens: int, max_tokens: int) -> Decimal | None:
-        """Hold the worst case for one call, or None (and ``exhausted``) if it may not run."""
+        """Hold the worst case for one call, or None (and ``exhausted``) if it may not run.
+
+        ``input_tokens`` must be an upper bound on the request's real input size: the
+        reservation is only as safe as that estimate."""
+        if input_tokens < 0 or max_tokens < 0:
+            raise ValueError("token counts cannot be negative")
         if self.would_exceed(model, input_tokens, max_tokens):
             self.exhausted = True
             return None
@@ -69,16 +76,28 @@ class CostMeter:
 
     def settle(self, model: str, reserved: Decimal, usage: Usage | None) -> None:
         """Replace a reservation with what the call cost. Without usage (the call failed and
-        may still have been billed) the reservation is kept as spent."""
+        may still have been billed) the reservation is kept as spent. A call that cost more
+        than its reservation sets ``overrun`` and ``exhausted``: nothing more is spent."""
+        if reserved > self.reserved:
+            raise ValueError("settling more than is reserved")
         self.reserved -= reserved
         if usage is None:
             self.spent += reserved
             self.models.add(model)
-        else:
-            self.record(model, usage)
+            self._check_limit()
+            return
+        if self.cost(model, usage.input_tokens, usage.output_tokens) > reserved:
+            self.overrun = True
+            self.exhausted = True
+        self.record(model, usage)
 
     def record(self, model: str, usage: Usage) -> None:
         self.spent += self.cost(model, usage.input_tokens, usage.output_tokens)
         self.tokens_in += usage.input_tokens
         self.tokens_out += usage.output_tokens
         self.models.add(model)
+        self._check_limit()
+
+    def _check_limit(self) -> None:
+        if self.spent > self.limit:
+            self.exhausted = True

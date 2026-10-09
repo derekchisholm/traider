@@ -106,3 +106,17 @@ async def test_the_scripted_llm_routes_by_symbol_and_records_requests():
     assert len(llm.requests_for("NVDA")) == 1
     with pytest.raises(LLMError, match="exhausted"):
         await llm.create(**REQUEST)
+
+
+def test_the_sdk_never_retries_so_every_attempt_is_metered():
+    assert MantleLLM("us-west-2")._client.max_retries == 0
+
+
+async def test_any_other_exception_becomes_an_llm_error_without_its_text():
+    with pytest.raises(LLMError) as caught:
+        await MantleLLM("us-west-2", client=FakeClient(RuntimeError("secret-ish detail"))).create(
+            **REQUEST
+        )
+    assert str(caught.value) == "RuntimeError"
+    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None

@@ -2,6 +2,8 @@
 
 from decimal import Decimal
 
+import pytest
+
 from traider.research.cost import CostMeter
 from traider.research.job_settings import ModelPrice
 from traider.research.llm import Usage
@@ -68,3 +70,41 @@ def test_an_unpriced_model_is_never_called():
     m = meter()
     assert m.would_exceed("anthropic.claude-opus-5", 1, 1)
     assert m.reserve("anthropic.claude-opus-5", 1, 1) is None
+
+
+def test_an_overrun_is_flagged_and_stops_further_spending():
+    m = meter(run="0.05")
+    first = m.reserve(MODEL, 1000, 2000)
+    second = m.reserve(MODEL, 1000, 2000)
+    assert first is not None and second is not None
+    assert not m.exhausted and not m.overrun
+    # Each call really cost 0.06, far over its 0.022 reservation.
+    m.settle(MODEL, first, Usage(20_000, 2000))
+    m.settle(MODEL, second, Usage(20_000, 2000))
+    assert m.spent == Decimal("0.12")
+    assert m.exhausted and m.overrun
+    assert m.reserve(MODEL, 0, 1) is None
+
+
+def test_spending_past_the_limit_exhausts_the_meter_even_within_a_reservation():
+    m = meter(run="0.01")
+    m.record(MODEL, Usage(0, 2000))  # 0.02, no reservation involved
+    assert m.exhausted and not m.overrun
+
+
+def test_negative_token_counts_are_refused():
+    m = meter()
+    with pytest.raises(ValueError, match="negative"):
+        m.reserve(MODEL, -1, 10)
+    with pytest.raises(ValueError, match="negative"):
+        m.reserve(MODEL, 10, -1)
+
+
+def test_a_double_settle_is_refused():
+    m = meter()
+    held = m.reserve(MODEL, 1000, 2000)
+    assert held is not None
+    m.settle(MODEL, held, Usage(1000, 200))
+    with pytest.raises(ValueError, match="more than is reserved"):
+        m.settle(MODEL, held, Usage(1000, 200))
+    assert (m.spent, m.reserved) == (Decimal("0.004"), Decimal(0))

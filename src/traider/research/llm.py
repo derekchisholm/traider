@@ -23,6 +23,7 @@ class LLMError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Usage:
+    # Cache token fields are not counted: no cache_control is sent, so the API reports none.
     input_tokens: int
     output_tokens: int
 
@@ -73,11 +74,12 @@ class MantleLLM:
         region: str,
         *,
         timeout_s: float = 120.0,
-        max_retries: int = 2,
         client: Any = None,
     ) -> None:
+        # No SDK retries: each metered call is exactly one HTTP attempt, so a retry can
+        # never bill tokens the cost meter did not see.
         self._client = client or AsyncAnthropicBedrockMantle(
-            aws_region=region, timeout=timeout_s, max_retries=max_retries
+            aws_region=region, timeout=timeout_s, max_retries=0
         )
 
     async def create(
@@ -103,6 +105,8 @@ class MantleLLM:
             raise LLMError(f"Bedrock refused the request (HTTP {exc.status_code})") from None
         except anthropic.AnthropicError as exc:
             raise LLMError(f"Bedrock could not be asked ({type(exc).__name__})") from None
+        except Exception as exc:
+            raise LLMError(type(exc).__name__) from None  # never the message text
         blocks = [_block(block.model_dump(mode="json")) for block in message.content]
         return LLMReply(
             content=tuple(b for b in blocks if b is not None),
