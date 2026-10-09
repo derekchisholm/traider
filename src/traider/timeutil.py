@@ -68,3 +68,30 @@ def previous_weekday(day: date) -> date:
     while day.weekday() >= 5:
         day -= timedelta(days=1)
     return day
+
+
+def next_weekday(day: date) -> date:
+    day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def weekdays_after(day: date, n: int) -> date:
+    """The ``n``-th weekday after ``day``. Holidays are not known here."""
+    for _ in range(n):
+        day = next_weekday(day)
+    return day
+
+
+def weekdays_between(start: date, end: date) -> int:
+    """Weekdays ``d`` with ``start < d <= end``; negative when ``end`` is before ``start``."""
+    if end < start:
+        return -weekdays_between(end, start)
+    count = 0
+    day = start
+    while day < end:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            count += 1
+    return count
