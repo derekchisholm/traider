@@ -113,12 +113,9 @@ async def run_backtest(
             f"bars for symbols that are not configured: {', '.join(strangers)} "
             f"(configured: {', '.join(allowed)})"
         )
-    # Whatever the configuration says, a backtest only ever trades on paper. With picks it
-    # reads its own research, never a real table, whatever the configuration names.
-    overrides: dict[str, Any] = {"trading_mode": "paper", "heartbeat_file": os.devnull}
-    if research_store is not None:
-        overrides["research_table"] = "backtest"
-    config = config.model_copy(update=overrides)
+    # Whatever the configuration says, a backtest only ever trades on paper. Its research
+    # (with picks) is its own in-memory store: no research table is ever read.
+    config = config.model_copy(update={"trading_mode": "paper", "heartbeat_file": os.devnull})
     cash = starting_cash if starting_cash is not None else config.paper_starting_cash
 
     calendar = StaticSessionProvider()
@@ -241,48 +238,82 @@ def pick_symbols(picks: Sequence[Mapping[str, Any]]) -> list[str]:
     return found
 
 
-async def _research_store(picks: Sequence[Mapping[str, Any]]) -> MemoryResearchStore:
-    """One ``backtest-<day>`` run per day that has rows, written before that day opens.
+@dataclass(frozen=True, slots=True)
+class _Day:
+    pick_rows: list[dict[str, Any]]
+    posture: str
 
-    A day with a pick row and no posture row is a ``trade`` day. A day with no rows at all
-    has no run, so it has no posture and the bot stands aside: it fails closed.
+
+def _where(row: Mapping[str, Any], number: int) -> str:
+    """Where a row came from: its file line when it was read from a file, else its position."""
+    line = getattr(row, "line", None)
+    return f"line {line}" if line is not None else f"row {number}"
+
+
+def check_picks(picks: Sequence[Mapping[str, Any]]) -> dict[date, _Day]:
+    """Validate every row, naming the file line (or row number) of the first bad one.
+
+    A day with a pick row and no posture row is a ``trade`` day.
     """
-    pick_rows: dict[date, list[Mapping[str, Any]]] = {}
+    pick_rows: dict[date, list[dict[str, Any]]] = {}
     postures: dict[date, str] = {}
+    symbols: dict[date, set[str]] = {}
     for number, row in enumerate(picks, start=1):
+        where = _where(row, number)
         if not isinstance(row, Mapping):
-            raise BacktestError(f"row {number}: must be an object")
+            raise BacktestError(f"{where}: must be an object")
         raw_day = row.get("day")
         try:
             if not isinstance(raw_day, str):
                 raise ValueError
             day = date.fromisoformat(raw_day)
         except ValueError:
-            raise BacktestError(f"row {number}: 'day' must be a date like 2026-10-06") from None
+            raise BacktestError(f"{where}: 'day' must be a date like 2026-10-06") from None
         pick_rows.setdefault(day, [])
-        if "posture" not in row:
-            pick_rows[day].append({k: v for k, v in row.items() if k != "day"})
+        if "posture" in row:
+            extra = sorted(set(row) - _POSTURE_ROW_KEYS)
+            if extra:
+                raise BacktestError(
+                    f"{where}: a posture row has only 'day' and 'posture' (also has "
+                    f"{', '.join(extra)})"
+                )
+            if day in postures:
+                raise BacktestError(f"{where}: a second posture for {day}")
+            try:
+                postures[day] = PostureLevel(row["posture"]).value
+            except ValueError as exc:
+                raise BacktestError(f"{where}: posture: {exc}") from None
             continue
-        extra = sorted(set(row) - _POSTURE_ROW_KEYS)
-        if extra:
-            raise BacktestError(
-                f"row {number}: a posture row has only 'day' and 'posture' (also has "
-                f"{', '.join(extra)})"
-            )
-        if day in postures:
-            raise BacktestError(f"row {number}: a second posture for {day}")
-        postures[day] = str(row["posture"])
-    store = MemoryResearchStore()
-    for day, rows in sorted(pick_rows.items()):
-        level = postures.get(day, PostureLevel.TRADE.value)
-        data: dict[str, Any] = {"picks": rows, "posture": {"level": level}}
+        fields = {k: v for k, v in row.items() if k != "day"}
         at = datetime.combine(day, _BACKTEST_RUN_HOUR, tzinfo=ET)
         try:
-            meta, day_picks, day_posture = build_manual_run(
-                data, at, run_id=f"backtest-{day.isoformat()}", kind="backtest"
-            )
+            build_manual_run({"picks": [fields], "posture": {"level": "trade"}}, at)
         except ValueError as exc:
-            raise BacktestError(f"{day}: {exc}") from None
+            raise BacktestError(f"{where}: {str(exc).removeprefix('pick 1: ')}") from None
+        symbol = fields["symbol"]
+        if symbol in symbols.setdefault(day, set()):
+            raise BacktestError(f"{where}: {symbol} is already picked for {day}")
+        symbols[day].add(symbol)
+        pick_rows[day].append(fields)
+    return {
+        day: _Day(rows, postures.get(day, PostureLevel.TRADE.value))
+        for day, rows in sorted(pick_rows.items())
+    }
+
+
+async def _research_store(picks: Sequence[Mapping[str, Any]]) -> MemoryResearchStore:
+    """One ``backtest-<day>`` run per day that has rows, written before that day opens.
+
+    A day with no rows at all has no run, so it has no posture and the bot stands aside:
+    it fails closed.
+    """
+    store = MemoryResearchStore()
+    for day, content in check_picks(picks).items():
+        data: dict[str, Any] = {"picks": content.pick_rows, "posture": {"level": content.posture}}
+        at = datetime.combine(day, _BACKTEST_RUN_HOUR, tzinfo=ET)
+        meta, day_picks, day_posture = build_manual_run(
+            data, at, run_id=f"backtest-{day.isoformat()}", kind="backtest"
+        )
         await store.write_run(meta, day_picks, day_posture)
     return store
 
@@ -313,9 +344,15 @@ def _score(trades: Sequence[Trade]) -> tuple[int, int, Decimal]:
     return round_trips, wins, realized
 
 
-def load_picks_jsonl(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+class PickRow(dict[str, Any]):
+    """A row read from a file; ``line`` is its line number there, for error messages."""
+
+    line: int
+
+
+def load_picks_jsonl(path: str | os.PathLike[str]) -> list[PickRow]:
     """Read pick and posture rows from a JSON Lines file. Blank lines are skipped."""
-    rows: list[dict[str, Any]] = []
+    rows: list[PickRow] = []
     with Path(path).open() as handle:
         for line, text in enumerate(handle, start=1):
             if not text.strip():
@@ -326,7 +363,9 @@ def load_picks_jsonl(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
                 raise BacktestError(f"{path} line {line}: not JSON ({exc})") from None
             if not isinstance(row, dict):
                 raise BacktestError(f"{path} line {line}: must be a JSON object")
-            rows.append(row)
+            picked = PickRow(row)
+            picked.line = line
+            rows.append(picked)
     return rows
 
 

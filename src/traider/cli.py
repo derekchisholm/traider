@@ -28,6 +28,7 @@ from traider import app
 from traider.backtest import (
     BacktestError,
     BacktestResult,
+    check_picks,
     load_bars_csv,
     load_picks_jsonl,
     pick_symbols,
@@ -478,7 +479,10 @@ def print_result(
 
 
 async def _backtest(args: argparse.Namespace, config: Config, out: TextIO) -> int:
-    picks = load_picks_jsonl(args.picks) if args.picks else None
+    picks = None
+    if args.picks is not None:
+        picks = load_picks_jsonl(args.picks)
+        check_picks(picks)  # a bad file fails here, before any download
     if args.csv:
         bars = [bar for path in args.csv for bar in load_bars_csv(path, args.symbol)]
     else:

@@ -224,7 +224,9 @@ TRAIDER_SYMBOLS=SPY uv run traider backtest --csv bars.csv --symbol SPY
 # Replay research too: one JSON Lines row per pick or posture, each with a "day".
 # Pick rows use the seed file's pick fields; a posture row is
 # {"day": "2026-10-06", "posture": "trade" | "reduced" | "stand_aside"}.
-uv run traider backtest --csv bars.csv --picks picks.jsonl
+# TRAIDER_RESEARCH_TABLE only lets the configuration load with no pinned symbols; the
+# replay reads the picks file and never reads that table.
+TRAIDER_RESEARCH_TABLE=backtest uv run traider backtest --csv bars.csv --picks picks.jsonl
 ```
 
 With `--picks`, each day's rows become a research run for that day, read through the same

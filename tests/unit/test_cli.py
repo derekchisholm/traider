@@ -520,3 +520,16 @@ def test_backtest_command_names_the_bad_line_in_a_picks_file(env, tmp_path, caps
     assert code == 1
     assert "line 1" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_a_bad_picks_file_fails_before_any_download(env, tmp_path, monkeypatch, capsys):
+    async def no_download(*_args, **_kwargs):
+        raise AssertionError("downloaded bars for a bad picks file")
+
+    monkeypatch.setattr(cli, "download_bars", no_download)
+    picks = tmp_path / "picks.jsonl"
+    picks.write_text('\n{"day": "2026-10-06", "posture": "maybe"}\n')
+    code = cli.main(["backtest", "--schwab-days", "5", "--picks", str(picks)])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "line 2" in captured.err

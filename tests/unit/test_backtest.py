@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -5,6 +6,7 @@ import pytest
 
 from traider.backtest import (
     BacktestError,
+    check_picks,
     load_bars_csv,
     load_picks_jsonl,
     max_drawdown,
@@ -423,12 +425,12 @@ async def test_picks_work_with_a_configuration_that_has_no_research_table():
     [
         ([{"symbol": "NVDA"}], "row 1.*day"),
         ([{"day": "10/06/2026", "posture": "trade"}], "row 1.*day"),
-        ([{"day": "2026-10-06", "posture": "maybe"}], "2026-10-06.*posture"),
+        ([{"day": "2026-10-06", "posture": "maybe"}], "row 1.*posture"),
         ([{"day": "2026-10-06", "posture": "trade", "symbol": "NVDA"}], "row 1"),
         ([posture("2026-10-06", "trade"), posture("2026-10-06", "reduced")], "row 2.*posture"),
-        ([pick("2026-10-06", side="sideways")], "2026-10-06"),
-        ([pick("2026-10-06", colour="red")], "colour"),
-        ([pick("2026-10-06"), pick("2026-10-06")], "2026-10-06.*twice"),
+        ([pick("2026-10-06", side="sideways")], "row 1"),
+        ([pick("2026-10-06", colour="red")], "row 1.*colour"),
+        ([pick("2026-10-06"), pick("2026-10-06")], "row 2.*already picked"),
         (["not a row"], "row 1"),
     ],
 )
@@ -470,3 +472,28 @@ def test_a_picks_line_that_is_not_an_object_names_the_line(tmp_path):
     path.write_text("[1, 2]\n")
     with pytest.raises(BacktestError, match="line 1"):
         load_picks_jsonl(path)
+
+
+@pytest.mark.parametrize(
+    ("bad", "message"),
+    [
+        ('{"day": "2026-10-06", "posture": "maybe"}', "line 3.*posture"),
+        ('{"day": "2026-10-06", "symbol": "NVDA", "side": "sideways"}', "line 3"),
+        ('{"day": "2026-10-06", "posture": "trade", "symbol": "NVDA"}', "line 3"),
+        ('{"symbol": "NVDA"}', "line 3.*day"),
+    ],
+)
+async def test_row_errors_name_the_real_file_line_even_after_blank_lines(tmp_path, bad, message):
+    path = tmp_path / "p.jsonl"
+    path.write_text(f'{{"day": "2026-10-06", "posture": "trade"}}\n\n{bad}\n')
+    rows = load_picks_jsonl(path)
+    with pytest.raises(BacktestError, match=message):
+        await run_backtest(rising_bars("NVDA", "2026-10-06"), research_config(), picks=rows)
+
+
+async def test_a_duplicate_pick_names_the_line_of_the_second(tmp_path):
+    path = tmp_path / "p.jsonl"
+    line = json.dumps(pick("2026-10-06"))
+    path.write_text(f"{line}\n\n{line}\n")
+    with pytest.raises(BacktestError, match=r"line 3.*already picked"):
+        check_picks(load_picks_jsonl(path))
