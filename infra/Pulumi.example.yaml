@@ -37,6 +37,8 @@ config:
   # Required for live: the last four digits of the Schwab account to trade in.
   # Keep the quotes, or a leading zero is lost.
   # traider:accountLast4: "1234"
+  # Or the account's hash as Schwab's API reports it, instead of the last four digits.
+  # traider:accountHash: ABCDEF0123456789
 
   # --- Limits -------------------------------------------------------------------
   # Give any subset; the rest keep their defaults. Unknown names are rejected.
@@ -48,12 +50,14 @@ config:
   #   require_cash: true             # buys must be covered by available cash (no margin)
   #   settled_cash_only: true        # ...and not by money from a sale made today.
   #                                  # Needed in a cash account; a margin account can set false.
-  #   max_orders_per_day: 20
+  #   max_orders_per_day: 20         # counts every order sent, sells and re-priced limits too;
+  #                                  # at the cap only buys stop
   #   order_cooldown_s: 30           # per symbol, between orders
   #   max_daily_loss_usd: 100        # stop opening positions for the day beyond this
   #   min_price: 5
   #   max_spread_bps: 20
-  #   max_quote_age_s: 15
+  #   max_quote_age_s: 15            # since the bot received the quote
+  #   max_quote_lag_s: 120           # since the market last updated it (catches a frozen quote)
   #   max_feed_silence_s: 30
   #   max_limit_deviation_bps: 100
   #   entry_delay_min_after_open: 1
@@ -64,8 +68,10 @@ config:
   # traider:orderType: LIMIT          # LIMIT or MARKET
   # traider:limitOffsetBps: 5         # how far through the quote a limit is priced
   # traider:orderTimeoutS: 20         # cancel and reconsider an unfilled order after this
-  # traider:flattenBeforeCloseMin: 10 # close the bot's positions this long before the close (default: off)
-  # traider:cancelUnknownOrders: false # only for an account nothing else trades in
+  # traider:flattenBeforeCloseMin: 10 # try to sell what the bot holds this long before the close
+  #                                   # (default: off; best effort, see the runbook)
+  # traider:cancelUnknownOrders: false # cancel open orders on these symbols that the bot did not
+  #                                    # place, yours included; only for an account that is the bot's
 
   # --- Market data --------------------------------------------------------------
   # traider:feed: stream              # stream (with polling as fallback) or poll
@@ -92,5 +98,5 @@ config:
 
   # --- Schwab sign-in -----------------------------------------------------------
   # Leave unset to use the hosted callback address this stack creates. Set it only
-  # if Schwab will not accept that address for your app (see the README).
+  # if Schwab will not accept that address for your app (see docs/runbook.md).
   # traider:schwabCallbackUrl: https://127.0.0.1

@@ -69,14 +69,15 @@ These are enforced in code and each has tests that fail if the rule stops workin
 | Rule | What it means |
 | --- | --- |
 | Two switches for live | The stack must be deployed with `tradingMode: live` **and** the control parameter must say `live`. Either one alone does nothing. |
-| Kill switch | Set the control parameter to `halt` and the bot stops ordering and cancels its working orders within about 10 seconds. `close_only` allows sells only. If the switch cannot be read for a minute, the bot halts itself. |
-| Small hard limits | Per-order, per-position and total exposure caps, a daily order count, a daily loss limit that stops new buys, a cooldown, spread and stale-quote checks. Defaults are deliberately small (500 / 1000 / 2000 dollars). |
-| Long only, cash only | It never shorts and never borrows: buys must be covered by cash, and by default not by money from a sale made the same day (see [Settled cash](#settled-cash)). |
+| Kill switch | Set the control parameter to `halt` and the bot stops ordering and cancels its working orders, normally within 10 to 15 seconds; longer if Schwab or AWS is slow, and cancelling needs a working Schwab sign-in. `close_only` allows sells only. If the switch cannot be read for a minute, the bot halts itself. |
+| Small hard limits | Per-order, per-position and total exposure caps, a daily order count, a daily loss limit that stops new buys, a cooldown, and checks for wide spreads, stale or frozen quotes and halted securities. Defaults are deliberately small (500 / 1000 / 2000 dollars). |
+| Long only, cash only | It never shorts and, by default, never borrows: a buy must be covered by cash that no other order of the bot's has claimed, and not by money from a sale that has yet to settle (see [Settled cash](#settled-cash)). |
 | The broker is the truth | Positions are read from the broker before every order. The bot keeps no position book of its own to drift out of step. |
-| Never resend on doubt | If an order's fate is unknown (a timeout, a lost reply), the bot does not send it again. It looks the order up, waits for the position to show what happened, and freezes the symbol and alerts you if things do not add up. |
-| One bot at a time | A lease in DynamoDB lets exactly one instance trade. Deploys stop the old task before starting the new one. |
+| Never resend on doubt | If an order's fate is unknown (a timeout, a lost reply), the bot does not send it again. It looks the order up and waits for the position to show what happened. Only after a minute in which the broker shows no such order and the position has not moved does it treat the order as never placed. If things do not add up it freezes the symbol and alerts you. |
+| One bot at a time | A lease in DynamoDB lets exactly one instance trade or touch orders, and it is re-checked right before each order. Deploys stop the old task before starting the new one. |
 | Fail closed | No control value, no lease, no market hours, no fresh account data, no usable quote, no valid sign-in: no order. |
-| Exits stay possible | The limits that stop the bot taking risk do not stop it selling what it holds. |
+| A new day starts clean | What the strategy wanted yesterday is forgotten at midnight New York time. Nothing trades in the morning until the strategy has asked again. |
+| Exits are not capped | The limits that stop the bot taking risk (size caps, order count, loss halt, cooldown) do not stop it selling what it holds. A sell still needs an open market, a fresh quote, the lease and a valid sign-in, like any order. |
 
 ### Settled cash
 
@@ -90,6 +91,10 @@ that money again until tomorrow (`settled_cash_only`, on by default).
 A **margin account** does not have this problem. `traider check` tells you which kind
 you have, and you can then set `settled_cash_only: false` to let the bot reuse the
 day's proceeds.
+
+A sale counts from the moment the sell order goes out, not when it finishes, and on
+the two days a year when markets trade but banks are shut (Columbus Day and Veterans
+Day) the previous trading day's sales still count as unsettled.
 
 Two things the bot cannot see: sales you make by hand in the same account, and
 whether a recent deposit has cleared. Keep the bot's account to the bot.
@@ -157,10 +162,15 @@ does not predict live results.
 
 ## Deploy
 
-You need: an AWS account and credentials that can create the resources, the
-[Pulumi CLI](https://www.pulumi.com/docs/install/) (a 2024 or later release, for the
-`uv` toolchain), Docker with buildx, uv, and a Schwab brokerage account. The Schwab
-API is reported to need thinkorswim enabled on the account.
+You need: an AWS account and credentials that can create the resources, the AWS CLI
+version 2, a current [Pulumi CLI](https://www.pulumi.com/docs/install/), Docker with
+buildx, uv, and a Schwab brokerage account. The Schwab API is reported to need
+thinkorswim enabled on the account. The AWS CLI must point at the same account and
+region as the stack, or commands such as the kill switch will fail or miss.
+
+> **The bot treats the whole position in every configured symbol as its own.** If the
+> account already holds shares of a symbol you list, a live bot will sell them when
+> the strategy says to hold none. Use an account, or symbols, that are the bot's alone.
 
 **1. Create the stack.**
 
@@ -172,13 +182,22 @@ pulumi config set aws:region us-east-1
 pulumi config set --path 'traider:symbols[0]' SPY
 pulumi config set --path 'traider:symbols[1]' QQQ
 pulumi config set traider:alertEmail you@example.com
+# The placeholder strategy holds `position_usd` worth of each symbol (500 by default)
+# and buys whole shares, so a share priced above that means it buys nothing. To see
+# it trade symbols like these on paper, raise it and the caps that bound it:
+pulumi config set --path traider:strategyParams.position_usd 1500
+pulumi config set --path traider:risk.max_order_usd 1500
+pulumi config set --path traider:risk.max_position_usd 1500
+pulumi config set --path traider:risk.max_total_exposure_usd 3000
 pulumi up
 ```
 
 [`infra/Pulumi.example.yaml`](infra/Pulumi.example.yaml) lists every setting with its
 default. `pulumi up` builds the image (for ARM; set `traider:cpuArchitecture` to
-`X86_64` if your machine cannot), creates about 50 resources and starts the bot in
-paper mode. AWS sends a confirmation email to the alert address: alerts start once
+`X86_64` if your machine cannot; `pulumi preview` builds it too, so it needs Docker
+as well), creates about 50 resources and starts the bot in paper mode. The first
+deploy starts the task straight away whatever the time; the weekday schedule takes
+over from the next 16:30 New York stop. AWS sends a confirmation email to the alert address: alerts start once
 you click the link in it. With no Schwab credentials yet, the bot idles and says so.
 
 **2. Register a Schwab developer app.** At <https://developer.schwab.com>, create an
@@ -212,8 +231,9 @@ for the one account the bot should use.
 pulumi stack output reauthUrl --show-secrets
 ```
 
-The link holds a key, so treat it like a password. The bot notices the new sign-in
-within a minute; there is nothing to restart.
+The link holds a key, so treat it like a password. A bot waiting for a sign-in
+notices it within a minute; one that is renewing early, within five. There is
+nothing to restart.
 
 **5. Check what the bot would see.** This reads from Schwab and sends no orders.
 
