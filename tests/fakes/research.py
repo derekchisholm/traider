@@ -5,11 +5,13 @@ Each records what it was asked and can be told to fail.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 from traider.research.events import EarningsEvent, EventsUnavailable, NewsItem, Profile
+from traider.research.llm import LLMError, LLMReply, Usage
 from traider.research.market import DailyBar, MarketQuote, PutContract, QuoteBatch
 from traider.session import Session
 from traider.timeutil import ET, previous_weekday
@@ -207,3 +209,69 @@ def news(symbol: str, count: int, *, day: date = TODAY, text: str = "") -> list[
         )
         for i in range(count)
     ]
+
+
+# -------------------------------------------------------------------------------- LLM
+
+
+def tool_use(name: str, tool_input: dict[str, Any], *, call_id: str | None = None) -> dict:
+    return {"type": "tool_use", "id": call_id or f"toolu_{name}", "name": name, "input": tool_input}
+
+
+def reply(*blocks: dict, input_tokens: int = 1000, output_tokens: int = 200) -> LLMReply:
+    return LLMReply(tuple(blocks), Usage(input_tokens, output_tokens), "tool_use")
+
+
+def submit(**fields: Any) -> LLMReply:
+    return reply(tool_use("submit_assessment", fields, call_id="toolu_submit"))
+
+
+def posture_reply(
+    level: str, *reasons: str, input_tokens: int = 1000, output_tokens: int = 200
+) -> LLMReply:
+    return reply(
+        tool_use("submit_posture", {"level": level, "reasons": list(reasons)}),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+class ScriptedLLM:
+    """Answers from scripts: one for the posture review, one per deep-dive symbol (dives
+    run concurrently, so each is routed by the ``Symbol:`` line that starts it). Every
+    request is recorded. An exhausted script, or an exception in it, raises."""
+
+    def __init__(
+        self,
+        *,
+        posture: Sequence[LLMReply | Exception] = (),
+        dives: dict[str, Sequence[LLMReply | Exception]] | None = None,
+    ) -> None:
+        self.posture = list(posture)
+        self.dives = {symbol: list(script) for symbol, script in (dives or {}).items()}
+        self.requests: list[dict[str, Any]] = []
+
+    def requests_for(self, symbol: str) -> list[dict[str, Any]]:
+        return [r for r in self.requests if _dive_symbol(r) == symbol]
+
+    async def create(self, **request: Any) -> LLMReply:
+        request = copy.deepcopy(request)  # as sent: the caller keeps adding to its messages
+        self.requests.append(request)
+        names = {tool["name"] for tool in request["tools"]}
+        if "submit_posture" in names:
+            script = self.posture
+        else:
+            script = self.dives.setdefault(_dive_symbol(request) or "?", [])
+        if not script:
+            raise LLMError("script exhausted")
+        step = script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+def _dive_symbol(request: dict[str, Any]) -> str | None:
+    first = request["messages"][0]["content"]
+    if isinstance(first, str) and first.startswith("Symbol: "):
+        return first.split("\n", 1)[0].removeprefix("Symbol: ").strip()
+    return None
