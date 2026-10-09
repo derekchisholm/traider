@@ -145,6 +145,8 @@ async def test_an_invalid_version_is_ignored_and_alerted(tmp_path):
     await h.tick(11)
     assert (await h.events("settings_rejected"))[-1]["data"]["version"] == 2
     assert "settings_rejected:2" in h.alert_keys()
+    (_, _, body) = alerts_for(h, "settings_rejected:2")[0]
+    assert body.endswith("The bot keeps the settings it was running with.")
     await h.target("SPY", 2)
     await h.settle()
     assert h.position("SPY") == 2  # the last good settings still trade
@@ -199,6 +201,12 @@ async def test_a_version_rejected_at_start_is_reported_and_blocks_entries(tmp_pa
     h = await Harness.create(tmp_path, settings_store=store)
     assert (await h.events("settings_rejected"))[-1]["data"]["version"] == 1
     assert "settings_rejected:1" in h.alert_keys()
+    (_, _, body) = alerts_for(h, "settings_rejected:1")[0]
+    assert body.endswith(
+        "No settings have loaded in this process, so no new positions open until a valid "
+        "version is written. Exits still work."
+    )
+    assert "keeps the settings it was running with" not in body
     await h.target("SPY", 2)
     await h.settle()
     assert h.position("SPY") == 0

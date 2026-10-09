@@ -354,10 +354,17 @@ class Engine:
             await self._event(
                 "settings_rejected", {"version": version, "detail": update.detail}, now
             )
+            if live.loaded:
+                in_force = "The bot keeps the settings it was running with."
+            else:
+                in_force = (
+                    "No settings have loaded in this process, so no new positions open "
+                    "until a valid version is written. Exits still work."
+                )
             await self._alerts.send(
                 f"settings_rejected:{version}",
                 f"Settings version {version} rejected",
-                f"{update.detail}. The bot keeps the settings it was running with.",
+                f"{update.detail}. {in_force}",
             )
         else:
             self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
