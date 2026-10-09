@@ -370,7 +370,7 @@ async def test_an_order_resumed_on_a_symbol_no_longer_traded_does_no_harm(tmp_pa
     await h.target("QQQ", 5)  # and the strategy cannot trade it
     await h.settle()
     assert h.position("QQQ") == 3
-    assert h.alert_keys() == []
+    assert h.alert_keys() == ["unmanaged_holding:QQQ"]  # only the notice that it is not ours
 
 
 async def test_a_resumed_order_on_another_symbols_option_does_not_make_it_ours(tmp_path):

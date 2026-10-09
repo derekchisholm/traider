@@ -157,6 +157,8 @@ class Engine:
         # The equity symbols the bot trades right now: see _refresh_universe.
         self._on_universe = on_universe
         self._universe: tuple[str, ...] = self._settings.pinned_symbols
+        self._universe_owed = False  # on_universe failed and must be called again
+        self._unmanaged_noticed: set[str] = set()  # holdings already reported as unmanaged
         self._symbols: dict[str, _SymbolState] = {s: _SymbolState() for s in self._universe}
         self._perms = _HALTED
         self._leader = False
@@ -326,6 +328,7 @@ class Engine:
         assert live is not None
         version = update.version
         if update.kind == "applied":
+            unpinned = set(self._settings.pinned_symbols) - set(live.current.pinned_symbols)
             self._settings = live.current
             self._risk.limits = self._settings.risk
             await self._event(
@@ -340,6 +343,7 @@ class Engine:
                 changes or "No change to the settings in force.",
             )
             await self._refresh_universe(now)
+            await self._warn_unpinned_but_held(unpinned, version)
         elif update.kind == "pending_restart":
             await self._event(
                 "settings_pending_restart", {"version": version, "fields": update.detail}, now
@@ -484,6 +488,7 @@ class Engine:
         await self._settle_pending(account, now)
         await self._check_daily_loss(account, now)
         await self._refresh_universe(now)
+        await self._report_unmanaged(account, now)
 
     # ---------------------------------------------------------------- universe
 
@@ -519,7 +524,10 @@ class Engine:
         )
         old = self._universe
         if set(new) == set(old):
-            return  # at most the order differs: nothing to add, drop or tell
+            # At most the order differs: nothing to add, drop or tell, unless the last
+            # call to on_universe failed.
+            await self._send_universe(now)
+            return
         self._universe = new
         added = [s for s in new if s not in old]
         dropped = [s for s in old if s not in new]
@@ -538,8 +546,74 @@ class Engine:
         except Exception as exc:
             log.exception("strategy raised in on_universe")
             await self._strategy_failed(exc)
-        if self._on_universe is not None:
-            self._on_universe(new)
+        self._universe_owed = self._on_universe is not None
+        await self._send_universe(now)
+
+    async def _send_universe(self, now: datetime) -> None:
+        """Tell the on_universe callback (the feed) the universe it still has to hear."""
+        callback = self._on_universe
+        if callback is None or not self._universe_owed:
+            return
+        try:
+            callback(self._universe)
+        except Exception as exc:
+            self._log_throttled("on_universe", now, "universe callback failed, will retry: %s", exc)
+            return
+        self._universe_owed = False
+
+    def _held_on(self, account: AccountSnapshot, roots: set[str]) -> list[str]:
+        """Held positions (shares or options) whose root is one of ``roots``."""
+        return sorted(
+            symbol
+            for symbol, held in account.positions.items()
+            if held.quantity != 0 and root_symbol(symbol) in roots
+        )
+
+    async def _warn_unpinned_but_held(self, unpinned: set[str], version: int | None) -> None:
+        """A version unpinned symbols the bot still holds. They stay managed for now, but
+        a new process starts from the pinned symbols and will not pick them up."""
+        account = self._account
+        if account is None or not unpinned:
+            return
+        held = self._held_on(account, unpinned & set(self._universe))
+        if not held:
+            return
+        await self._alerts.send(
+            f"unpinned_but_held:{version}",
+            "Unpinned symbols are still held",
+            f"Settings version {version} unpins symbols the bot still holds: "
+            f"{', '.join(held)}. The bot keeps managing them until they are flat or until "
+            "the next restart (the schedule restarts it every morning). After that it will "
+            "not manage them, so sell them or keep them pinned.",
+        )
+
+    async def _report_unmanaged(self, account: AccountSnapshot, now: datetime) -> None:
+        """Say once per symbol when the account holds something outside the universe:
+        the bot neither trades it nor watches its expiry.
+
+        Task 9: only while research is off (no research source)."""
+        held = {
+            symbol: held.quantity
+            for symbol, held in account.positions.items()
+            if held.quantity != 0 and root_symbol(symbol) not in self._universe
+        }
+        self._unmanaged_noticed &= held.keys()  # flat again: report it if it comes back
+        for symbol in sorted(held.keys() - self._unmanaged_noticed):
+            self._unmanaged_noticed.add(symbol)
+            quantity = held[symbol]
+            await self._event("unmanaged_holding", {"symbol": symbol, "quantity": quantity}, now)
+            option = (
+                " Because it is an option, there are no expiry alerts for it and the bot will "
+                "not sell it before it expires."
+                if is_option_symbol(symbol)
+                else ""
+            )
+            await self._alerts.send(
+                f"unmanaged_holding:{symbol}",
+                f"{symbol} is held but not managed",
+                f"The account holds {quantity} of {symbol}. The bot does not trade it "
+                f"because it is not pinned.{option} Pin it or handle it yourself.",
+            )
 
     def _is_our_option(self, symbol: str) -> bool:
         """An option contract on one of the universe's symbols."""

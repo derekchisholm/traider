@@ -347,9 +347,11 @@ settings into its settings table as version 1. From then on that table is the so
 every change is a new numbered version, the running bot applies it within about 10
 seconds, and an alert lists what changed. `traider settings show | history | apply`
 reads and writes it (see the [runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
-Pinned symbols apply live: a newly pinned symbol is traded at once, and an unpinned one
-the bot still holds stays managed until it is sold. A few fields (strategy, its
-parameters, option-chain span, `allow_options`) wait for the next restart. Until the bot has read a valid version
+Pinned symbols apply live: the bot watches a newly pinned symbol at once, and quotes
+for it start once the feed follows the bot's universe. An unpinned symbol the bot still
+holds stays managed until it is sold or the bot next restarts (every morning on the
+schedule); sell it first or keep it pinned. A few fields (strategy, its parameters,
+option-chain span, `allow_options`) wait for the next restart. Until the bot has read a valid version
 it opens no new positions; after that, an unreadable table or a bad version leaves
 the last good settings in force. `traider check` and `traider backtest` still use the
 `TRAIDER_*` environment values, not the settings table.

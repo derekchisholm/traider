@@ -1,7 +1,9 @@
 """The engine's universe follows the pinned symbols live and never drops a held one."""
 
+from decimal import Decimal
+
 from tests.unit.engine_harness import Harness
-from traider.models import Target
+from traider.models import OrderRequest, OrderType, Side, Target
 from traider.settings_store import MemorySettingsStore
 
 QQQ_CALL = "QQQ   261016C00400000"  # eight days out from the bench's clock
@@ -178,3 +180,72 @@ async def test_unpinning_a_symbol_with_an_order_working_keeps_it(tmp_path):
     await h.settle(40)
     assert h.position("QQQ") == 2
     assert "QQQ" in h.engine.universe  # held now
+
+
+def alerts_for(h: Harness, prefix: str) -> list[tuple[str, str, str]]:
+    return [alert for alert in h.alerts.sent if alert[0].startswith(prefix)]
+
+
+async def test_unpinning_a_held_symbol_says_it_is_managed_only_until_a_restart(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, symbols=("SPY", "QQQ"), settings_store=store)
+    await h.target("QQQ", 2)
+    await h.settle()
+    await pin(h, store, ("SPY",))
+    [(key, subject, body)] = alerts_for(h, "unpinned_but_held:")
+    assert key == "unpinned_but_held:2"
+    assert subject == "Unpinned symbols are still held"
+    assert "QQQ" in body
+    assert "until they are flat or until the next restart" in body
+    assert "sell them or keep them pinned" in body
+
+
+async def test_unpinning_a_symbol_that_is_not_held_raises_no_held_alert(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, symbols=("SPY", "QQQ"), settings_store=store)
+    await pin(h, store, ("SPY",))
+    assert alerts_for(h, "unpinned_but_held:") == []
+
+
+async def test_a_holding_outside_the_universe_is_reported_once_after_a_restart(tmp_path):
+    old = await Harness.create(tmp_path, symbols=("SPY", "QQQ"))
+    await old.target("QQQ", 2)
+    await old.settle()
+    h = await Harness.create(tmp_path, symbols=("SPY",), restart_of=old)
+    await h.run_for(65)  # a few account snapshots
+    [(key, subject, body)] = alerts_for(h, "unmanaged_holding:")
+    assert key == "unmanaged_holding:QQQ"
+    assert subject == "QQQ is held but not managed"
+    assert "not pinned" in body
+    assert "expiry" not in body  # only options expire
+    events = await h.events("unmanaged_holding")
+    assert [e["data"] for e in events] == [{"symbol": "QQQ", "quantity": 2}]
+
+
+async def test_a_failed_universe_callback_is_retried_until_it_goes_through(tmp_path):
+    store = MemorySettingsStore()
+    calls: list[tuple[str, ...]] = []
+    failures = [RuntimeError("feed not ready")]
+
+    def callback(symbols):
+        calls.append(symbols)
+        if failures:
+            raise failures.pop()
+
+    h = await Harness.create(tmp_path, settings_store=store, on_universe=callback)
+    await pin(h, store, ("SPY", "QQQ"))  # the error does not escape the step
+    assert calls == [("SPY", "QQQ")]
+    await h.tick(31)  # next account snapshot: same set, but the callback is owed
+    assert calls == [("SPY", "QQQ"), ("SPY", "QQQ")]
+    await h.tick(31)
+    assert len(calls) == 2  # delivered: not repeated
+
+
+async def test_an_unmanaged_option_is_reported_with_no_expiry_cover(tmp_path):
+    h = await Harness.create(tmp_path, risk={"allow_options": True})
+    h.price(QQQ_CALL, "2.00", "2.10")
+    await h.broker.place(OrderRequest(QQQ_CALL, Side.BUY, 1, OrderType.LIMIT, Decimal("2.10")))
+    await h.run_for(31)
+    [(_, _, body)] = alerts_for(h, f"unmanaged_holding:{QQQ_CALL}")
+    assert "no expiry alerts" in body
+    assert "will not sell it before it expires" in body

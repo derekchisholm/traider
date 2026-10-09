@@ -148,6 +148,8 @@ once every 15 minutes.
 | Order on X is not finishing / Cannot read order status for X | An order has been open for five minutes, or its status has been unreadable for about 30 seconds. | Look at the order at Schwab. Cancel it there if needed. |
 | X expires today | The account holds an option on its last day. Sent once, when the bot first sees it that day. | Decide whether to leave it to the bot, which tries to sell in the last hour if it is allowed to trade, or to close it yourself. |
 | X expires today and is still held | It is the last hour and the option is still in the account. Repeats while that is so. | One alert is normal: the sale is in progress. If it repeats, the bot is not getting it sold (halt, no bid, stale quote, frozen symbol). Sell it at Schwab or tell Schwab not to exercise it: an option that expires in the money becomes 100 shares per contract. |
+| Unpinned symbols are still held | A settings version unpinned symbols the bot still holds (shares, or options on them). The alert names them. The bot keeps managing them until they are flat or the next restart (every morning on the schedule); after that it does not. | Sell them, or pin them again. |
+| X is held but not managed | The account holds X but X (or, for an option, its underlying) is not pinned, so the bot does not trade it. For an option that also means no expiry alerts and no sale before it expires. Sent once per symbol. | Pin it, or handle it yourself at Schwab. |
 | Strategy error | The strategy raised an exception. | Buys are off until the next restart, which the schedule does every morning. Set `close_only` or `halt`, fix the strategy and deploy. |
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
@@ -190,6 +192,7 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `settings_pending_restart` | A new version changes fields that only apply after a restart. `fields` names them. |
 | `settings_rejected` | The newest version does not validate. The bot kept the settings it had. |
 | `settings_unreadable` | The settings table stayed unreadable for five minutes. `since` says when it began, `detail` what went wrong. Recorded once per outage. |
+| `unmanaged_holding` | The account holds `symbol` (`quantity`) outside the bot's universe, so the bot does not manage it. Recorded once per symbol. |
 | `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
@@ -226,9 +229,12 @@ uv run --env-file .env traider settings apply settings.json --note "why"
 uv run --env-file .env traider settings history
 ```
 
-Limits, order settings, flattening and the pinned symbols apply at once. A symbol you
-unpin while the bot holds it (or options on it) stays managed until it is sold. The
-strategy, its parameters, the option-chain span and `allow_options` wait for a restart.
+Limits, order settings, flattening and the pinned symbols apply at once: the bot
+watches a newly pinned symbol straight away, and quotes for it start once the feed
+follows the bot's universe. A symbol you unpin while the bot holds it (or options on it)
+stays managed until it is sold or the bot next restarts (every morning on the
+schedule); sell it first or keep it pinned. The strategy, its parameters, the
+option-chain span and `allow_options` wait for a restart.
 `show` prints only the JSON on stdout (the version line goes to stderr), so the file
 can be given straight back to `apply`. To go back, print an older version and apply it
 as a new version:
