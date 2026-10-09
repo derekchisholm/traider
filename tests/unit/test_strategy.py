@@ -192,3 +192,13 @@ def test_require_pick_sells_a_held_symbol_whose_pick_has_expired():
     )
     targets = rising(strategy, "NVDA", held)
     assert [(t.symbol, t.quantity) for t in targets] == [("NVDA", 0)]
+
+
+def test_a_symbol_that_leaves_and_returns_starts_its_history_again():
+    strategy = SmaCross(("SPY", "NVDA"), {"fast": 1, "slow": 2})
+    ctx = StrategyContext(now=T0, positions={})
+    rising(strategy, "NVDA", ctx)
+    strategy.on_universe(("SPY",))
+    strategy.on_universe(("SPY", "NVDA"))
+    # One bar after the return is not enough: the old closes must not count.
+    assert list(strategy.on_bar(make_bar("NVDA", close="110", minute=5), ctx)) == []

@@ -49,6 +49,14 @@ class SmaCross(Strategy):
         # added later by on_universe gets its own window.
         self._closes: dict[str, deque[Decimal]] = {}
 
+    def on_universe(self, symbols: Sequence[str]) -> None:
+        super().on_universe(symbols)
+        # A symbol that leaves the universe forgets its history, so if it returns its
+        # averages are not mixed with closes from before the gap.
+        for symbol in list(self._closes):
+            if symbol not in self.symbols:
+                del self._closes[symbol]
+
     def on_bar(self, bar: Bar, ctx: StrategyContext) -> Sequence[Target]:
         closes = self._closes.get(bar.symbol)
         if closes is None:
