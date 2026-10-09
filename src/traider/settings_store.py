@@ -297,6 +297,10 @@ class LiveSettings:
         self.current = fallback
         self.version: int | None = None
         self.loaded = False
+        #: The newest stored settings, as written, while they differ from the running ones in
+        #: a restart-only field; None otherwise. The engine reads it to say what a restart
+        #: would change.
+        self.pending: Settings | None = None
         self._rejected: set[int] = set()
         self.start_updates: list[SettingsUpdate] = []
 
@@ -356,6 +360,7 @@ class LiveSettings:
         restart = restart_changes(self.current, latest.settings)
         diff = settings_diff(self.current, merged)
         self.current, self.version, self.loaded = merged, latest.version, True
+        self.pending = latest.settings if restart else None
         out = [SettingsUpdate("applied", latest.version, latest.author, diff)]
         if restart:
             out.append(SettingsUpdate("pending_restart", latest.version, ", ".join(restart)))

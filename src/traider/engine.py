@@ -318,11 +318,21 @@ class Engine:
             await self._event(
                 "settings_pending_restart", {"version": version, "fields": update.detail}, now
             )
+            body = (
+                f"These fields only change when the bot restarts: {update.detail}. "
+                "Everything else in the version is in force now."
+            )
+            if "pinned_symbols" in update.detail.split(", ") and live.pending is not None:
+                orphaned = self._orphaned_by(live.pending)
+                if orphaned:
+                    body += (
+                        f" After the restart the bot will no longer manage: "
+                        f"{', '.join(orphaned)}. Sell them first or keep them pinned."
+                    )
             await self._alerts.send(
                 f"settings_restart:{version}",
                 f"Settings version {version} needs a restart",
-                f"These fields only change when the bot restarts: {update.detail}. "
-                "Everything else in the version is in force now.",
+                body,
             )
         elif update.kind == "rejected":
             await self._event(
@@ -335,6 +345,22 @@ class Engine:
             )
         else:
             self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
+
+    def _orphaned_by(self, stored: Settings) -> list[str]:
+        """Held positions (by their own symbol) that the running bot manages through a pinned
+        symbol which ``stored`` drops: shares of it, or options on it."""
+        account = self._account
+        if account is None:
+            return []
+        running, kept = self._settings.pinned_symbols, stored.pinned_symbols
+        orphaned = []
+        for symbol, held in account.positions.items():
+            if held.quantity == 0:
+                continue
+            root = parse_option_symbol(symbol).underlying if is_option_symbol(symbol) else symbol
+            if root in running and root not in kept:
+                orphaned.append(symbol)
+        return sorted(orphaned)
 
     async def _renew_lease(self, now: datetime) -> None:
         try:

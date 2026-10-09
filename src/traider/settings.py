@@ -33,7 +33,8 @@ _RESTART_RISK_FIELDS = ("allow_options",)
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    pinned_symbols: tuple[str, ...] = ()
+    # At least one symbol until research can choose them (sub-project A2).
+    pinned_symbols: tuple[str, ...]
     strategy: str = "sma_cross"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     risk: RiskLimits = Field(default_factory=RiskLimits)
@@ -48,7 +49,7 @@ class Settings(BaseModel):
     @field_validator("pinned_symbols")
     @classmethod
     def _symbols_ok(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        return check_symbols(value, allow_empty=True)
+        return check_symbols(value)
 
     @model_validator(mode="after")
     def _strategy_builds(self) -> Self:

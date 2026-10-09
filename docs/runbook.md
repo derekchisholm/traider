@@ -152,7 +152,7 @@ once every 15 minutes.
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
 | Settings version N applied | A new version of the settings is in force; the alert lists each change. | Nothing, if you made it. If you did not, set `halt` and look at `traider settings history`. |
-| Settings version N needs a restart | The version changes the strategy, its parameters, the pinned symbols, the option-chain span or whether options are allowed. Those wait for a restart; the rest applies now. | Restart when convenient (see below), or tomorrow's 09:00 start does it. |
+| Settings version N needs a restart | The version changes the strategy, its parameters, the pinned symbols, the option-chain span or whether options are allowed. Those wait for a restart; the rest applies now. | Restart when convenient (see below), or tomorrow's 09:00 start does it. If the version drops a pinned symbol you still hold (or hold options on), the alert names it: after the restart the bot no longer manages it, so sell it first or keep it pinned. |
 | Settings version N rejected | The newest version does not validate. | Fix it with `traider settings apply`. The bot runs on the last good version meanwhile. |
 
 ## Seeing what the bot did

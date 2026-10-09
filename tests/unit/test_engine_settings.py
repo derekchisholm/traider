@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from tests.unit.engine_harness import Harness
+from traider.models import AccountSnapshot, Position
 from traider.settings import Settings
 from traider.settings_store import MemorySettingsStore
 
@@ -66,6 +67,74 @@ async def test_a_restart_only_change_waits_and_is_announced(tmp_path):
     pending = await h.events("settings_pending_restart")
     assert pending[-1]["data"] == {"version": 2, "fields": "pinned_symbols"}
     assert "settings_restart:2" in h.alert_keys()
+
+
+def restart_body(h: Harness) -> str:
+    return next(body for key, _, body in h.alerts.sent if key.startswith("settings_restart:"))
+
+
+async def write_pinned(h: Harness, store, symbols: tuple[str, ...]) -> None:
+    current = await store.latest()
+    await store.write(
+        current.settings.model_copy(update={"pinned_symbols": symbols}),
+        expected_version=current.version,
+        author="test",
+        note="",
+        now=h.clock.now(),
+    )
+
+
+async def test_dropping_a_pinned_symbol_with_a_position_warns_before_the_restart(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    await h.target("SPY", 2)
+    await h.settle()
+    await write_pinned(h, store, ("QQQ",))
+    await h.tick(11)
+    body = restart_body(h)
+    assert "After the restart the bot will no longer manage: SPY." in body
+    assert "Sell them first or keep them pinned." in body
+
+
+async def test_dropping_a_pinned_symbol_names_options_on_it_too(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    call = "SPY   261016C00500000"
+    positions = {
+        call: Position(call, 1, Decimal(2)),
+        "SPY": Position("SPY", 3, Decimal(100)),
+        "IWM": Position("IWM", 5, Decimal(100)),  # not pinned: not the bot's to manage
+        "QQQ": Position("QQQ", 0, Decimal(100)),
+    }
+    h.engine._account = AccountSnapshot(Decimal(10000), Decimal(10000), positions, h.clock.now())
+    await write_pinned(h, store, ("QQQ",))
+    await h.tick(11)
+    assert "no longer manage: SPY, SPY   261016C00500000. Sell" in restart_body(h)
+
+
+async def test_a_pinned_change_that_strands_nothing_adds_no_warning(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    await write_pinned(h, store, ("SPY", "QQQ"))
+    await h.tick(11)
+    assert "no longer manage" not in restart_body(h)
+
+
+async def test_a_restart_change_other_than_the_symbols_adds_no_warning(tmp_path):
+    store = MemorySettingsStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    await h.target("SPY", 2)
+    await h.settle()
+    current = await store.latest()
+    await store.write(
+        current.settings.model_copy(update={"option_chain_days": 30}),
+        expected_version=1,
+        author="test",
+        note="",
+        now=h.clock.now(),
+    )
+    await h.tick(11)
+    assert "no longer manage" not in restart_body(h)
 
 
 async def test_an_invalid_version_is_ignored_and_alerted(tmp_path):

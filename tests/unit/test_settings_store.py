@@ -321,6 +321,24 @@ async def test_refresh_keeps_restart_fields_and_says_a_restart_is_needed():
     assert live.current.risk.max_order_usd == Decimal(250)
 
 
+async def test_pending_holds_the_stored_settings_while_a_restart_field_differs():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    assert live.pending is None
+    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    await store.write(changed, expected_version=1, author="cli", note="", now=T0)
+    await live.refresh(T0)
+    assert live.pending == changed  # as written, not merged
+    assert live.current.pinned_symbols == ("SPY",)
+    # A later version that puts the restart field back clears it.
+    await store.write(
+        settings(max_order_usd=Decimal(100)), expected_version=2, author="cli", note="", now=T0
+    )
+    await live.refresh(T0)
+    assert live.pending is None
+
+
 async def test_refresh_ignores_an_invalid_version_once_and_keeps_the_last_good():
     store = MemorySettingsStore()
     live = LiveSettings(store, settings())

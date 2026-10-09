@@ -52,6 +52,17 @@ def test_bad_symbols_are_rejected():
         Settings.model_validate(body)
 
 
+@pytest.mark.parametrize("symbols", [[], None])
+def test_empty_pinned_symbols_are_rejected(symbols):
+    body = base().model_dump(mode="json")
+    if symbols is None:
+        del body["pinned_symbols"]  # leaving it out is no way round the rule
+    else:
+        body["pinned_symbols"] = symbols
+    with pytest.raises(ValidationError, match="pinned_symbols"):
+        Settings.model_validate(body)
+
+
 def test_an_unknown_strategy_is_rejected():
     body = base().model_dump(mode="json") | {"strategy": "nope"}
     with pytest.raises(ValidationError, match="unknown strategy"):
