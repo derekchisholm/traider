@@ -51,6 +51,8 @@ from traider.schwab.tokens import (
     TokenStore,
 )
 from traider.session import SessionTracker
+from traider.settings import Settings
+from traider.settings_store import DynamoSettingsStore, LiveSettings
 from traider.state.base import StateStore
 from traider.state.dynamo import DynamoStateStore
 from traider.state.memory import MemoryStateStore
@@ -103,23 +105,25 @@ def credentials(config: Config, aws: Aws) -> CredentialsProvider:
     return StaticCredentials(None)
 
 
-def describe(config: Config) -> dict[str, Any]:
+def describe(config: Config, settings: Settings | None = None) -> dict[str, Any]:
     """What the bot is set up to do, safe to log: no keys, no secrets, no sign-in link."""
+    s = settings if settings is not None else Settings.from_config(config)
     return {
         "trading_mode": config.trading_mode,
-        "symbols": list(config.symbols),
-        "strategy": config.strategy,
-        "strategy_params": config.strategy_params,
-        "order_type": config.order_type,
-        "limit_offset_bps": str(config.limit_offset_bps),
-        "order_timeout_s": config.order_timeout_s,
-        "flatten_before_close_min": config.flatten_before_close_min,
-        "cancel_unknown_orders": config.cancel_unknown_orders,
+        "symbols": list(s.pinned_symbols),
+        "strategy": s.strategy,
+        "strategy_params": s.strategy_params,
+        "order_type": s.order_type,
+        "limit_offset_bps": str(s.limit_offset_bps),
+        "order_timeout_s": s.order_timeout_s,
+        "flatten_before_close_min": s.flatten_before_close_min,
+        "cancel_unknown_orders": s.cancel_unknown_orders,
         "feed": config.feed,
         "account": f"...{config.account_last4}" if config.account_last4 else "by hash or only one",
-        "risk": {name: str(value) for name, value in config.risk.model_dump().items()},
+        "risk": {name: str(value) for name, value in s.risk.model_dump().items()},
         "control": config.control_param or f"static:{config.control}",
         "state": config.state_table or "memory",
+        "settings": config.settings_table or "environment",
         "alerts": "sns" if config.alert_topic_arn else "log only",
         "token_store": (
             "secrets manager"
@@ -134,6 +138,7 @@ def describe(config: Config) -> dict[str, Any]:
 @dataclass(slots=True)
 class Bot:
     config: Config
+    settings: Settings
     clock: Clock
     tokens: TokenManager
     client: SchwabClient
@@ -175,15 +180,15 @@ class Bot:
             raise RuntimeError(f"background task stopped: {', '.join(crashed)}")
 
     async def _announce(self) -> None:
-        summary = describe(self.config)
+        summary = describe(self.config, self.settings)
         log.info("starting: %s", summary)
         if self.config.trading_mode == "live":
             await self.alerts.send(
                 "startup",
                 "traider started in LIVE mode",
                 "Real orders go out once the control switch is set to live.\n"
-                f"Symbols: {', '.join(self.config.symbols)}\n"
-                f"Strategy: {self.config.strategy} {self.config.strategy_params}\n"
+                f"Symbols: {', '.join(self.settings.pinned_symbols)}\n"
+                f"Strategy: {self.settings.strategy} {self.settings.strategy_params}\n"
                 f"Limits: {summary['risk']}",
             )
 
@@ -254,7 +259,16 @@ async def build_bot(
     client = SchwabClient(http, tokens, base_url=schwab_base_url)
     market = MarketData()
     session = SessionTracker(SchwabSessionProvider(client))
-    strategy = create_strategy(config.strategy, config.symbols, config.strategy_params)
+    settings = Settings.from_config(config)
+    live_settings: LiveSettings | None = None
+    if config.settings_table:
+        live_settings = LiveSettings(
+            DynamoSettingsStore(aws.table(config.settings_table)), settings
+        )
+        for update in await live_settings.start(clock.now()):
+            log.warning("settings at start-up: %s %s", update.kind, update.detail)
+        settings = live_settings.current
+    strategy = create_strategy(settings.strategy, settings.pinned_symbols, settings.strategy_params)
 
     state: StateStore
     if config.state_table:
@@ -289,7 +303,7 @@ async def build_bot(
         clock=clock,
         market=market,
         strategy=strategy,
-        risk=RiskManager(config.risk),
+        risk=RiskManager(settings.risk),
         broker=broker,
         state=state,
         control=ControlState(source),
@@ -297,6 +311,7 @@ async def build_bot(
         alerts=alerts,
         instance_id=f"{socket.gethostname()}-{os.getpid()}",
         auth_seconds_left=tokens.seconds_left,
+        settings=live_settings,
     )
     feed = Feed(
         config=config,
@@ -306,10 +321,12 @@ async def build_bot(
         market=market,
         clock=clock,
         session=session,
+        settings=settings,
         sleep=sleep,
     )
     return Bot(
         config=config,
+        settings=settings,
         clock=clock,
         tokens=tokens,
         client=client,

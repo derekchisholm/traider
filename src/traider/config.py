@@ -142,6 +142,7 @@ class Config(BaseModel):
     control_param: str | None = None
     control: str = "paper"  # used only when control_param is unset
     state_table: str | None = None
+    settings_table: str | None = None
     alert_topic_arn: str | None = None
     reauth_url: str | None = None
 

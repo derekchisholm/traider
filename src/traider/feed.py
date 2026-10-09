@@ -28,6 +28,7 @@ from traider.schwab.parse import parse_candles, parse_option_chain, parse_quotes
 from traider.schwab.stream import SchwabStream
 from traider.schwab.tokens import TokenManager
 from traider.session import SessionTracker
+from traider.settings import Settings
 from traider.timeutil import Clock, trading_date
 
 log = logging.getLogger(__name__)
@@ -52,10 +53,12 @@ class Feed:
         market: MarketData,
         clock: Clock,
         session: SessionTracker,
+        settings: Settings | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        chosen = settings if settings is not None else Settings.from_config(config)
         self._sleep = sleep
-        self._symbols = config.symbols
+        self._symbols = chosen.pinned_symbols
         self._poll_interval_s = config.poll_interval_s
         self._client = client
         self._market = market
@@ -63,14 +66,20 @@ class Feed:
         self._session = session
         self._stream = (
             SchwabStream(
-                http, client, tokens, sink=self, clock=clock, symbols=config.symbols, sleep=sleep
+                http,
+                client,
+                tokens,
+                sink=self,
+                clock=clock,
+                symbols=chosen.pinned_symbols,
+                sleep=sleep,
             )
             if config.feed == "stream"
             else None
         )
-        self._chains_wanted = config.risk.allow_options
-        self._chain_span = timedelta(days=config.option_chain_days)
-        self._chain_strikes = config.option_chain_strikes
+        self._chains_wanted = chosen.risk.allow_options
+        self._chain_span = timedelta(days=chosen.option_chain_days)
+        self._chain_strikes = chosen.option_chain_strikes
         self._chain_tried_at: dict[str, datetime] = {}
         self._bars_fetched_for: datetime | None = None
         self._complained_at: datetime | None = None

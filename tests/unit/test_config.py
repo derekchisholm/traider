@@ -115,3 +115,8 @@ def test_blank_optional_values_are_treated_as_unset():
     )
     assert cfg.state_table is None
     assert cfg.flatten_before_close_min is None
+
+
+def test_settings_table_is_read_from_the_environment():
+    cfg = Config.from_env({**BASE, "TRAIDER_SETTINGS_TABLE": "traider-dev-settings"})
+    assert cfg.settings_table == "traider-dev-settings"

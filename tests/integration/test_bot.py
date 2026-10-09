@@ -424,3 +424,59 @@ def test_configuration_never_appears_in_the_startup_summary_with_secrets(world):
     summary = json.dumps(app.describe(world.config()))
     assert APP_SECRET not in summary
     assert APP_KEY not in summary
+
+
+async def test_bot_seeds_the_settings_table_and_starts_on_its_values(world, aws):
+    from traider.settings_store import DynamoSettingsStore
+
+    boto3.client("dynamodb").create_table(
+        TableName="traider-test-settings",
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+    )
+    world.sign_in()
+    config = world.config(settings_table="traider-test-settings")
+    await world.start(config)
+    store = DynamoSettingsStore(boto3.resource("dynamodb").Table("traider-test-settings"))
+    latest = await store.latest()
+    assert latest is not None and latest.author == "bootstrap"
+    assert world.bot.settings == latest.settings
+    assert app.describe(config, world.bot.settings)["settings"] == "traider-test-settings"
+
+
+async def test_bot_starts_on_the_stored_settings_and_gives_the_same_ones_to_the_engine(world, aws):
+    from traider.settings import Settings
+    from traider.settings_store import DynamoSettingsStore
+
+    boto3.client("dynamodb").create_table(
+        TableName="traider-test-settings",
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+    )
+    world.sign_in()
+    config = world.config(settings_table="traider-test-settings")
+    stored = Settings.from_config(config)
+    stored = stored.model_copy(
+        update={"risk": stored.risk.model_copy(update={"max_order_usd": Decimal(250)})}
+    )
+    store = DynamoSettingsStore(boto3.resource("dynamodb").Table("traider-test-settings"))
+    await store.write(stored, expected_version=0, author="test", note="", now=START)
+    await world.start(config)
+    assert world.bot.settings == stored
+    assert world.bot.settings.risk.max_order_usd == Decimal(250)
+    # The engine is on the same stored values, not the environment's 500.
+    assert world.bot.engine.settings == stored

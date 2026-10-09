@@ -39,7 +39,16 @@ async def until(predicate, timeout=3.0):
 
 @contextlib.asynccontextmanager
 async def make_feed(
-    schwab, client, signed_in, *, feed="poll", now=NOW, symbols=("SPY",), options=False, **extra
+    schwab,
+    client,
+    signed_in,
+    *,
+    feed="poll",
+    now=NOW,
+    symbols=("SPY",),
+    options=False,
+    settings=None,
+    **extra,
 ):
     clock = ManualClock(now)
     market = MarketData()
@@ -55,6 +64,7 @@ async def make_feed(
             market=market,
             clock=clock,
             session=session,
+            settings=settings,
         )
         built.clock = clock
         built.market = market
@@ -505,3 +515,13 @@ async def test_no_option_data_is_polled_while_the_market_is_closed(schwab, clien
         feed.market.watch(CALL)
         await feed.poll_once()
     assert schwab.calls("GET", "/marketdata/v1") == []
+
+
+async def test_feed_takes_its_symbols_from_the_settings_it_is_given(schwab, client, signed_in):
+    from traider.settings import Settings
+
+    settings = Settings.from_config(Config(symbols=("SPY",))).model_copy(
+        update={"pinned_symbols": ("QQQ",)}
+    )
+    async with make_feed(schwab, client, signed_in, settings=settings) as feed:
+        assert feed._symbols == ("QQQ",)
