@@ -76,6 +76,43 @@ def test_decimals_and_dates_serialise_wherever_they_sit():
     }
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_numbers_fail_the_write_instead_of_writing_invalid_json(bad):
+    with pytest.raises(ValueError, match="JSON"):
+        to_json({"x": [bad]})
+
+
+def test_sets_are_written_in_order():
+    assert json.loads(to_json({"s": {"b", "c", "a"}, "d": frozenset({3, 1, 2})})) == {
+        "s": ["a", "b", "c"],
+        "d": [1, 2, 3],
+    }
+    mixed = json.loads(to_json({"s": {"a", 1}}))["s"]  # unsortable: still written
+    assert sorted(map(str, mixed)) == ["1", "a"]
+
+
+class StubS3:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def put_object(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+async def test_s3_trail_asks_for_encryption_and_sets_no_acl():
+    stub = StubS3()
+    await S3Trail(stub, "trail", PREFIX).put("result.json", {"ok": True})
+    assert stub.calls == [
+        {
+            "Bucket": "trail",
+            "Key": PREFIX + "result.json",
+            "Body": b'{\n "ok": true\n}',
+            "ContentType": "application/json",
+            "ServerSideEncryption": "AES256",
+        }
+    ]
+
+
 async def test_s3_trail_writes_json_objects_under_the_runs_prefix():
     with mock_aws():
         client = boto3.client("s3")
@@ -87,6 +124,7 @@ async def test_s3_trail_writes_json_objects_under_the_runs_prefix():
         stored = client.get_object(Bucket="trail", Key=PREFIX + "dives/NVDA.json")
         assert json.loads(stored["Body"].read()) == STORED
         assert stored["ContentType"] == "application/json"
+        assert stored["ServerSideEncryption"] == "AES256"
         assert trail.location == f"s3://trail/{PREFIX}"
 
 
@@ -157,7 +195,7 @@ async def test_a_symlink_inside_the_trail_cannot_lead_out_of_it(tmp_path):
 async def test_a_prefix_cannot_lead_out_of_the_root_either(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
-    with pytest.raises(ValueError, match="not a trail file name"):
+    with pytest.raises(ValueError, match="outside the trail root"):
         await LocalTrail(root, "../elsewhere/").put("x.json", {})
     assert not (tmp_path / "elsewhere").exists()
 
@@ -209,6 +247,13 @@ KEY = "d1c2b3a4e5f6a7b8c9d0e1f2"
         "\N{ZERO WIDTH NO-BREAK SPACE}",
         "\N{WORD JOINER}",
         "\N{TAG LATIN CAPITAL LETTER A}",
+        "\N{COMBINING GRAPHEME JOINER}",
+        "\N{COMBINING ENCLOSING CIRCLE}",
+        "\N{VARIATION SELECTOR-16}",
+        "\N{HANGUL FILLER}",
+        "\N{HANGUL CHOSEONG FILLER}",
+        "\N{HANGUL JUNGSEONG FILLER}",
+        "\N{BRAILLE PATTERN BLANK}",
     ],
 )
 def test_invisible_characters_cannot_hide_a_key(hidden):
@@ -229,7 +274,7 @@ def test_scrub_survives_lone_surrogates_and_odd_unicode():
     raw = f"bad \ud800 pair \udfff and e{accent} {face} {separator} end"
     clean = scrub(raw)
     clean.encode("utf-8")  # alerts and DynamoDB need valid UTF-8
-    assert clean == f"bad pair and e{accent} {face} end"
+    assert clean == f"bad pair and e {face} end"  # the combining accent is dropped
 
 
 @pytest.mark.parametrize(
@@ -253,12 +298,134 @@ def test_scrub_output_never_exceeds_the_limit(raw, limit):
     assert KEY not in clean
 
 
-def test_scrub_is_fast_on_large_hostile_text():
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://x" * 50_000,
+        "https://a/" * 50_000,
+        "a" * 2_000_000,
+        "1a" * 1_000_000,
+        "http://x" + "?" * 500_000,
+        "arn:aws" * 50_000,
+        "token:" * 50_000,
+        "x-amz-security-token = " * 50_000,
+        "AKIA" * 100_000,
+        "aB1/" * 100_000,
+        "a://b:" * 50_000,
+    ],
+)
+def test_scrub_is_linear_on_hostile_text(raw):
     started = time.monotonic()
-    scrub("a" * 2_000_000)
-    scrub("1a" * 1_000_000)
-    scrub("http://x" + "?" * 500_000)
-    assert time.monotonic() - started < 5
+    scrub(raw)
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://x" * 4_000,
+        "https://a/" * 4_000,
+        "arn:aws" * 4_000,
+        "token:" * 4_000,
+        "aB1/" * 8_000,
+        "a://b:" * 4_000,
+    ],
+)
+def test_the_patterns_themselves_are_not_quadratic(raw):
+    # A bigger limit lifts the input cap, so the patterns must hold up on their own.
+    started = time.monotonic()
+    scrub(raw, 10_000)
+    assert time.monotonic() - started < 0.5
+
+
+# --- AWS secrets ------------------------------------------------------------------------
+
+SESSION_TOKEN = (
+    "IQoJb3JpZ2luX2VjEJr//////////wEaCXVzLWVhc3QtMSJHMEUCIQDk3xXexampleSignature"
+    "Base64+Zm9vYmFyYmF6cXV4/AiBabcdEFGH12345678ijklMNOPqrstUVWXyz0123456789=="
+)
+
+
+@pytest.mark.parametrize(
+    "key", ["AKIAABCDEFGHIJKLMNOP", "ASIAQWERTYUIOPASDFGH", "AROAABCDEFGHIJKLMNOP"]
+)
+def test_scrub_masks_access_key_ids(key):
+    assert scrub(f"denied for {key} today") == "denied for *** today"
+
+
+def test_scrub_masks_a_secret_access_key():
+    secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    assert len(secret) == 40
+    assert scrub(f"secret {secret} here") == "secret *** here"
+    assert scrub(f"({secret})") == "(***)"
+    assert scrub(f"{secret}=") != f"{secret}="  # not left whole
+
+
+def test_scrub_masks_a_forty_character_key_the_other_rules_would_miss():
+    key = "A" * 13 + "/" + "B" * 13 + "/" + "C" * 12  # one case, no digit
+    assert len(key) == 40
+    assert scrub(f"key {key} end") == "key *** end"
+    assert scrub("see /marketdata/v1/pricehistory/instrument/lookups") == (
+        "see /marketdata/v1/pricehistory/instrument/lookups"
+    )
+
+
+def test_scrub_leaves_no_fragment_of_a_session_token():
+    clean = scrub(f"call failed with {SESSION_TOKEN} at 12:00")
+    assert clean == "call failed with *** at 12:00"
+    assert not any(SESSION_TOKEN[i : i + 8] in clean for i in range(len(SESSION_TOKEN) - 7))
+
+
+@pytest.mark.parametrize(
+    ("raw", "clean"),
+    [
+        ("Authorization: Bearer abc123def456", "Authorization: ***"),
+        ("authorization=Basic dXNlcjpwYXNz", "authorization=***"),
+        ("x-amz-security-token: " + SESSION_TOKEN, "x-amz-security-token: ***"),
+        ("AWS_SECRET_ACCESS_KEY=hunter2", "AWS_SECRET_ACCESS_KEY=***"),
+        ("aws_session_token = abc", "aws_session_token = ***"),
+        ("X-Finnhub-Token: d1abcdef", "X-Finnhub-Token: ***"),
+        ("api_key=xyz and more", "api_key=*** and more"),
+        ("api-key: xyz", "api-key: ***"),
+        ("client_secret=zzz", "client_secret=***"),
+        ("password: hunter2", "password: ***"),
+        ("retry with token=abc.def", "retry with token=***"),
+    ],
+)
+def test_scrub_masks_header_and_field_values_but_keeps_the_name(raw, clean):
+    assert scrub(raw) == clean
+
+
+def test_scrub_masks_quoted_json_values():
+    clean = scrub('{"api_key": "sekrit-value", "password":"hunter2"}')
+    assert "sekrit" not in clean and "hunter2" not in clean
+    assert "api_key" in clean and "password" in clean
+
+
+@pytest.mark.parametrize(
+    ("raw", "clean"),
+    [
+        (
+            "connect postgres://admin:hunter2@db.example.com:5432/x failed",
+            "connect postgres://admin:***@db.example.com:5432/x failed",
+        ),
+        ("https://user:pa55@host/p?k=v", "https://user:***@host/p?***"),
+        ("https://host/p", "https://host/p"),
+        ("mail me@example.com", "mail me@example.com"),
+    ],
+)
+def test_scrub_masks_the_password_in_a_link(raw, clean):
+    assert scrub(raw) == clean
+
+
+def test_ordinary_prose_with_symbols_and_prices_survives():
+    text = (
+        "NVDA closed at $123.45 (+2.1%) on 2026-10-09; $VIX 18.2, order 1234 for 10 shares at "
+        "5.5. GET /marketdata/v1/pricehistory/quotes/all/symbols: HTTP 503. "
+        "Tokens are cheap, so stand_aside because authentication_failed. "
+        "Mixed Case Words And Prices like AAPL 190.25 stay."
+    )
+    assert scrub(text, 1000) == text
 
 
 def test_scrub_keeps_short_text_whole_and_marks_the_cut():

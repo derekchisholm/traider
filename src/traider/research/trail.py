@@ -66,13 +66,19 @@ def _default(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, Enum):
         return value.value
-    if isinstance(value, set | frozenset | tuple):
+    if isinstance(value, set | frozenset):
+        try:
+            return sorted(value)  # a set has no order; sorted output is reproducible
+        except TypeError:
+            return list(value)
+    if isinstance(value, tuple):
         return list(value)
     raise TypeError(f"cannot store a {type(value).__name__} in the trail")
 
 
 def to_json(data: Any) -> str:
-    return json.dumps(_keyed(data), default=_default, indent=1)
+    # allow_nan=False: NaN and Infinity are not JSON, so a non-finite float fails the write.
+    return json.dumps(_keyed(data), default=_default, indent=1, allow_nan=False)
 
 
 def _check_name(name: str) -> None:
@@ -101,6 +107,7 @@ class S3Trail:
             Key=self._prefix + name,
             Body=body,
             ContentType="application/json",
+            ServerSideEncryption="AES256",
         )
 
 
@@ -123,7 +130,7 @@ class LocalTrail:
             # (which itself must be inside the root).
             real_dir = self._dir.resolve()
             if not real_dir.is_relative_to(self._root.resolve()):
-                raise ValueError(f"not a trail file name: {name!r}")
+                raise ValueError(f"trail directory is outside the trail root: {self._dir}")
             if not path.resolve().is_relative_to(real_dir):
                 raise ValueError(f"not a trail file name: {name!r}")
             path.parent.mkdir(parents=True, exist_ok=True)
