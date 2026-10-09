@@ -40,12 +40,15 @@ def build() -> Stack:
 
     # What the command line needs on your own machine: the bot's settings and where its
     # secrets live. The trading mode, the control switch and the state table are left
-    # out on purpose, so nothing run locally with this can send a live order.
+    # out on purpose, so nothing run locally with this can send a live order. The
+    # settings table is included so `traider settings` works locally; settings cannot
+    # place orders.
     local: dict[str, pulumi.Input[str]] = {
         "AWS_REGION": aws.get_region_output().region,
         **{k: v for k, v in settings.bot_env.items() if k != "TRAIDER_TRADING_MODE"},
         "TRAIDER_SCHWAB_APP_SECRET_ID": store.app_secret.arn,
         "TRAIDER_SCHWAB_TOKEN_SECRET_ID": store.token_secret.arn,
+        "TRAIDER_SETTINGS_TABLE": store.settings_table.name,
     }
     if settings.callback_url:
         # Paste mode: `traider login` must use the same registered address.
@@ -63,6 +66,7 @@ def build() -> Stack:
             "appSecretArn": store.app_secret.arn,
             "tokenSecretArn": store.token_secret.arn,
             "stateTable": store.table.name,
+            "settingsTable": store.settings_table.name,
             "alertTopicArn": store.topic.arn,
             "clusterName": deployed.cluster_name,
             "serviceName": deployed.service_name,

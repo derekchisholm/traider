@@ -236,6 +236,12 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
                         "Resource": data.table.arn,
                     },
                     {
+                        "Sid": "Settings",
+                        "Effect": "Allow",
+                        "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"],
+                        "Resource": data.settings_table.arn,
+                    },
+                    {
                         "Sid": "Alerts",
                         "Effect": "Allow",
                         "Action": "sns:Publish",
@@ -252,6 +258,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
         "TRAIDER_SCHWAB_TOKEN_SECRET_ID": data.token_secret.arn,
         "TRAIDER_CONTROL_PARAM": data.control.name,
         "TRAIDER_STATE_TABLE": data.table.name,
+        "TRAIDER_SETTINGS_TABLE": data.settings_table.name,
         "TRAIDER_ALERT_TOPIC_ARN": data.topic.arn,
     }
     container = {

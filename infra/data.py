@@ -16,6 +16,7 @@ class Data:
     token_secret: aws.secretsmanager.Secret
     control: aws.ssm.Parameter
     table: aws.dynamodb.Table
+    settings_table: aws.dynamodb.Table
     topic: aws.sns.Topic
 
 
@@ -64,9 +65,26 @@ def build(settings: Settings) -> Data:
         tags=tags,
     )
 
+    # Versioned bot settings. Each change is a new item and nothing is ever rewritten,
+    # so the history is the audit trail.
+    settings_table = aws.dynamodb.Table(
+        "settings",
+        name=f"{prefix}-settings",
+        billing_mode="PAY_PER_REQUEST",
+        hash_key="pk",
+        range_key="sk",
+        attributes=[
+            aws.dynamodb.TableAttributeArgs(name="pk", type="S"),
+            aws.dynamodb.TableAttributeArgs(name="sk", type="S"),
+        ],
+        point_in_time_recovery=aws.dynamodb.TablePointInTimeRecoveryArgs(enabled=True),
+        deletion_protection_enabled=settings.trading_mode == "live",
+        tags=tags,
+    )
+
     topic = aws.sns.Topic("alerts", name=f"{prefix}-alerts", tags=tags)
     if settings.alert_email:
         aws.sns.TopicSubscription(
             "alerts-email", topic=topic.arn, protocol="email", endpoint=settings.alert_email
         )
-    return Data(app_secret, token_secret, control, table, topic)
+    return Data(app_secret, token_secret, control, table, settings_table, topic)

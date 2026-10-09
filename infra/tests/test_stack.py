@@ -292,7 +292,7 @@ def test_bot_is_wired_to_the_resources_this_stack_creates(paper):
     env = environment(paper)
     assert env["TRAIDER_SYMBOLS"] == "SPY,QQQ"
     assert env["TRAIDER_CONTROL_PARAM"] == "/traider-dev/control"
-    assert env["TRAIDER_STATE_TABLE"] == paper.one("aws:dynamodb/table:Table").inputs["name"]
+    assert env["TRAIDER_STATE_TABLE"] == paper.one(TABLE, "state").inputs["name"]
     assert env["TRAIDER_SCHWAB_APP_SECRET_ID"].startswith("arn:aws:secretsmanager:")
     assert env["TRAIDER_SCHWAB_TOKEN_SECRET_ID"].startswith("arn:aws:secretsmanager:")
     assert env["TRAIDER_SCHWAB_APP_SECRET_ID"] != env["TRAIDER_SCHWAB_TOKEN_SECRET_ID"]
@@ -412,15 +412,15 @@ def test_secret_containers_are_created_but_never_their_values(paper):
 
 
 def test_state_table_is_on_demand_with_point_in_time_recovery(paper):
-    table = paper.one("aws:dynamodb/table:Table").inputs
+    table = paper.one(TABLE, "state").inputs
     assert table["billingMode"] == "PAY_PER_REQUEST"
     assert (table["hashKey"], table["rangeKey"]) == ("pk", "sk")
     assert table["pointInTimeRecovery"] == {"enabled": True}
 
 
 def test_live_state_table_is_protected_from_deletion(live, paper):
-    assert live.one("aws:dynamodb/table:Table").inputs["deletionProtectionEnabled"] is True
-    assert not paper.one("aws:dynamodb/table:Table").inputs.get("deletionProtectionEnabled")
+    assert live.one(TABLE, "state").inputs["deletionProtectionEnabled"] is True
+    assert not paper.one(TABLE, "state").inputs.get("deletionProtectionEnabled")
 
 
 def test_alert_email_is_subscribed_when_given(paper):
@@ -460,7 +460,8 @@ def test_each_bot_permission_names_exactly_the_resource_it_is_for(paper):
         ],
         "SaveRotatedRefreshToken": paper.one(SECRET, "schwab-token").arn,
         "ReadControlSwitch": paper.one(PARAMETER, "control").arn,
-        "State": paper.one(TABLE).arn,
+        "State": paper.one(TABLE, "state").arn,
+        "Settings": paper.one(TABLE, "settings").arn,
         "Alerts": paper.one(TOPIC).arn,
     }
 
@@ -915,3 +916,35 @@ def test_resource_names_the_docs_spell_out_match_what_the_stack_creates(paper):
     # The README shows the kill switch command with the parameter's name written out.
     readme = DOCS[0].read_text(encoding="utf-8")
     assert f"--name {paper.outputs['controlParameter']} --value halt --overwrite" in readme
+
+
+# --- versioned settings ---------------------------------------------------------------
+
+
+def test_settings_table_is_on_demand_with_point_in_time_recovery(paper):
+    table = paper.one(TABLE, "settings").inputs
+    assert table["name"] == "traider-dev-settings"
+    assert table["billingMode"] == "PAY_PER_REQUEST"
+    assert (table["hashKey"], table["rangeKey"]) == ("pk", "sk")
+    assert table["pointInTimeRecovery"] == {"enabled": True}
+
+
+def test_live_settings_table_is_protected_from_deletion(live, paper):
+    assert live.one(TABLE, "settings").inputs["deletionProtectionEnabled"] is True
+    assert not paper.one(TABLE, "settings").inputs.get("deletionProtectionEnabled")
+
+
+def test_bot_is_told_where_its_settings_live(paper):
+    assert (
+        environment(paper)["TRAIDER_SETTINGS_TABLE"] == paper.one(TABLE, "settings").inputs["name"]
+    )
+    assert paper.outputs["settingsTable"] == paper.one(TABLE, "settings").inputs["name"]
+
+
+def test_bot_can_read_and_add_settings_versions_but_not_delete_or_rewrite_them(paper):
+    (statement,) = [s for s in paper.policy("bot-task") if s["Sid"] == "Settings"]
+    assert set(statement["Action"]) == {"dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"}
+
+
+def test_local_env_lets_the_cli_edit_settings(paper):
+    assert local_env(paper)["TRAIDER_SETTINGS_TABLE"] == paper.one(TABLE, "settings").inputs["name"]
