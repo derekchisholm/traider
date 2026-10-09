@@ -275,3 +275,117 @@ def _dive_symbol(request: dict[str, Any]) -> str | None:
     if isinstance(first, str) and first.startswith("Symbol: "):
         return first.split("\n", 1)[0].removeprefix("Symbol: ").strip()
     return None
+
+
+# ----------------------------------------------------------------- a whole morning
+
+
+def market_day() -> tuple[FakeMarketData, FakeEvents]:
+    """One fixed pre-market morning, 2026-10-09 at 08:00 New York.
+
+    Eight candidates. Four survive the screen: NVDA (gap +4%, 3x volume), AMD (gap -4%,
+    2x volume, reported last night), MSFT (flat, very liquid) and PLTR (gap +2%). TINY is
+    under $5, OTCX trades over the counter, ETFQ is an ETF and NEWCO has 30 days of history.
+    The market is calm: VIX 18, SPY up 0.2% and above its 50-day average.
+    """
+    market = FakeMarketData()
+    calm_context(market)
+    market.mover_lists = {
+        ("EQUITY_ALL", "PERCENT_CHANGE_UP"): ["NVDA", "PLTR", "TINY"],
+        ("EQUITY_ALL", "PERCENT_CHANGE_DOWN"): ["AMD"],
+        ("NYSE", "VOLUME"): ["ETFQ", "NEWCO"],
+        ("NASDAQ", "VOLUME"): ["MSFT", "NVDA", "OTCX"],
+    }
+    market.quote_map.update(
+        {
+            "NVDA": quote("NVDA", 104.0, 100.0, avg_volume=1_000_000, high_52w=130.0),
+            "AMD": quote("AMD", 48.0, 50.0, avg_volume=2_000_000),
+            "MSFT": quote("MSFT", 401.0, 400.0, avg_volume=1_000_000),
+            "PLTR": quote("PLTR", 20.4, 20.0, avg_volume=3_000_000),
+            "TINY": quote("TINY", 2.0, 1.9),
+            "OTCX": quote("OTCX", 10.0, 9.0, exchange="OTC Markets"),
+            "ETFQ": quote("ETFQ", 50.0, 49.0, sub_type="ETF"),
+            "NEWCO": quote("NEWCO", 30.0, 29.0),
+        }
+    )
+    market.bars.update(
+        {
+            "NVDA": flat_bars(100.0, 1_000_000, last_volume=3_000_000),
+            "AMD": flat_bars(50.0, 1_000_000, last_volume=2_000_000),
+            "MSFT": flat_bars(400.0, 1_000_000),
+            "PLTR": flat_bars(20.0, 1_000_000, last_volume=1_500_000),
+            "NEWCO": flat_bars(29.0, 1_000_000, n=30),
+        }
+    )
+    market.put_chains["AMD"] = [
+        PutContract(
+            symbol="AMD   261023P00048000",
+            strike=48.0,
+            days=14,
+            bid=1.0,
+            ask=1.05,
+            open_interest=500,
+        )
+    ]
+    events = FakeEvents()
+    events.calendar = [EarningsEvent(symbol="AMD", day=date(2026, 10, 8), hour="amc")]
+    events.news = {"NVDA": news("NVDA", 5), "AMD": news("AMD", 2), "PLTR": news("PLTR", 1)}
+    events.general = news("MARKET", 3)
+    events.profiles = {
+        "NVDA": Profile(symbol="NVDA", industry="Semiconductors", market_cap_m=2.5e6),
+        "AMD": Profile(symbol="AMD", industry="Semiconductors", market_cap_m=2.4e5),
+        "MSFT": Profile(symbol="MSFT", industry="Technology", market_cap_m=3.0e6),
+        "PLTR": Profile(symbol="PLTR", industry="Technology", market_cap_m=1.5e5),
+    }
+    return market, events
+
+
+NVDA_SWING = {
+    "side": "long",
+    "horizon": "swing",
+    "score": 82,
+    "thesis": "Gap up on three times normal volume, holding above its averages.",
+    "invalidation": 101.0,
+    "swing_days": 5,
+    "risks": ["export rules", "crowded trade"],
+}
+AMD_BEARISH = {
+    "side": "bearish",
+    "horizon": "intraday",
+    "score": 70,
+    "thesis": "Weak guidance after last night's report; gap down below its averages.",
+    "invalidation": 49.5,
+    "risks": ["short squeeze"],
+}
+PLTR_LONG = {
+    "side": "long",
+    "horizon": "intraday",
+    "score": 65,
+    "thesis": "Steady buying into a +2% gap.",
+    "invalidation": 20.0,
+    "risks": [],
+}
+MSFT_PASS = {
+    "side": "pass",
+    "horizon": "intraday",
+    "score": 20,
+    "thesis": "Nothing new.",
+    "invalidation": 390.0,
+    "risks": [],
+}
+
+
+def golden_llm() -> ScriptedLLM:
+    """The model's side of the golden morning: posture reduced; NVDA looks at bars then
+    goes long swing; AMD bearish intraday; MSFT passes; PLTR first submits a score of 150,
+    is told why it is wrong, and resubmits."""
+    return ScriptedLLM(
+        posture=[posture_reply("reduced", "CPI at 08:30")],
+        dives={
+            "NVDA": [reply(tool_use("daily_bars", {"days": 20}, call_id="t1")),
+                     submit(**NVDA_SWING)],
+            "AMD": [submit(**AMD_BEARISH)],
+            "MSFT": [submit(**MSFT_PASS)],
+            "PLTR": [submit(**(PLTR_LONG | {"score": 150})), submit(**PLTR_LONG)],
+        },
+    )  # fmt: skip
