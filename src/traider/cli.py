@@ -1,4 +1,4 @@
-"""Command line: ``traider run | check | login | backtest | settings``.
+"""Command line: ``traider run | check | login | backtest | settings | research``.
 
 ``check`` is the first thing to run against the real Schwab API. It only reads:
 it signs in, looks at the account, the calendar and the quotes, and tells you
@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import TextIO
+from typing import Any, TextIO
 
 import aiohttp
 from botocore.exceptions import BotoCoreError, ClientError
@@ -31,6 +31,9 @@ from traider.broker.schwab import SchwabBroker
 from traider.config import Config, ConfigError, RiskLimits
 from traider.log import setup_logging
 from traider.models import Bar
+from traider.research.seed import build_manual_run
+from traider.research.source import ResearchSource
+from traider.research.store import DynamoResearchStore, ResearchStore
 from traider.schwab.client import API_BASE, SchwabClient, SchwabError
 from traider.schwab.hours import SchwabSessionProvider
 from traider.schwab.oauth import (
@@ -89,6 +92,15 @@ def _money(value: Decimal) -> str:
     return f"{value:,.2f}"
 
 
+def _check_symbol(config: Config) -> tuple[str, str]:
+    """The one symbol `check` reads history and an option chain for, and why that one.
+    With no pinned symbols (research chooses them) there is nothing of ours to look at,
+    so it uses SPY, which is only a probe that the market data works."""
+    if config.symbols:
+        return config.symbols[0], "first pinned symbol"
+    return "SPY", "no pinned symbols, research chooses the symbols"
+
+
 # ---------------------------------------------------------------------------- check
 
 
@@ -101,7 +113,8 @@ async def check(
 ) -> int:
     report = _Report(out)
     out.write("traider check: read-only, no orders are sent\n")
-    out.write(f"mode {config.trading_mode} | symbols {', '.join(config.symbols)}\n\n")
+    pinned = ", ".join(config.symbols) or "none pinned (research chooses)"
+    out.write(f"mode {config.trading_mode} | symbols {pinned}\n\n")
     aws = app.Aws(config.aws_region)
     try:
         creds = await asyncio.to_thread(app.credentials(config, aws).load)
@@ -220,25 +233,28 @@ async def _check_market(
                 f"{session.open.astimezone(ET):%H:%M} to {session.close.astimezone(ET):%H:%M} "
                 f"New York, {state}",
             )
+    symbol, why = _check_symbol(config)
+    used_for = "price history and option chain" if config.risk.allow_options else "price history"
+    report.note(f"checked {symbol} for {used_for}: {why}")
+    quoted = config.symbols or (symbol,)
     try:
-        quotes = parse_quotes(await client.quotes(config.symbols), now)
+        quotes = parse_quotes(await client.quotes(quoted), now)
     except SchwabError as exc:
         report.fail("quotes", str(exc))
         quotes = {}
     else:
-        for symbol in config.symbols:
-            quote = quotes.get(symbol)
+        for name in quoted:
+            quote = quotes.get(name)
             if quote is None:
-                report.fail(f"quote {symbol}", "Schwab returned no quote for this symbol")
+                report.fail(f"quote {name}", "Schwab returned no quote for this symbol")
             elif quote.delayed:
                 report.fail(
-                    f"quote {symbol}",
+                    f"quote {name}",
                     f"{quote.bid:.2f} x {quote.ask:.2f} but delayed; "
                     "the bot only trades on real-time quotes",
                 )
             else:
-                report.ok(f"quote {symbol}", f"{quote.bid:.2f} x {quote.ask:.2f}")
-    symbol = config.symbols[0]
+                report.ok(f"quote {name}", f"{quote.bid:.2f} x {quote.ask:.2f}")
     try:
         raw = await client.price_history(symbol, now - timedelta(days=5), now)
         bars = parse_candles(raw, symbol)
@@ -255,7 +271,7 @@ async def _check_options(
     config: Config, client: SchwabClient, now: datetime, report: _Report
 ) -> None:
     """Options are on: can the bot see a chain, and a real-time quote for a contract?"""
-    symbol = config.symbols[0]
+    symbol, _ = _check_symbol(config)
     today = trading_date(now)
     try:
         raw = await client.option_chain(
@@ -535,6 +551,58 @@ def _settings_store(config: Config) -> SettingsStore:
     return DynamoSettingsStore(app.Aws(config.aws_region).table(config.settings_table))
 
 
+# ------------------------------------------------------------------------- research
+
+
+def _read_seed_file(path: str) -> Any:
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+async def research_seed(store: ResearchStore, path: str, out: TextIO, *, now: datetime) -> int:
+    """Write one hand-made research run. The whole file is checked first: a bad file writes
+    nothing."""
+    try:
+        data = await asyncio.to_thread(_read_seed_file, path)
+        meta, picks, posture = build_manual_run(data, now)
+    except (OSError, ValueError) as exc:  # includes bad JSON and pydantic's ValidationError
+        out.write(f"invalid seed file: {exc}\n")
+        return 1
+    await store.write_run(meta, picks, posture)
+    shown = posture.level.value if posture is not None else "none"
+    out.write(f"wrote run {meta.run_id}: {len(picks)} pick(s), posture {shown}\n")
+    return 0
+
+
+async def research_show(source: ResearchSource, out: TextIO, *, now: datetime) -> int:
+    """Read research once, the way the bot does, and print what it would act on."""
+    await source.refresh(now)
+    view = source.view
+    if view.as_of != now:
+        # A failed read keeps the empty view; do not let that pass for "no research".
+        out.write("research could not be read: check the research table and your AWS access\n")
+        return 1
+    if view.posture is None:
+        note = "no posture today, so the bot stands aside"
+    else:
+        note = "; ".join(view.posture.reasons)
+    out.write(f"posture {view.level.value}{': ' + note if note else ''}\n")
+    live = sorted(view.live_picks(now).values(), key=lambda p: (-p.score, p.rank, p.symbol))
+    if not live:
+        out.write("no live picks\n")
+    for p in live:
+        out.write(
+            f"{p.rank} {p.symbol} {p.side.value} {p.horizon.value} {p.score} "
+            f"{p.expires_at.astimezone(ET):%Y-%m-%d %H:%M} New York\n"
+        )
+    return 0
+
+
+def _research_store(config: Config) -> ResearchStore:
+    assert config.research_table is not None
+    return DynamoResearchStore(app.Aws(config.aws_region).table(config.research_table))
+
+
 # ----------------------------------------------------------------------------- main
 
 
@@ -574,6 +642,11 @@ def _parser() -> argparse.ArgumentParser:
     apply = actions.add_parser("apply", help="write a JSON file as the next version")
     apply.add_argument("file")
     apply.add_argument("--note", default="", help="why, kept with the version")
+    research = commands.add_parser("research", help="write or read research by hand")
+    research_actions = research.add_subparsers(dest="action", required=True)
+    seed = research_actions.add_parser("seed", help="write a JSON file as a manual research run")
+    seed.add_argument("file")
+    research_actions.add_parser("show", help="print the posture and live picks the bot would see")
     return parser
 
 
@@ -614,6 +687,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(
                 settings_apply(
                     store, args.file, sys.stdout, note=args.note, now=SystemClock().now()
+                )
+            )
+        if args.command == "research":
+            if not config.research_table:
+                print("TRAIDER_RESEARCH_TABLE is not set", file=sys.stderr)
+                return 2
+            research_store = _research_store(config)
+            if args.action == "seed":
+                return asyncio.run(
+                    research_seed(research_store, args.file, sys.stdout, now=SystemClock().now())
+                )
+            return asyncio.run(
+                research_show(
+                    ResearchSource(research_store, lambda: config.research),
+                    sys.stdout,
+                    now=SystemClock().now(),
                 )
             )
         return asyncio.run(_backtest(args, config, sys.stdout))

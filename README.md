@@ -354,7 +354,12 @@ schedule); sell it first or keep it pinned. A few fields (strategy, its paramete
 option-chain span, `allow_options`) wait for the next restart. Until the bot has read a valid version
 it opens no new positions; after that, an unreadable table or a bad version leaves
 the last good settings in force. `traider check` and `traider backtest` still use the
-`TRAIDER_*` environment values, not the settings table.
+`TRAIDER_*` environment values, not the settings table. With no pinned symbols,
+`traider check` reads price history (and the option chain, with `allow_options` on)
+for SPY and says so; with pinned symbols it uses the first one.
+`traider research seed FILE` writes research by hand for paper testing and
+`traider research show` prints what the bot would read (see the
+[runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
 
 To run the command line on your own machine against a deployed stack, use the
 `localEnv` output as in step 5. It leaves out the trading mode and the control

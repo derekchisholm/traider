@@ -260,6 +260,33 @@ If the newest version is damaged and has no readable version number,
 `traider settings apply` refuses and tells you to delete that item from the settings
 table first.
 
+**Write research by hand** (paper testing, before the research jobs exist). With
+`TRAIDER_RESEARCH_TABLE` set in the `localEnv` output, write a file like this:
+
+```json
+{
+  "posture": {"level": "trade", "reasons": ["quiet macro calendar"]},
+  "picks": [
+    {"symbol": "NVDA", "side": "long", "horizon": "intraday", "score": 80,
+     "thesis": "why", "invalidation": "100"}
+  ]
+}
+```
+
+```sh
+uv run --env-file .env traider research seed picks.json
+uv run --env-file .env traider research show
+```
+
+`seed` checks the whole file and writes nothing if any part is wrong. It writes one run
+named `manual-<UTC time>`; picks rank in list order, and `pre_score` defaults to `score`.
+Unless you give `expires_at` (an ISO time with a timezone), an intraday pick expires at
+today's 16:00 New York time and a swing pick at 16:00 five weekdays later (holidays are
+not skipped). `side` is `long` or `bearish`, `horizon` is `intraday` or `swing`,
+`level` is `trade`, `reduced` or `stand_aside`. `show` reads the table the way the bot
+does and prints the posture and the live picks; it exits 1 if the table cannot be read.
+A pick below `research.min_score` is written but not shown, because the bot ignores it.
+
 **Change the code:** edit, then `pulumi up`. Same stop-then-start.
 
 **Stop for a while:** set the switch to `halt`. Scaling the service to zero by hand

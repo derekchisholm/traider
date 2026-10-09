@@ -207,6 +207,40 @@ async def test_check_fails_when_the_option_chain_is_empty(schwab, tmp_path):
     assert "FAIL" in text and "no option contracts" in text
 
 
+async def research_only_check(schwab, tmp_path, **overrides) -> tuple[int, str]:
+    sign_in(schwab, tmp_path)
+    schwab.set_quote("SPY", 512.30, 512.34)
+    cfg = config(tmp_path, symbols=(), research_table="research", **overrides)
+    return await run_check(schwab, cfg)
+
+
+async def test_check_with_no_pinned_symbols_checks_spy_and_says_why(schwab, tmp_path):
+    code, text = await research_only_check(schwab, tmp_path)
+    assert code == 0, text
+    assert "checked SPY" in text and "no pinned symbols" in text
+    assert "512.30" in text and "one-minute bars for SPY" in text
+    assert [c["query"]["symbol"] for c in schwab.calls("GET", "/pricehistory")] == ["SPY"]
+    assert [c["query"]["symbols"] for c in schwab.calls("GET", "/quotes")] == ["SPY"]
+
+
+async def test_check_with_no_pinned_symbols_reads_the_option_chain_of_spy(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10)
+    code, text = await research_only_check(schwab, tmp_path, risk=RiskLimits(allow_options=True))
+    assert code == 0, text
+    assert "1 contracts for SPY" in text
+    assert [c["query"]["symbol"] for c in schwab.calls("GET", "/chains")] == ["SPY"]
+
+
+async def test_check_says_it_checked_the_first_pinned_symbol(schwab, tmp_path):
+    sign_in(schwab, tmp_path)
+    schwab.set_quote("SPY", 512.30, 512.34)
+    schwab.set_quote("QQQ", 440.10, 440.15)
+    code, text = await run_check(schwab, config(tmp_path, symbols=("QQQ", "SPY")))
+    assert code == 0, text
+    assert "checked QQQ" in text and "first pinned symbol" in text
+    assert [c["query"]["symbol"] for c in schwab.calls("GET", "/pricehistory")] == ["QQQ"]
+
+
 async def test_check_fails_when_the_option_chain_cannot_be_read(schwab, tmp_path):
     schwab.fail("GET", "/marketdata/v1/chains", 500, times=3)
     code, text = await options_check(schwab, tmp_path)
