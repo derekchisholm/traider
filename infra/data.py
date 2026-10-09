@@ -65,8 +65,9 @@ def build(settings: Settings) -> Data:
         tags=tags,
     )
 
-    # Versioned bot settings. Each change is a new item and nothing is ever rewritten,
-    # so the history is the audit trail.
+    # Versioned bot settings. Each change is a new item, and the bot only ever writes
+    # with a conditional put. IAM cannot stop PutItem replacing an item, so the history
+    # being an audit trail rests on that code, not on permissions.
     settings_table = aws.dynamodb.Table(
         "settings",
         name=f"{prefix}-settings",

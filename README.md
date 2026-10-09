@@ -342,6 +342,16 @@ Stack settings live in `infra/Pulumi.<stack>.yaml` and are documented in
 `TRAIDER_*` environment variables the bot reads (`src/traider/config.py`), and
 validates them with the bot's own code during `pulumi preview`.
 
+**Settings are versioned.** The first time a deployed bot starts it copies the stack's
+settings into its settings table as version 1. From then on that table is the source:
+every change is a new numbered version, the running bot applies it within about 10
+seconds, and an alert lists what changed. `traider settings show | history | apply`
+reads and writes it (see the [runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
+A few fields (strategy, its parameters, pinned symbols, option-chain span,
+`allow_options`) wait for the next restart. Until the bot has read a valid version
+it opens no new positions; after that, an unreadable table or a bad version leaves
+the last good settings in force.
+
 To run the command line on your own machine against a deployed stack, use the
 `localEnv` output as in step 5. It leaves out the trading mode and the control
 switch on purpose, so nothing you run locally with it can send a live order. Do not

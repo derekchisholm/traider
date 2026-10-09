@@ -110,6 +110,9 @@ switch. A new version is validated with the same pydantic model.
   environment with a conditional put (`author: bootstrap`). A deploy therefore
   seeds the settings once and never overwrites them afterwards.
 
+Implementation note: `Config` keeps its tunable fields as the bootstrap source; the
+engine, feed and strategy read `Settings` at runtime.
+
 ### A.2 Settings table
 
 `{prefix}-settings`, keys `pk`/`sk`, on demand, point-in-time recovery, deletion
@@ -118,11 +121,10 @@ protection in live stacks.
 | pk | sk | Body |
 |---|---|---|
 | `SETTINGS` | `V#<000000n>` | Full settings JSON, `version`, `author`, `at`, `note`, `diff` against the previous version. Immutable. |
-| `SETTINGS` | `CURRENT` | `version` pointer |
 
-A write is one transaction: put `V#n+1` (condition: it does not exist) and update
-`CURRENT` (condition: still `n`). Two editors cannot clobber each other; the loser
-gets a conflict and re-reads. Rollback writes a new version whose body is an old one.
+The current version is the highest-numbered `V#` item. A write is one conditional put
+of `V#n+1` (`attribute_not_exists`), so two editors cannot both write version n+1;
+the loser gets a conflict and re-reads. Rollback writes a new version whose body is an old one.
 Alerts fire on any version that changes `risk` or the control switch (the switch
 itself stays in SSM).
 

@@ -8,6 +8,10 @@
 #
 # `pulumi preview` checks the settings with the bot's own validation, so a misspelled
 # limit fails there and not in the running bot.
+#
+# These settings seed the bot's versioned settings table the first time it starts.
+# After that, change them with `traider settings apply`: a `pulumi up` does not
+# overwrite a table that already has versions.
 
 config:
   aws:region: us-east-1

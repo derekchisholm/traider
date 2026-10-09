@@ -151,6 +151,9 @@ once every 15 minutes.
 | Strategy error | The strategy raised an exception. | Buys are off until the next restart, which the schedule does every morning. Set `close_only` or `halt`, fix the strategy and deploy. |
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
+| Settings version N applied | A new version of the settings is in force; the alert lists each change. | Nothing, if you made it. If you did not, set `halt` and look at `traider settings history`. |
+| Settings version N needs a restart | The version changes the strategy, its parameters, the pinned symbols, the option-chain span or whether options are allowed. Those wait for a restart; the rest applies now. | Restart when convenient (see below), or tomorrow's 09:00 start does it. |
+| Settings version N rejected | The newest version does not validate. | Fix it with `traider settings apply`. The bot runs on the last good version meanwhile. |
 
 ## Seeing what the bot did
 
@@ -208,17 +211,39 @@ The old task is stopped before the new one starts. On the way down the bot cance
 its working orders and hands back the lease; positions are kept. The new task reads
 positions from the broker, replays recent bars through the strategy and carries on.
 
-**Change a setting or the code:** edit, then `pulumi up`. Same stop-then-start.
+**Change a setting:** settings are versioned in the settings table, and the running
+bot picks up a new version within about 10 seconds. With the `localEnv` output
+loaded:
+
+```sh
+uv run --env-file .env traider settings show > settings.json
+# edit settings.json
+uv run --env-file .env traider settings apply settings.json --note "why"
+uv run --env-file .env traider settings history
+```
+
+Limits, order settings and flattening apply at once. The strategy, its parameters,
+the pinned symbols, the option-chain span and `allow_options` wait for a restart.
+To go back, apply an older version's body as a new version. Stack settings in
+Pulumi only seed version 1 when the table is empty; after that the table wins.
+If the newest version is damaged and has no readable version number,
+`traider settings apply` refuses and tells you to delete that item from the settings
+table first.
+
+**Change the code:** edit, then `pulumi up`. Same stop-then-start.
 
 **Stop for a while:** set the switch to `halt`. Scaling the service to zero by hand
 does not last with the default schedule, which starts it again at 09:00 New York
 time on the next weekday.
 
 **Remove everything:** `pulumi destroy`. The two secrets enter AWS's 30-day recovery
-window. A live stack's state table is protected against deletion; lift that first:
+window. A live stack's state and settings tables are protected against deletion; lift
+that first:
 
 ```sh
 aws dynamodb update-table --table-name "$(pulumi stack output stateTable)" \
+  --no-deletion-protection-enabled
+aws dynamodb update-table --table-name "$(pulumi stack output settingsTable)" \
   --no-deletion-protection-enabled
 ```
 
