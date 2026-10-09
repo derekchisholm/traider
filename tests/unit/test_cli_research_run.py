@@ -3,6 +3,8 @@ against the fake Schwab and Finnhub servers and moto."""
 
 import io
 import json
+import logging
+import os
 import time
 from datetime import timedelta
 
@@ -14,6 +16,8 @@ from tests.fakes.finnhub_server import API_KEY
 from tests.fakes.research import NOW, golden_llm, market_day
 from tests.fakes.schwab_server import APP_KEY, APP_SECRET
 from tests.unit.test_research_store import TABLE, make_table
+from tests.unit.test_settings_store import TABLE as SETTINGS_TABLE
+from tests.unit.test_settings_store import make_table as make_settings_table
 from traider import cli
 from traider.alerts import LogAlerter
 from traider.config import Config
@@ -26,6 +30,7 @@ from traider.research.wiring import SetupError, build_deps
 from traider.schwab.oauth import REFRESH_TOKEN_LIFETIME_S
 from traider.schwab.tokens import Grant
 from traider.settings import Settings
+from traider.settings_store import DynamoSettingsStore
 from traider.timeutil import ManualClock
 
 CONFIG = Config(research_table=TABLE)
@@ -508,16 +513,7 @@ async def test_through_the_real_adapters_an_expired_sign_in_fails_the_run(
     assert not [i for i in table.scan()["Items"] if i["sk"].startswith("POSTURE#")]
 
 
-async def test_a_dry_run_through_the_real_adapters_prints_no_secret_and_writes_nothing(
-    aws_stack, schwab, finnhub, tmp_path, caplog
-):
-    sign_in(aws_stack, schwab)
-    refresh = json.loads(
-        aws_stack["client"].get_secret_value(SecretId=aws_stack["token"])["SecretString"]
-    )["refresh_token"]
-    schwab.market_open = False
-    out = io.StringIO()
-
+def fake_adapters(schwab, finnhub):
     async def build(config, http, **kwargs):
         return await build_deps(
             config,
@@ -529,6 +525,25 @@ async def test_a_dry_run_through_the_real_adapters_prints_no_secret_and_writes_n
             **kwargs,
         )
 
+    return build
+
+
+@pytest.mark.parametrize("market_open", [False, True])
+async def test_a_dry_run_through_the_real_adapters_shows_no_secret_and_writes_nothing(
+    aws_stack, schwab, finnhub, tmp_path, caplog, capsys, market_open
+):
+    # botocore's own DEBUG lines print whole API responses, secret values included.
+    # setup_logging pins it at WARNING whatever the log level, and so does this test.
+    for noisy in ("botocore", "boto3"):
+        caplog.set_level(logging.WARNING, logger=noisy)
+    caplog.set_level(logging.DEBUG)  # last: it also sets the capture handler's level
+    sign_in(aws_stack, schwab)
+    refresh = json.loads(
+        aws_stack["client"].get_secret_value(SecretId=aws_stack["token"])["SecretString"]
+    )["refresh_token"]
+    schwab.market_open = market_open
+    out = io.StringIO()
+
     code = await cli.research_run(
         stack_config(aws_stack, research_bucket="trail", alert_topic_arn="arn:aws:sns:x"),
         out,
@@ -536,12 +551,18 @@ async def test_a_dry_run_through_the_real_adapters_prints_no_secret_and_writes_n
         dry_run=True,
         force=False,
         trail_dir=str(tmp_path),
-        build=build,
+        build=fake_adapters(schwab, finnhub),
     )
-    assert code == 0
     _, _, printed = out.getvalue().partition("\n\n")
-    assert json.loads(printed)["status"] == "closed"
-    shown = out.getvalue() + caplog.text
+    status = json.loads(printed)["status"]
+    if market_open:
+        # The key really went out: Finnhub was asked, with the key in its header.
+        assert any(r["headers"].get("X-Finnhub-Token") == API_KEY for r in finnhub.requests)
+    else:
+        assert (code, status) == (0, "closed")
+        assert finnhub.requests == []
+    captured = capsys.readouterr()
+    shown = out.getvalue() + captured.out + captured.err + caplog.text
     for secret in (API_KEY, APP_KEY, APP_SECRET, refresh):
         assert secret not in shown
     assert boto3.resource("dynamodb").Table(TABLE).scan()["Items"] == []
@@ -569,3 +590,102 @@ async def test_a_client_that_fails_to_close_does_not_change_the_result(tmp_path,
     assert out.getvalue().startswith("research premarket ok:")
     assert "could not close the model client" in caplog.text
     assert "123456789012" not in caplog.text
+
+
+# --- the versioned settings, read once -------------------------------------------------
+
+
+async def write_settings(settings: Settings) -> None:
+    store = DynamoSettingsStore(boto3.resource("dynamodb").Table(SETTINGS_TABLE))
+    await store.write(settings, expected_version=0, author="test", note="", now=NOW)
+
+
+async def test_the_newest_settings_version_is_what_the_run_uses(
+    aws_stack, schwab, finnhub, tmp_path
+):
+    make_settings_table()
+    config = stack_config(aws_stack, settings_table=SETTINGS_TABLE)
+    base = Settings.from_config(config)
+    await write_settings(
+        base.model_copy(
+            update={"research_jobs": base.research_jobs.model_copy(update={"enabled": False})}
+        )
+    )
+    out = io.StringIO()
+    code = await cli.research_run(
+        config,
+        out,
+        kind="premarket",
+        dry_run=False,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=fake_adapters(schwab, finnhub),
+    )
+    assert code == 0
+    assert out.getvalue().startswith("research premarket disabled:")
+    assert boto3.resource("dynamodb").Table(TABLE).scan()["Items"] == []
+
+
+async def test_an_invalid_newest_settings_version_stops_the_run_before_it_starts(
+    aws_stack, schwab, finnhub, tmp_path
+):
+    settings_table = make_settings_table()
+    config = stack_config(aws_stack, settings_table=SETTINGS_TABLE)
+    await write_settings(Settings.from_config(config))
+    settings_table.put_item(
+        Item={"pk": "SETTINGS", "sk": "V#000000002", "body": "{not json", "at": NOW.isoformat()}
+    )
+    out = io.StringIO()
+    code = await cli.research_run(
+        config,
+        out,
+        kind="premarket",
+        dry_run=False,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=fake_adapters(schwab, finnhub),
+    )
+    assert code == 1
+    assert "cannot start the research run: the newest settings version is invalid" in (
+        out.getvalue()
+    )
+    assert boto3.resource("dynamodb").Table(TABLE).scan()["Items"] == []
+
+
+# --- main: a dry run's stdout is the notice and the JSON, nothing else -----------------
+
+
+def test_a_dry_runs_stdout_is_only_the_notice_and_the_report(monkeypatch, capsys, tmp_path):
+    for name in list(os.environ):
+        if name.startswith("TRAIDER_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("TRAIDER_SYMBOLS", "SPY")
+    monkeypatch.setenv("TRAIDER_RESEARCH_TABLE", TABLE)
+    monkeypatch.setattr(cli, "SystemClock", lambda: ManualClock(NOW))
+    build, _ = fake_build()
+
+    async def noisy_build(config, http, **kwargs):
+        chatter = logging.getLogger("traider.research.run")
+        chatter.warning("a warning the run logs")
+        chatter.info("an info line the run logs")
+        return await build(config, http, **kwargs)
+
+    monkeypatch.setitem(cli.research_run.__kwdefaults__, "build", noisy_build)
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        root.handlers[:] = []  # a fresh process: main sets up the logging itself
+        code = cli.main(
+            ["research", "run", "--kind", "premarket", "--dry-run", "--trail-dir", str(tmp_path)]
+        )
+    finally:
+        root.handlers[:], root.level = handlers, level
+    assert code == 0
+    captured = capsys.readouterr()
+    notice, _, printed = captured.out.partition("\n\n")
+    assert notice + "\n\n" == cli.DRY_RUN_NOTICE.format(where=tmp_path)
+    assert json.loads(printed)["status"] == "ok"  # the rest of stdout is one JSON document
+    assert "a warning the run logs" not in captured.out
+    assert "an info line the run logs" not in captured.out
+    assert "a warning the run logs" in captured.err  # warnings go to stderr
+    assert "an info line the run logs" not in captured.err
