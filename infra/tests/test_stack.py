@@ -903,7 +903,7 @@ DOCS = [
 def test_every_stack_output_the_docs_tell_you_to_read_exists(doc, paper):
     named = set(re.findall(r"pulumi stack output (\w+)", doc.read_text(encoding="utf-8")))
     assert named, "the docs should use at least one stack output"
-    researched = deploy({"research": True, "pinnedSymbols": []})  # adds researchTable
+    researched = deploy({"research": True, "researchJobs": True, "pinnedSymbols": []})
     assert named <= set(paper.outputs) | set(researched.outputs)
 
 

@@ -16,7 +16,7 @@ from network import Network
 from settings import Settings
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ECS_TRUST = json.dumps(
+ECS_TRUST = json.dumps(
     {
         "Version": "2012-10-17",
         "Statement": [
@@ -36,6 +36,8 @@ class Bot:
     service_name: pulumi.Output[str]
     log_group: pulumi.Output[str]
     image: pulumi.Output[str]
+    execution_role: aws.iam.Role  # the research task starts with it too
+    stopped_rule: aws.cloudwatch.EventRule  # the bot's crash alarm
 
 
 def _image(settings: Settings) -> pulumi.Output[str]:
@@ -101,7 +103,7 @@ def _image(settings: Settings) -> pulumi.Output[str]:
 
 def _alert_when_the_task_dies(
     prefix: str, tags: dict[str, str], cluster: aws.ecs.Cluster, data: Data
-) -> None:
+) -> aws.cloudwatch.EventRule:
     """Send an alert when a task crashes or cannot start. The bot cannot report its own
     death, and a deploy made outside market hours is not exercised until the next open.
     Clean stops (the evening schedule, a deploy) exit 0 and stay quiet."""
@@ -137,6 +139,12 @@ def _alert_when_the_task_dies(
             ),
         ),
     )
+    return rule
+
+
+def alert_topic_policy(data: Data, alarms: dict[str, aws.cloudwatch.EventRule]) -> None:
+    """Let EventBridge publish to the alert topic, for these rules only. A topic has one
+    policy, so every alarm that publishes to it is listed here (Sid -> rule)."""
     aws.sns.TopicPolicy(
         "alerts",
         arn=data.topic.arn,
@@ -145,13 +153,14 @@ def _alert_when_the_task_dies(
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        "Sid": "TaskStoppedAlarm",
+                        "Sid": sid,
                         "Effect": "Allow",
                         "Principal": {"Service": "events.amazonaws.com"},
                         "Action": "sns:Publish",
                         "Resource": data.topic.arn,
                         "Condition": {"ArnEquals": {"aws:SourceArn": rule.arn}},
                     }
+                    for sid, rule in alarms.items()
                 ],
             }
         ),
@@ -172,7 +181,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
 
     # The execution role is what ECS uses to start the task: pull the image, write logs,
     # and fetch the one parameter injected as a secret.
-    execution_role = aws.iam.Role("bot-execution", assume_role_policy=_ECS_TRUST, tags=tags)
+    execution_role = aws.iam.Role("bot-execution", assume_role_policy=ECS_TRUST, tags=tags)
     aws.iam.RolePolicyAttachment(
         "bot-execution-managed",
         role=execution_role.name,
@@ -198,7 +207,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
 
     # The task role is what the bot's own code can do. Each statement names exact
     # resources. Note what is missing: it cannot change the control switch.
-    task_role = aws.iam.Role("bot-task", assume_role_policy=_ECS_TRUST, tags=tags)
+    task_role = aws.iam.Role("bot-task", assume_role_policy=ECS_TRUST, tags=tags)
     statements: list[dict[str, Any]] = [
         {
             "Sid": "ReadSchwabSecrets",
@@ -320,7 +329,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
     )
 
     cluster = aws.ecs.Cluster("bot", name=prefix, tags=tags)
-    _alert_when_the_task_dies(prefix, tags, cluster, data)
+    stopped_rule = _alert_when_the_task_dies(prefix, tags, cluster, data)
     scheduled = not settings.always_on
     service = aws.ecs.Service(
         "bot",
@@ -377,5 +386,10 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
                 ),
             )
     return Bot(
-        cluster_name=cluster.name, service_name=service.name, log_group=logs.name, image=image
+        cluster_name=cluster.name,
+        service_name=service.name,
+        log_group=logs.name,
+        image=image,
+        execution_role=execution_role,
+        stopped_rule=stopped_rule,
     )

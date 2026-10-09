@@ -45,6 +45,7 @@ class Settings:
     trading_mode: str
     symbols: tuple[str, ...]  # the pinned symbols; may be empty when research is on
     research: bool
+    research_jobs: bool  # the scheduled research runs; needs research
     bot_env: dict[str, str]  # everything the bot needs that is known before deploy
     alert_email: str | None
     callback_url: str | None  # override; None means "the hosted callback"
@@ -93,6 +94,12 @@ def load() -> Settings:
     config = pulumi.Config()
     prefix = f"{pulumi.get_project()}-{pulumi.get_stack()}"
     research = bool(config.get_bool("research"))
+    research_jobs = bool(config.get_bool("researchJobs"))
+    if research_jobs and not research:
+        raise ValueError(
+            "traider:researchJobs needs traider:research: true: the research jobs write to "
+            "the research table, which only exists with research on"
+        )
     symbols = _symbols(config, research=research)
     mode = config.get("tradingMode") or "paper"
 
@@ -145,6 +152,7 @@ def load() -> Settings:
         trading_mode=mode,
         symbols=symbols,
         research=research,
+        research_jobs=research_jobs,
         bot_env=env,
         alert_email=alert_email,
         callback_url=config.get("schwabCallbackUrl"),
