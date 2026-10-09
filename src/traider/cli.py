@@ -21,6 +21,7 @@ from decimal import Decimal
 from typing import TextIO
 
 import aiohttp
+from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import ValidationError
 
 from traider import app
@@ -456,7 +457,7 @@ async def settings_show(store: SettingsStore, out: TextIO) -> int:
     try:
         latest = await store.latest()
     except SettingsInvalid as exc:
-        out.write(f"newest version {exc.version} is invalid: {exc}\n")
+        out.write(f"{exc}\n")
         return 1
     if latest is None:
         out.write("no settings stored yet; the bot writes version 1 when it first starts\n")
@@ -493,6 +494,13 @@ async def settings_apply(
         latest = await store.latest()
         expected = latest.version if latest is not None else 0
     except SettingsInvalid as exc:
+        if exc.version < 0:
+            # No version number can be read, so there is nothing to write on top of.
+            out.write(
+                "newest settings item is damaged and has no readable version; "
+                "delete it from the settings table, then apply again\n"
+            )
+            return 1
         # The newest version is damaged. Writing on top of it is how an operator repairs it.
         expected = exc.version
     try:
@@ -572,24 +580,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         return 0
     logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
-    if args.command == "settings":
-        if not config.settings_table:
-            print("TRAIDER_SETTINGS_TABLE is not set", file=sys.stderr)
-            return 2
-        store = _settings_store(config)
-        if args.action == "show":
-            return asyncio.run(settings_show(store, sys.stdout))
-        if args.action == "history":
-            return asyncio.run(settings_history(store, sys.stdout, limit=args.limit))
-        return asyncio.run(
-            settings_apply(store, args.file, sys.stdout, note=args.note, now=SystemClock().now())
-        )
     try:
         if args.command == "check":
             return asyncio.run(check(config, sys.stdout))
         if args.command == "login":
             return login(config, sys.stdout)
+        if args.command == "settings":
+            if not config.settings_table:
+                print("TRAIDER_SETTINGS_TABLE is not set", file=sys.stderr)
+                return 2
+            store = _settings_store(config)
+            if args.action == "show":
+                return asyncio.run(settings_show(store, sys.stdout))
+            if args.action == "history":
+                return asyncio.run(settings_history(store, sys.stdout, limit=args.limit))
+            return asyncio.run(
+                settings_apply(
+                    store, args.file, sys.stdout, note=args.note, now=SystemClock().now()
+                )
+            )
         return asyncio.run(_backtest(args, config, sys.stdout))
-    except (BacktestError, SchwabError, ParseError, OSError) as exc:
+    except (
+        BacktestError,
+        SchwabError,
+        ParseError,
+        OSError,
+        BotoCoreError,
+        ClientError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

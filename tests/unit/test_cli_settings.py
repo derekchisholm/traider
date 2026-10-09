@@ -7,13 +7,31 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from botocore.exceptions import ClientError
 
 from traider import cli
 from traider.config import Config
 from traider.settings import Settings
-from traider.settings_store import MemorySettingsStore
+from traider.settings_store import MemorySettingsStore, SettingsConflict
 
 T0 = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)
+
+
+class ConflictingStore(MemorySettingsStore):
+    async def write(self, *args, **kwargs):
+        raise SettingsConflict("version 2 already exists")
+
+
+class DeniedStore(MemorySettingsStore):
+    async def latest(self):
+        raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "nope"}}, "Query")
+
+
+def settings_file(tmp_path) -> str:
+    body = Settings.from_config(Config(symbols=("SPY",))).model_dump(mode="json")
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps(body))
+    return str(path)
 
 
 async def seeded() -> MemorySettingsStore:
@@ -54,7 +72,8 @@ async def test_show_reports_an_invalid_newest_version():
     store.put_raw(2, invalid_body())
     out = io.StringIO()
     assert await cli.settings_show(store, out) == 1
-    assert out.getvalue().startswith("newest version 2 is invalid:")
+    assert out.getvalue().startswith("settings version 2 is invalid:")
+    assert "newest version" not in out.getvalue()
 
 
 async def test_apply_repairs_over_an_invalid_newest_version(tmp_path):
@@ -68,6 +87,37 @@ async def test_apply_repairs_over_an_invalid_newest_version(tmp_path):
     latest = await store.latest()
     assert latest.version == 3 and latest.note == "repair"
     assert "wrote version 3" in out.getvalue()
+
+
+async def test_apply_refuses_a_newest_item_with_no_readable_version(tmp_path):
+    store = await seeded()
+    store.put_raw(2, invalid_body())
+    # Corrupt both the version field and the sort key, so no version number can be read.
+    store._items[2]["version"] = "x"
+    store._items[2]["sk"] = "V#bad"
+    out = io.StringIO()
+    assert await cli.settings_apply(store, settings_file(tmp_path), out, note="", now=T0) == 1
+    assert out.getvalue() == (
+        "newest settings item is damaged and has no readable version; "
+        "delete it from the settings table, then apply again\n"
+    )
+    assert set(store._items) == {1, 2}
+
+
+async def test_apply_reports_a_conflict_and_returns_1(tmp_path):
+    out = io.StringIO()
+    store = ConflictingStore()
+    assert await cli.settings_apply(store, settings_file(tmp_path), out, note="", now=T0) == 1
+    assert "not written" in out.getvalue()
+
+
+def test_settings_reports_an_aws_error_in_one_line(monkeypatch, capsys):
+    monkeypatch.setenv("TRAIDER_SYMBOLS", "SPY")
+    monkeypatch.setenv("TRAIDER_SETTINGS_TABLE", "settings")
+    monkeypatch.setattr(cli, "_settings_store", lambda config: DeniedStore())
+    assert cli.main(["settings", "show"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "AccessDeniedException" in err
 
 
 async def test_apply_writes_a_new_version_and_prints_the_diff(tmp_path):
