@@ -10,6 +10,7 @@ from traider.research.models import Pick, Posture, RunMeta
 from traider.research.store import DynamoResearchStore, MemoryResearchStore
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
+T1 = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)
 DAY = "2026-10-09"
 TABLE = "traider-test-research"
 
@@ -137,19 +138,74 @@ class _FailingDict(dict):
         super().__setitem__(key, value)
 
 
-class _FailingTable:
-    """DynamoDB table stand-in that refuses the second pick and passes everything else."""
+class _TableWrapper:
+    """A DynamoDB table stand-in that passes every call through unless a subclass changes it."""
 
     def __init__(self, table):
         self._table = table
+
+    def __getattr__(self, name):
+        return getattr(self._table, name)
+
+
+class _FailingTable(_TableWrapper):
+    """Refuses the second pick and passes everything else."""
 
     def put_item(self, Item):
         if Item["sk"].endswith("#002"):
             raise RuntimeError("throttled")
         return self._table.put_item(Item=Item)
 
-    def __getattr__(self, name):
-        return getattr(self._table, name)
+
+class _PagedTable(_TableWrapper):
+    """Forces every query to a page of two, so reads must follow LastEvaluatedKey."""
+
+    def __init__(self, table):
+        super().__init__(table)
+        self.query_calls = 0
+
+    def query(self, **kwargs):
+        self.query_calls += 1
+        return self._table.query(**(kwargs | {"Limit": 2}))
+
+
+class _SpyTable(_TableWrapper):
+    """Records the keyword arguments of every query and get_item."""
+
+    def __init__(self, table):
+        super().__init__(table)
+        self.calls: list[tuple[str, dict]] = []
+
+    def query(self, **kwargs):
+        self.calls.append(("query", kwargs))
+        return self._table.query(**kwargs)
+
+    def get_item(self, **kwargs):
+        self.calls.append(("get_item", kwargs))
+        return self._table.get_item(**kwargs)
+
+
+async def test_a_day_with_more_items_than_one_page_reads_back_whole(store):
+    if isinstance(store, MemoryResearchStore):
+        pytest.skip("paging is a DynamoDB feature")
+    store._table = paged = _PagedTable(store._table)
+    await store.write_run(meta(), [pick("NVDA", 1), pick("AMD", 2), pick("MU", 3)], posture())
+    day = await store.day(DAY)
+    assert [p.symbol for p in day.picks] == ["NVDA", "AMD", "MU"]
+    assert day.postures == (posture(),)
+    assert paged.query_calls > 1
+
+
+async def test_day_and_meta_reads_are_consistent(store):
+    if isinstance(store, MemoryResearchStore):
+        pytest.skip("consistent reads are a DynamoDB feature")
+    await store.write_run(meta(), [pick()], None)
+    store._table = spy = _SpyTable(store._table)
+    await store.day(DAY)
+    queries = [kw for name, kw in spy.calls if name == "query"]
+    gets = [kw for name, kw in spy.calls if name == "get_item"]
+    assert queries and gets
+    assert all(kw.get("ConsistentRead") is True for kw in queries + gets)
 
 
 async def test_a_run_whose_picks_part_failed_to_write_is_never_seen(store):
@@ -160,7 +216,34 @@ async def test_a_run_whose_picks_part_failed_to_write_is_never_seen(store):
     with pytest.raises(RuntimeError):
         await store.write_run(meta(), [pick("NVDA", 1), pick("AMD", 2)], None)
     day = await store.day(DAY)
-    assert dict(day.runs) == {}
+    assert [p.symbol for p in day.picks] == ["NVDA"]
+    assert "r1" not in day.runs
+
+
+async def test_run_ids_with_hash_and_posture_only_runs_are_both_listed(store):
+    await store.write_run(meta("a#b"), [pick(run_id="a#b")], None)
+    await store.write_run(meta("r2"), [], posture(run_id="r2", at=T1))
+    day = await store.day(DAY)
+    assert set(day.runs) == {"a#b", "r2"}
+    assert [p.symbol for p in day.picks] == ["NVDA"]
+    assert day.postures == (posture(run_id="r2", at=T1),)
+
+
+@pytest.mark.parametrize(
+    ("picks", "run_posture", "problem"),
+    [
+        pytest.param([pick("NVDA", 1, run_id="r2")], None, "pick from another run", id="pick"),
+        pytest.param([pick("NVDA", 1)], posture(run_id="r2"), "posture", id="posture"),
+        pytest.param([pick("NVDA", 1), pick("AMD", 1)], None, "duplicate rank", id="rank"),
+    ],
+)
+async def test_a_run_whose_parts_do_not_belong_together_is_refused_whole(
+    store, picks, run_posture, problem
+):
+    with pytest.raises(ValueError):
+        await store.write_run(meta(), picks, run_posture)
+    day = await store.day(DAY)
+    assert (day.picks, day.postures, dict(day.runs)) == ((), (), {})
 
 
 async def test_picks_are_indexed_by_symbol_for_reports(store):

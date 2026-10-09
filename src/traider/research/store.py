@@ -37,9 +37,22 @@ class ResearchStore(Protocol):
     async def day(self, day: str) -> DayResearch: ...
 
 
+def _check_run(meta: RunMeta, picks: Sequence[Pick], posture: Posture | None) -> None:
+    """Refuse a run whose parts do not belong together, before anything is written."""
+    for p in picks:
+        if p.run_id != meta.run_id:
+            raise ValueError(f"pick {p.symbol} belongs to run {p.run_id!r}, not {meta.run_id!r}")
+    if posture is not None and posture.run_id != meta.run_id:
+        raise ValueError(f"posture belongs to run {posture.run_id!r}, not {meta.run_id!r}")
+    ranks = [p.rank for p in picks]
+    if len(set(ranks)) != len(ranks):
+        raise ValueError("duplicate pick ranks in one run")
+
+
 def _items_for(
     meta: RunMeta, picks: Sequence[Pick], posture: Posture | None
 ) -> list[dict[str, Any]]:
+    _check_run(meta, picks, posture)
     day = meta.trading_day.isoformat()
     items: list[dict[str, Any]] = [
         {
@@ -107,7 +120,7 @@ def _run_ids(items: Sequence[Mapping[str, Any]]) -> set[str]:
             ids.add(sk.removeprefix("PICK#").rsplit("#", 1)[0])
         elif sk.startswith("POSTURE#"):
             # A posture that does not parse names no run; the day read counts it as invalid.
-            with contextlib.suppress(KeyError, TypeError, ValueError):
+            with contextlib.suppress(Exception):
                 ids.add(str(json.loads(str(item["body"]))["run_id"]))
     return ids
 
