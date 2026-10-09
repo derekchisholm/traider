@@ -52,10 +52,10 @@ def store(request):
             yield DynamoSettingsStore(make_table())
 
 
-def put_body(store, version: int, body: dict[str, Any]) -> None:
+def put_body(store, version: int, body: dict[str, Any], *, at: str | None = None) -> None:
     """Store a body exactly as given, the way a buggy writer might."""
     if isinstance(store, MemorySettingsStore):
-        store.put_raw(version, body)
+        store.put_raw(version, body, at=at or "")
     else:
         store._table.put_item(
             Item={
@@ -63,7 +63,7 @@ def put_body(store, version: int, body: dict[str, Any]) -> None:
                 "sk": f"V#{version:09d}",
                 "version": version,
                 "author": "test",
-                "at": T0.isoformat(),
+                "at": at or T0.isoformat(),
                 "note": "",
                 "body": json.dumps(body),
                 "diff": "{}",
@@ -134,6 +134,7 @@ async def test_an_invalid_latest_version_is_reported_with_its_number(store):
     with pytest.raises(SettingsInvalid) as raised:
         await store.latest()
     assert raised.value.version == 2
+    assert "unknown strategy 'nope'" in str(raised.value)
 
 
 async def test_a_strategy_that_raises_a_non_value_error_is_still_invalid_not_a_crash(store):
@@ -144,6 +145,64 @@ async def test_a_strategy_that_raises_a_non_value_error_is_still_invalid_not_a_c
     with pytest.raises(SettingsInvalid) as raised:
         await store.latest()
     assert raised.value.version == 2
+    assert str(raised.value).split(": ", 1)[1].startswith("TypeError: ")
+
+
+async def test_a_malformed_timestamp_is_invalid_not_a_crash(store):
+    await store.write(settings(), expected_version=0, author="a", note="", now=T0)
+    put_body(store, 2, settings().model_dump(mode="json"), at="not-a-date")
+    with pytest.raises(SettingsInvalid) as raised:
+        await store.latest()
+    assert raised.value.version == 2
+    assert "ValueError" in str(raised.value)
+    assert [v.version for v in await store.history()] == [1]
+
+
+async def test_a_write_on_top_of_an_invalid_latest_version_succeeds_with_an_empty_diff(store):
+    await store.write(settings(), expected_version=0, author="a", note="", now=T0)
+    put_invalid(store, 2)
+    written = await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=2, author="b", note="", now=T0
+    )
+    assert written.version == 3
+    assert written.diff == {}
+    latest = await store.latest()
+    assert latest is not None
+    assert (latest.version, latest.settings.risk.max_order_usd) == (3, Decimal(250))
+
+
+async def test_a_negative_expected_version_is_a_value_error(store):
+    with pytest.raises(ValueError, match="expected_version"):
+        await store.write(settings(), expected_version=-1, author="a", note="", now=T0)
+    assert await store.latest() is None
+
+
+async def test_writing_ahead_of_the_latest_version_is_refused_and_leaves_no_gap(store):
+    with pytest.raises(SettingsConflict):
+        await store.write(settings(), expected_version=1, author="a", note="", now=T0)
+    assert await store.latest() is None
+    await store.write(settings(), expected_version=0, author="a", note="", now=T0)
+    with pytest.raises(SettingsConflict):
+        await store.write(settings(), expected_version=3, author="a", note="", now=T0)
+    assert (await store.latest()).version == 1
+
+
+@pytest.mark.parametrize(("sort_key", "version"), [("V#000000002", 2), ("V#junk", -1)])
+async def test_a_damaged_item_without_a_version_is_reported_under_its_sort_key(sort_key, version):
+    # Dynamo only: the memory store always records a version number.
+    with mock_aws():
+        store = DynamoSettingsStore(make_table())
+        store._table.put_item(
+            Item={
+                "pk": "SETTINGS",
+                "sk": sort_key,
+                "body": json.dumps(settings().model_dump(mode="json") | {"strategy": "nope"}),
+                "at": T0.isoformat(),
+            }
+        )
+        with pytest.raises(SettingsInvalid) as raised:
+            await store.latest()
+    assert raised.value.version == version
 
 
 async def test_history_is_newest_first_and_skips_invalid_versions(store):

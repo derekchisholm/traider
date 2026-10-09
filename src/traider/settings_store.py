@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from botocore.exceptions import ClientError
+from pydantic import ValidationError
 
 from traider.settings import Settings, settings_diff
 
@@ -57,23 +58,49 @@ class SettingsStore(Protocol):
     async def history(self, limit: int = 20) -> list[SettingsVersion]: ...
 
 
-def _parse(item: dict[str, Any]) -> SettingsVersion:
-    version = int(item["version"])
+def _version_of(item: dict[str, Any]) -> int:
+    """The item's version number, from ``version`` or else its sort key; -1 if neither parses.
+
+    Never raises, so a damaged item can still be reported as invalid under some number.
+    """
     try:
-        settings = Settings.model_validate(json.loads(item["body"]))
-    except Exception as exc:
+        return int(item["version"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        return int(str(item.get("sk", "")).removeprefix("V#"))
+    except ValueError:
+        return -1
+
+
+def _problem(exc: Exception) -> str:
+    """One readable line: the first field error for a ValidationError, else the exception."""
+    if isinstance(exc, ValidationError):
+        error = exc.errors(include_url=False)[0]
+        where = ".".join(str(part) for part in error["loc"])
+        return f"{where}: {error['msg']}" if where else str(error["msg"])
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _parse(item: dict[str, Any]) -> SettingsVersion:
+    version = _version_of(item)
+    try:
+        diff = json.loads(item.get("diff") or "{}")
+        if not isinstance(diff, dict):
+            raise ValueError("diff is not an object")
         # A strategy constructor may raise anything (KeyError, TypeError, ...) on bad
-        # params. A stored version must never crash the reader, so every failure counts.
-        first_line = (str(exc).splitlines() or [""])[0]
-        raise SettingsInvalid(version, first_line or type(exc).__name__) from None
-    return SettingsVersion(
-        version=version,
-        settings=settings,
-        author=str(item.get("author", "")),
-        at=datetime.fromisoformat(str(item["at"])),
-        note=str(item.get("note", "")),
-        diff=json.loads(item.get("diff") or "{}"),
-    )
+        # params, and a damaged timestamp or diff can fail in several ways. A stored
+        # version must never crash the reader, so every failure is reported as invalid.
+        return SettingsVersion(
+            version=version,
+            settings=Settings.model_validate(json.loads(item["body"])),
+            author=str(item.get("author", "")),
+            at=datetime.fromisoformat(str(item["at"])),
+            note=str(item.get("note", "")),
+            diff=diff,
+        )
+    except Exception as exc:
+        raise SettingsInvalid(version, _problem(exc)) from None
 
 
 def _item(
@@ -95,6 +122,16 @@ def _item(
         "body": json.dumps(settings.model_dump(mode="json")),
         "diff": json.dumps(diff),
     }
+
+
+def _check_expected(expected_version: int, *, latest: int) -> None:
+    """Refuse a write based on a version that is not a real one."""
+    if expected_version < 0:
+        raise ValueError(f"expected_version must be 0 or more, got {expected_version}")
+    if expected_version > latest:
+        raise SettingsConflict(
+            f"expected_version {expected_version} is ahead of the latest version {latest}"
+        )
 
 
 class MemorySettingsStore:
@@ -122,11 +159,17 @@ class MemorySettingsStore:
     async def write(
         self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime
     ) -> SettingsVersion:
+        _check_expected(expected_version, latest=max(self._items, default=0))
         version = expected_version + 1
         if version in self._items or (self._items and max(self._items) > expected_version):
             raise SettingsConflict(f"version {version} already exists")
+        diff: dict[str, Any] = {}
         previous = self._items.get(expected_version)
-        diff = settings_diff(_parse(previous).settings, settings) if previous else {}
+        if previous is not None:
+            try:
+                diff = settings_diff(_parse(previous).settings, settings)
+            except SettingsInvalid:
+                diff = {}
         self._items[version] = _item(
             settings, version, author=author, note=note, now=now, diff=diff
         )
@@ -170,6 +213,8 @@ class DynamoSettingsStore:
     async def write(
         self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime
     ) -> SettingsVersion:
+        newest = await self._newest(1)
+        _check_expected(expected_version, latest=_version_of(newest[0]) if newest else 0)
         version = expected_version + 1
         diff: dict[str, Any] = {}
         if expected_version > 0:
