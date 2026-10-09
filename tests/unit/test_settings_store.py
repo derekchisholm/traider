@@ -17,6 +17,7 @@ from traider.settings_store import (
     MemorySettingsStore,
     SettingsConflict,
     SettingsInvalid,
+    SettingsVersion,
 )
 
 T0 = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)
@@ -339,3 +340,67 @@ async def test_a_refresh_after_an_unreadable_start_keeps_the_running_restart_fie
     assert live.current.pinned_symbols == ("SPY",)
     assert live.current.risk.max_order_usd == Decimal(250)
     assert [u.kind for u in updates] == ["applied", "pending_restart"]
+
+
+async def test_a_refresh_seeds_an_empty_store_after_an_unreadable_start():
+    store = BrokenStore()
+    store.error = RuntimeError("no network")
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store.error = None
+    updates = await live.refresh(T0)
+    assert [u.kind for u in updates] == ["applied"]
+    assert live.loaded
+    assert live.version == 1
+    assert (await store.latest()).author == "bootstrap"
+
+
+async def test_a_loaded_refresh_never_seeds_a_store_that_has_become_empty():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store._items.clear()
+    assert await live.refresh(T0) == []
+    assert await store.latest() is None
+    assert live.loaded
+    assert live.current == settings()
+
+
+class RacingStore:
+    """Empty on the first read; a rival writer gets the bootstrap write in first."""
+
+    def __init__(self, winner: SettingsVersion) -> None:
+        self._winner = winner
+        self._reads = 0
+
+    async def latest(self) -> SettingsVersion | None:
+        self._reads += 1
+        return None if self._reads == 1 else self._winner
+
+    async def write(
+        self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime
+    ) -> SettingsVersion:
+        raise SettingsConflict("another writer got there first")
+
+    async def history(self, limit: int = 20) -> list[SettingsVersion]:
+        return [self._winner]
+
+
+async def test_start_adopts_the_version_a_rival_wrote_during_bootstrap():
+    rival = await MemorySettingsStore().write(
+        settings(max_order_usd=Decimal(250)), expected_version=0, author="cli", note="", now=T0
+    )
+    live = LiveSettings(RacingStore(rival), settings())
+    assert await live.start(T0) == []
+    assert live.loaded
+    assert live.version == 1
+    assert live.current == rival.settings
+
+
+async def test_an_invalid_version_is_reported_once_across_start_and_refresh():
+    store = MemorySettingsStore()
+    store.put_raw(1, settings().model_dump(mode="json") | {"strategy": "nope"})
+    live = LiveSettings(store, settings())
+    assert [(u.kind, u.version) for u in await live.start(T0)] == [("rejected", 1)]
+    assert await live.refresh(T0) == []
+    assert not live.loaded

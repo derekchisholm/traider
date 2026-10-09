@@ -273,6 +273,10 @@ class LiveSettings:
     ``loaded`` is False until a version has been read successfully in this process;
     until then the engine allows no entries. After that, a read error or an invalid
     version leaves the last good settings in force.
+
+    Caller contract: restart-only fields stay whatever ``current`` held when the process
+    built its strategy, feed and engine, including the fallback after an unreadable
+    start. ``refresh`` never changes them; it reports them as ``pending_restart``.
     """
 
     def __init__(self, store: SettingsStore, fallback: Settings) -> None:
