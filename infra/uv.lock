@@ -936,7 +936,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "moto", extras = ["dynamodb", "secretsmanager", "sns", "ssm"], specifier = ">=5" },
+    { name = "moto", extras = ["dynamodb", "s3", "secretsmanager", "sns", "ssm"], specifier = ">=5" },
     { name = "mypy", specifier = ">=2.4" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-asyncio", specifier = ">=1.4" },

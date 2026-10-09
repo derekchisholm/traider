@@ -565,6 +565,10 @@ dynamodb = [
     { name = "docker" },
     { name = "py-partiql-parser" },
 ]
+s3 = [
+    { name = "py-partiql-parser" },
+    { name = "pyyaml" },
+]
 ssm = [
     { name = "pyyaml" },
 ]
@@ -919,7 +923,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "moto", extra = ["dynamodb", "ssm"] },
+    { name = "moto", extra = ["dynamodb", "s3", "ssm"] },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -937,7 +941,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "moto", extras = ["dynamodb", "secretsmanager", "sns", "ssm"], specifier = ">=5" },
+    { name = "moto", extras = ["dynamodb", "s3", "secretsmanager", "sns", "ssm"], specifier = ">=5" },
     { name = "mypy", specifier = ">=2.4" },
     { name = "pytest", specifier = ">=9" },
     { name = "pytest-asyncio", specifier = ">=1.4" },
