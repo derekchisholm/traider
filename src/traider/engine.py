@@ -46,7 +46,9 @@ from traider.models import (
     Target,
 )
 from traider.options import contract_size, is_option_symbol, parse_option_symbol
-from traider.risk import Decision, RiskContext, RiskManager
+from traider.research.models import PostureLevel
+from traider.research.source import ResearchSource, ResearchUpdate
+from traider.risk import Decision, ResearchGate, RiskContext, RiskManager
 from traider.session import SessionTracker
 from traider.settings import Settings
 from traider.settings_store import LiveSettings, SettingsUpdate
@@ -59,6 +61,8 @@ log = logging.getLogger(__name__)
 
 _CENT = Decimal("0.01")
 _HALTED = Permissions(False, False, False, "control not read yet")
+# Used when the research gate cannot be built: it blocks every entry and no exit.
+_NO_ENTRIES_GATE = ResearchGate(pick_side=None, pinned=False, posture="stand_aside")
 
 
 @dataclass(slots=True)
@@ -132,6 +136,7 @@ class Engine:
         auth_seconds_left: Callable[[], float | None] | None = None,
         settings: LiveSettings | None = None,
         on_universe: Callable[[tuple[str, ...]], None] | None = None,
+        research: ResearchSource | None = None,
     ) -> None:
         self._config = config
         self._clock = clock
@@ -153,6 +158,9 @@ class Engine:
         self._settings_at: datetime | None = None
         self._settings_unreadable_since: datetime | None = None
         self._settings_unreadable_reported = False
+        # Research picks and the day's posture. None: research is off and the old rules hold.
+        self._research = research
+        self._research_at: datetime | None = None
 
         # The equity symbols the bot trades right now: see _refresh_universe.
         self._on_universe = on_universe
@@ -292,6 +300,13 @@ class Engine:
                 self._settings_unreadable_reported = False
             for update in updates:
                 await self._on_settings(update, now)
+        if self._research is not None and _due(
+            self._research_at, now, self._settings.research.poll_s
+        ):
+            self._research_at = now
+            for research_update in await self._research.refresh(now):
+                await self._on_research(research_update, now)
+            await self._refresh_universe(now)
         if _due(self._control_at, now, self.CONTROL_REFRESH_S):
             self._control_at = now
             await self._control.refresh(now)
@@ -373,6 +388,26 @@ class Engine:
         else:
             self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
             await self._settings_unreadable(update, now)
+
+    async def _on_research(self, update: ResearchUpdate, now: datetime) -> None:
+        if update.kind == "stale":
+            await self._event("research_stale", {"detail": update.detail}, now)
+            await self._alerts.send(
+                "research_stale",
+                "Research is stale",
+                f"Research could not be read for longer than "
+                f"{self._settings.research.max_stale_s:.0f}s ({update.detail}). No new "
+                "positions open until research is readable again. Exits still work. Check "
+                "the research table, the task role and the research jobs.",
+            )
+        else:
+            await self._event("research_restored", {}, now)
+            await self._alerts.send(
+                "research_restored",
+                "Research readable again",
+                "The research table is readable again. New positions follow the live picks "
+                "and the day's posture.",
+            )
 
     async def _settings_unreadable(self, update: SettingsUpdate, now: datetime) -> None:
         """Say so, once, when the settings have stayed unreadable for a while."""
@@ -511,7 +546,12 @@ class Engine:
         return required
 
     def _wanted_picks(self, now: datetime) -> list[tuple[str, int]]:
-        return []  # research picks arrive in Task 9
+        """Live research picks with their scores. Empty without research."""
+        if self._research is None:
+            return []
+        return [
+            (symbol, pick.score) for symbol, pick in self._research.view.live_picks(now).items()
+        ]
 
     async def _refresh_universe(self, now: datetime) -> None:
         """Recompute the universe and, when its members change, tell everyone. A dropped
@@ -594,7 +634,10 @@ class Engine:
         """Say once per symbol when the account holds something outside the universe:
         the bot neither trades it nor watches its expiry.
 
-        Task 9: only while research is off (no research source)."""
+        Only while research is off: with research on, the bot's own ledger says which
+        holdings it did not open."""
+        if self._research is not None:
+            return
         held = {
             symbol: held.quantity
             for symbol, held in account.positions.items()
@@ -977,6 +1020,9 @@ class Engine:
         account = self._account
         positions = {s: account.position(s) for s in self._symbols} if account else {}
         ctx = StrategyContext(now=now, positions=positions, chains=self._market.chains())
+        if self._research is not None:
+            view = self._research.view
+            ctx = replace(ctx, picks=view.live_picks(now), posture=view.level)
         for bar, _warmup in self._market.drain_bars():
             await self._hear(lambda bar=bar: self._strategy.on_bar(bar, ctx), now)  # type: ignore[misc]
         for symbol in self._market.drain_dirty():
@@ -1147,6 +1193,14 @@ class Engine:
         now: datetime,
     ) -> Decision:
         since = None if st.last_order_at is None else (now - st.last_order_at).total_seconds()
+        try:
+            gate = self._gate(order, now)
+        except Exception as exc:
+            # Fail closed for entries only: exits never depend on research.
+            self._log_throttled(
+                "gate", now, "research gate failed, no entries: %s: %s", type(exc).__name__, exc
+            )
+            gate = _NO_ENTRIES_GATE
         return self._risk.check(
             RiskContext(
                 now=now,
@@ -1166,7 +1220,26 @@ class Engine:
                 + self._carried_usd
                 + self._in_flight(Side.SELL, account),
                 committed_usd=self._in_flight(Side.BUY, account),
+                research=gate,
             )
+        )
+
+    def _gate(self, order: OrderRequest, now: datetime) -> ResearchGate | None:
+        """What research says about the order's symbol (or its underlying). None without
+        research, so the research rules do not apply."""
+        if self._research is None:
+            return None
+        view = self._research.view
+        s = self._settings.research
+        root = root_symbol(order.symbol)
+        pick = view.pick(root, now)
+        level = view.level
+        factor = s.reduced_factor if level is PostureLevel.REDUCED else Decimal(1)
+        return ResearchGate(
+            pick_side=pick.side.value if pick else None,
+            pinned=root in self._settings.pinned_symbols,
+            posture=level.value,
+            cap_factor=factor,
         )
 
     def _in_flight(self, side: Side, account: AccountSnapshot) -> Decimal:

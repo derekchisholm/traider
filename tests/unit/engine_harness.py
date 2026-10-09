@@ -16,6 +16,7 @@ from traider.control import ControlState
 from traider.engine import Engine
 from traider.marketdata import MarketData
 from traider.models import Bar, BrokerOrder, OrderRequest, OrderStatus, Quote, Side, Target
+from traider.research.source import ResearchSource
 from traider.risk import RiskManager
 from traider.session import SessionTracker, StaticSessionProvider
 from traider.settings import Settings
@@ -196,6 +197,7 @@ class Harness:
     alerts: LogAlerter
     config: Config
     engine: Engine
+    research: ResearchSource | None
 
     @classmethod
     async def create(
@@ -216,10 +218,18 @@ class Harness:
         restart_of: Harness | None = None,
         settings_store=None,
         on_universe=None,
+        research_store=None,
+        research_settings: dict | None = None,
+        symbols_extra=(),
     ) -> Harness:
         """``restart_of`` models a new process: same broker account, same durable state and
-        the same wall clock, but an engine with empty memory."""
+        the same wall clock, but an engine with empty memory.
+
+        ``research_store`` turns research on: the engine reads it through a ResearchSource
+        (``harness.research``), and ``symbols`` may then be empty. ``symbols_extra`` adds
+        pinned symbols to ``symbols``."""
         self = cls()
+        symbols = tuple(dict.fromkeys((*symbols, *symbols_extra)))
         if restart_of is not None:
             self.clock = restart_of.clock
             self.market = restart_of.market
@@ -248,6 +258,10 @@ class Harness:
             "heartbeat_file": str(tmp_path / "heartbeat"),
             **(config or {}),
         }
+        if research_store is not None:
+            fields["research_table"] = "test-research"
+        if research_settings is not None:
+            fields["research"] = research_settings
         if trading_mode == "live":
             fields.update(
                 account_last4="1234",
@@ -263,6 +277,9 @@ class Harness:
         if settings_store is not None:
             self.live_settings = LiveSettings(settings_store, Settings.from_config(self.config))
             await self.live_settings.start(self.clock.now())
+        self.research = None
+        if research_store is not None:
+            self.research = ResearchSource(research_store, lambda: self.engine.settings.research)
         self.engine = Engine(
             config=self.config,
             clock=self.clock,
@@ -278,7 +295,10 @@ class Harness:
             auth_seconds_left=lambda: self.auth_seconds_left,
             settings=self.live_settings,
             on_universe=on_universe or self.universe_calls.append,
+            research=self.research,
         )
+        if self.research is not None:
+            await self.research.refresh(self.clock.now())
         self.requote()
         if begin:
             await self.engine.start()

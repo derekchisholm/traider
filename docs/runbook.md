@@ -158,6 +158,8 @@ once every 15 minutes.
 | Settings version N rejected | The newest version does not validate. If settings had already loaded, the bot keeps the settings it was running with. If none have loaded in this process, no new positions open until a valid version is written; exits still work. | Fix it with `traider settings apply`, start from the last good version: find it with `traider settings history`, print it with `traider settings show --version N`. |
 | Settings not loaded | At start-up the bot could not read the settings table. (A version that is stored but invalid gets the "rejected" alert instead.) No new positions open until it can; exits still work. | Check the settings table and the task role (a missing table or a denied read is the usual cause). The bot loads the settings by itself once they are readable. |
 | Settings table unreadable | The settings table has been unreadable for five minutes. If settings had loaded, the last good version stays in force and newer versions, tighter limits included, do not apply. If not, no new positions open. Sent once per outage. | Check the table and the task role. If you need tighter limits now, set the control switch to `close_only` or `halt`. |
+| Research is stale | The research table has been unreadable for longer than `research.max_stale_s` (10 minutes by default). | No new positions open; exits still work. Check the research table, the task role and the research jobs. |
+| Research readable again | It recovered. | Nothing. |
 
 ## Seeing what the bot did
 
@@ -195,6 +197,8 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `unmanaged_holding` | The account holds `symbol` (`quantity`) outside the bot's universe, so the bot does not manage it. Recorded with the alert. |
 | `unpinned_but_held` | A settings `version` unpinned `symbols` the bot still holds. Recorded with the alert. |
 | `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
+| `research_stale` | Research could not be read for longer than `research.max_stale_s`. No new entries until it can. |
+| `research_restored` | Research is readable again. |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
 restarts. To start it over, set `halt`, delete it and restart the bot. If the old
