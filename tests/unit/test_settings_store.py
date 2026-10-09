@@ -13,6 +13,7 @@ from traider.config import Config
 from traider.settings import Settings
 from traider.settings_store import (
     DynamoSettingsStore,
+    LiveSettings,
     MemorySettingsStore,
     SettingsConflict,
     SettingsInvalid,
@@ -213,3 +214,131 @@ async def test_history_is_newest_first_and_skips_invalid_versions(store):
     put_invalid(store, 3)
     assert [v.version for v in await store.history()] == [2, 1]
     assert [v.version for v in await store.history(limit=1)] == [2]
+
+
+class BrokenStore(MemorySettingsStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.error: Exception | None = None
+
+    async def latest(self):
+        if self.error is not None:
+            raise self.error
+        return await super().latest()
+
+
+async def test_start_seeds_an_empty_store_from_the_fallback():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    assert live.loaded
+    assert live.version == 1
+    assert (await store.latest()).author == "bootstrap"
+
+
+async def test_start_takes_the_stored_version_in_full_restart_fields_included():
+    store = MemorySettingsStore()
+    stored = settings().model_copy(update={"pinned_symbols": ("QQQ",)})
+    await store.write(stored, expected_version=0, author="cli", note="", now=T0)
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    assert live.current.pinned_symbols == ("QQQ",)
+
+
+async def test_start_without_a_readable_store_keeps_the_fallback_and_is_not_loaded():
+    store = BrokenStore()
+    store.error = RuntimeError("no network")
+    live = LiveSettings(store, settings())
+    updates = await live.start(T0)
+    assert not live.loaded
+    assert live.current == settings()
+    assert [u.kind for u in updates] == ["unreadable"]
+
+
+async def test_start_with_an_invalid_latest_version_is_not_loaded():
+    store = MemorySettingsStore()
+    store.put_raw(1, settings().model_dump(mode="json") | {"strategy": "nope"})
+    live = LiveSettings(store, settings())
+    updates = await live.start(T0)
+    assert not live.loaded
+    assert [(u.kind, u.version) for u in updates] == [("rejected", 1)]
+
+
+async def test_refresh_applies_a_new_version_and_reports_the_diff():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="cli", note="", now=T0
+    )
+    updates = await live.refresh(T0)
+    assert [(u.kind, u.version) for u in updates] == [("applied", 2)]
+    assert updates[0].diff == {"risk.max_order_usd": ["500", "250"]}
+    assert live.current.risk.max_order_usd == Decimal(250)
+    assert await live.refresh(T0) == []  # nothing new
+
+
+async def test_refresh_keeps_restart_fields_and_says_a_restart_is_needed():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    await store.write(changed, expected_version=1, author="cli", note="", now=T0)
+    updates = await live.refresh(T0)
+    assert [u.kind for u in updates] == ["applied", "pending_restart"]
+    assert updates[1].detail == "pinned_symbols"
+    assert live.current.pinned_symbols == ("SPY",)
+    assert live.current.risk.max_order_usd == Decimal(250)
+
+
+async def test_refresh_ignores_an_invalid_version_once_and_keeps_the_last_good():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store.put_raw(2, settings().model_dump(mode="json") | {"strategy": "nope"})
+    first = await live.refresh(T0)
+    assert [(u.kind, u.version) for u in first] == [("rejected", 2)]
+    assert await live.refresh(T0) == []  # reported once
+    assert live.version == 1
+    assert live.current == settings()
+
+
+async def test_refresh_keeps_the_last_good_when_the_store_is_unreadable():
+    store = BrokenStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store.error = RuntimeError("throttled")
+    updates = await live.refresh(T0)
+    assert [u.kind for u in updates] == ["unreadable"]
+    assert live.loaded
+    assert live.current == settings()
+
+
+async def test_a_later_refresh_loads_settings_that_could_not_be_read_at_start():
+    store = BrokenStore()
+    store.error = RuntimeError("no network")
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store.error = None
+    updates = await live.refresh(T0)
+    assert live.loaded
+    assert updates[0].kind == "applied"
+
+
+async def test_a_refresh_after_an_unreadable_start_takes_the_stored_version_in_full():
+    # Nothing is running yet, so no restart-only field is in force: the stored values apply.
+    store = BrokenStore()
+    store.error = RuntimeError("no network")
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    await store.write(
+        settings().model_copy(update={"pinned_symbols": ("QQQ",)}),
+        expected_version=0,
+        author="cli",
+        note="",
+        now=T0,
+    )
+    store.error = None
+    updates = await live.refresh(T0)
+    assert [u.kind for u in updates] == ["applied"]
+    assert live.current.pinned_symbols == ("QQQ",)

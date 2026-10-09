@@ -12,12 +12,12 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from botocore.exceptions import ClientError
 from pydantic import ValidationError
 
-from traider.settings import Settings, settings_diff
+from traider.settings import Settings, merge_live, restart_changes, settings_diff
 
 PK = "SETTINGS"
 
@@ -256,4 +256,85 @@ class DynamoSettingsStore:
                 continue
             if len(out) >= limit:
                 break
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class SettingsUpdate:
+    kind: Literal["applied", "pending_restart", "rejected", "unreadable"]
+    version: int | None
+    detail: str
+    diff: dict[str, list[Any]] = field(default_factory=dict)
+
+
+class LiveSettings:
+    """The settings a running bot uses, kept in step with the store.
+
+    ``loaded`` is False until a version has been read successfully in this process;
+    until then the engine allows no entries. After that, a read error or an invalid
+    version leaves the last good settings in force.
+    """
+
+    def __init__(self, store: SettingsStore, fallback: Settings) -> None:
+        self._store = store
+        self.current = fallback
+        self.version: int | None = None
+        self.loaded = False
+        self._rejected: set[int] = set()
+
+    async def _bootstrap(self, now: datetime) -> SettingsVersion | None:
+        """Write the fallback as version 1 of an empty store. Losing the race to another
+        writer is fine: theirs is read instead."""
+        try:
+            return await self._store.write(
+                self.current,
+                expected_version=0,
+                author="bootstrap",
+                note="seeded from the environment",
+                now=now,
+            )
+        except SettingsConflict:
+            return await self._store.latest()
+
+    async def start(self, now: datetime) -> list[SettingsUpdate]:
+        try:
+            latest = await self._store.latest()
+            if latest is None:
+                latest = await self._bootstrap(now)
+        except SettingsInvalid as exc:
+            self._rejected.add(exc.version)
+            return [SettingsUpdate("rejected", exc.version, str(exc))]
+        except Exception as exc:
+            return [SettingsUpdate("unreadable", None, f"{type(exc).__name__}: {exc}")]
+        if latest is None:
+            return [SettingsUpdate("unreadable", None, "no settings version after bootstrap")]
+        self.current, self.version, self.loaded = latest.settings, latest.version, True
+        return []
+
+    async def refresh(self, now: datetime) -> list[SettingsUpdate]:
+        try:
+            latest = await self._store.latest()
+            if latest is None and not self.loaded:
+                # The store could not be read at start-up and is empty now: seed it.
+                latest = await self._bootstrap(now)
+        except SettingsInvalid as exc:
+            if exc.version in self._rejected:
+                return []
+            self._rejected.add(exc.version)
+            return [SettingsUpdate("rejected", exc.version, str(exc))]
+        except Exception as exc:
+            return [SettingsUpdate("unreadable", self.version, f"{type(exc).__name__}: {exc}")]
+        if latest is None or latest.version == self.version:
+            return []
+        if self.loaded:
+            merged = merge_live(self.current, latest.settings)
+            restart = restart_changes(self.current, latest.settings)
+        else:
+            # Nothing is running yet, so no restart-only field is in force: take it in full.
+            merged, restart = latest.settings, []
+        diff = settings_diff(self.current, merged)
+        self.current, self.version, self.loaded = merged, latest.version, True
+        out = [SettingsUpdate("applied", latest.version, latest.author, diff)]
+        if restart:
+            out.append(SettingsUpdate("pending_restart", latest.version, ", ".join(restart)))
         return out
