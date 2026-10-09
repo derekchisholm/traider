@@ -350,7 +350,8 @@ reads and writes it (see the [runbook](docs/runbook.md#restarting-changing-setti
 A few fields (strategy, its parameters, pinned symbols, option-chain span,
 `allow_options`) wait for the next restart. Until the bot has read a valid version
 it opens no new positions; after that, an unreadable table or a bad version leaves
-the last good settings in force.
+the last good settings in force. `traider check` and `traider backtest` still use the
+`TRAIDER_*` environment values, not the settings table.
 
 To run the command line on your own machine against a deployed stack, use the
 `localEnv` output as in step 5. It leaves out the trading mode and the control

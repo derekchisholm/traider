@@ -18,7 +18,7 @@ import os
 import signal
 import socket
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -51,7 +51,7 @@ from traider.schwab.tokens import (
     TokenStore,
 )
 from traider.session import SessionTracker
-from traider.settings import Settings
+from traider.settings import Settings, settings_diff
 from traider.settings_store import DynamoSettingsStore, LiveSettings
 from traider.state.base import StateStore
 from traider.state.dynamo import DynamoStateStore
@@ -151,6 +151,9 @@ class Bot:
     engine: Engine
     feed: Feed
     sleep: Sleep
+    #: Settings (dotted names, no values) where the stack's environment and the loaded
+    #: settings table disagree. The table wins; this only exists to say so.
+    settings_drift: list[str] = field(default_factory=list)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run until ``stop`` is set. Raises if a background task dies on its own."""
@@ -190,6 +193,15 @@ class Bot:
                 f"Symbols: {', '.join(self.settings.pinned_symbols)}\n"
                 f"Strategy: {self.settings.strategy} {self.settings.strategy_params}\n"
                 f"Limits: {summary['risk']}",
+            )
+        if self.settings_drift:
+            await self.alerts.send(
+                "settings_drift",
+                "Stack settings differ from the settings table",
+                "The stack's settings (the TRAIDER_* values from Pulumi) differ from the "
+                f"settings table in: {', '.join(self.settings_drift)}.\n"
+                "The table wins: the bot runs on the table's values, and `pulumi up` does not "
+                "change it. Change it with `traider settings apply`.",
             )
 
     async def _watch_auth(self) -> None:
@@ -261,12 +273,20 @@ async def build_bot(
     session = SessionTracker(SchwabSessionProvider(client))
     settings = Settings.from_config(config)
     live_settings: LiveSettings | None = None
+    drift: list[str] = []
     if config.settings_table:
         live_settings = LiveSettings(
             DynamoSettingsStore(aws.table(config.settings_table)), settings
         )
         for update in await live_settings.start(clock.now()):
             log.warning("settings at start-up: %s %s", update.kind, update.detail)
+        if live_settings.loaded:
+            drift = list(settings_diff(settings, live_settings.current))
+            if drift:
+                log.warning(
+                    "stack settings differ from the settings table in: %s (the table wins)",
+                    ", ".join(drift),
+                )
         settings = live_settings.current
     strategy = create_strategy(settings.strategy, settings.pinned_symbols, settings.strategy_params)
 
@@ -339,6 +359,7 @@ async def build_bot(
         engine=engine,
         feed=feed,
         sleep=sleep,
+        settings_drift=drift,
     )
 
 
