@@ -35,6 +35,8 @@ from traider.control import ControlSource, ControlState, SsmControl, StaticContr
 from traider.engine import Engine
 from traider.feed import Feed
 from traider.marketdata import MarketData
+from traider.research.source import ResearchSource
+from traider.research.store import DynamoResearchStore
 from traider.risk import RiskManager
 from traider.schwab.client import API_BASE, SchwabClient
 from traider.schwab.hours import SchwabSessionProvider
@@ -124,6 +126,7 @@ def describe(config: Config, settings: Settings | None = None) -> dict[str, Any]
         "control": config.control_param or f"static:{config.control}",
         "state": config.state_table or "memory",
         "settings": config.settings_table or "environment",
+        "research": config.research_table or "off",
         "alerts": "sns" if config.alert_topic_arn else "log only",
         "token_store": (
             "secrets manager"
@@ -271,7 +274,9 @@ async def build_bot(
     drift: list[str] = []
     if config.settings_table:
         live_settings = LiveSettings(
-            DynamoSettingsStore(aws.table(config.settings_table)), settings
+            DynamoSettingsStore(aws.table(config.settings_table)),
+            settings,
+            require_pinned=config.research_table is None,
         )
         for update in await live_settings.start(clock.now()):
             log.warning("settings at start-up: %s %s", update.kind, update.detail)
@@ -313,6 +318,28 @@ async def build_bot(
         await paper.load()
         broker = paper
 
+    feed = Feed(
+        config=config,
+        http=http,
+        client=client,
+        tokens=tokens,
+        market=market,
+        clock=clock,
+        session=session,
+        settings=settings,
+        sleep=sleep,
+    )
+    research: ResearchSource | None = None
+    if config.research_table:
+        # Read through the variables, not their values now: the settings can be replaced
+        # while the bot runs, and the source must see the current research settings.
+        research = ResearchSource(
+            DynamoResearchStore(aws.table(config.research_table)),
+            lambda: (live_settings.current if live_settings else settings).research,
+        )
+        # One read before the engine exists. If it fails, the source fails closed (no picks)
+        # and the engine's first step tries again and reports.
+        await research.refresh(clock.now())
     engine = Engine(
         config=config,
         clock=clock,
@@ -327,17 +354,8 @@ async def build_bot(
         instance_id=f"{socket.gethostname()}-{os.getpid()}",
         auth_seconds_left=tokens.seconds_left,
         settings=live_settings,
-    )
-    feed = Feed(
-        config=config,
-        http=http,
-        client=client,
-        tokens=tokens,
-        market=market,
-        clock=clock,
-        session=session,
-        settings=settings,
-        sleep=sleep,
+        on_universe=feed.set_symbols if research is not None else None,
+        research=research,
     )
     return Bot(
         config=config,

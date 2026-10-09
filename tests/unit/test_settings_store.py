@@ -657,3 +657,40 @@ async def test_start_keeps_what_it_returned_in_start_updates():
     assert live.start_updates == []
     updates = await live.start(T0)
     assert updates and live.start_updates == updates
+
+
+async def test_with_research_off_a_version_with_no_pinned_symbols_is_rejected():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings(), require_pinned=True)
+    await live.start(T0)
+    empty = settings().model_copy(update={"pinned_symbols": ()})
+    await store.write(empty, expected_version=1, author="cli", note="", now=T0)
+    updates = await live.refresh(T0)
+    assert [u.kind for u in updates] == ["rejected"]
+    assert updates[0].detail == (
+        "settings version 2 has no pinned symbols and research is off, "
+        "so the bot would have nothing to trade"
+    )
+    assert live.current.pinned_symbols == ("SPY",)
+    assert await live.refresh(T0) == []  # reported once only
+
+
+async def test_with_research_off_a_start_version_with_no_pinned_symbols_is_rejected():
+    store = MemorySettingsStore()
+    empty = settings().model_copy(update={"pinned_symbols": ()})
+    await store.write(empty, expected_version=0, author="cli", note="", now=T0)
+    live = LiveSettings(store, settings(), require_pinned=True)
+    updates = await live.start(T0)
+    assert [u.kind for u in updates] == ["rejected"]
+    assert "no pinned symbols" in updates[0].detail
+    assert live.loaded is False
+    assert live.current.pinned_symbols == ("SPY",)
+
+
+async def test_with_research_on_no_pinned_symbols_is_fine():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    empty = settings().model_copy(update={"pinned_symbols": ()})
+    await store.write(empty, expected_version=1, author="cli", note="", now=T0)
+    assert [u.kind for u in await live.refresh(T0)] == ["applied"]
