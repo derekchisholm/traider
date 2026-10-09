@@ -202,13 +202,15 @@ class Engine:
                 await self._on_settings(update, now)
             if not self._live_settings.loaded:
                 await self._event("entries_halted", {"reason": "settings not loaded"}, now)
-                await self._alerts.send(
-                    "settings_not_loaded",
-                    "Settings not loaded",
-                    "The bot could not read a valid settings version at start-up. No new "
-                    "positions open until the settings table can be read. Exits still work. "
-                    "Check the settings table and the task role.",
-                )
+                if not any(u.kind == "rejected" for u in self._live_settings.start_updates):
+                    # A rejected version has its own alert, which says what to do.
+                    await self._alerts.send(
+                        "settings_not_loaded",
+                        "Settings not loaded",
+                        "The bot could not read a valid settings version at start-up. No new "
+                        "positions open until the settings table can be read. Exits still "
+                        "work. Check the settings table and the task role.",
+                    )
 
     async def _adopt_open_orders(self) -> None:
         """Take over the orders the previous holder of the lease left open. Only the

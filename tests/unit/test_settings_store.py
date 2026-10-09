@@ -388,9 +388,9 @@ class ForcedLatest(MemorySettingsStore):
         return self.forced if self.forced is not None else await super().latest()
 
 
-def unchecked(version: int, **fields) -> SettingsVersion:
+def unchecked(version: int, *, at: datetime = T0, **fields) -> SettingsVersion:
     # model_copy does not validate, so this is a Settings that validation would refuse.
-    return SettingsVersion(version, settings().model_copy(update=fields), "test", T0)
+    return SettingsVersion(version, settings().model_copy(update=fields), "test", at)
 
 
 async def test_a_merged_result_that_does_not_validate_is_rejected_and_the_last_good_stays():
@@ -409,6 +409,60 @@ async def test_a_merged_result_that_does_not_validate_is_rejected_and_the_last_g
     again = await live.refresh(T0)
     assert [(u.kind, u.version) for u in again] == [("applied", 3)]
     assert live.current.order_timeout_s == 30.0
+
+
+LATER = datetime(2026, 10, 9, 13, 5, tzinfo=UTC)
+
+
+def delete_item(store, version: int) -> None:
+    if isinstance(store, MemorySettingsStore):
+        store._items.pop(version)
+    else:
+        store._table.delete_item(Key={"pk": "SETTINGS", "sk": f"V#{version:09d}"})
+
+
+async def test_an_invalid_item_that_is_deleted_and_rewritten_as_valid_is_applied(store):
+    await store.write(settings(), expected_version=0, author="a", note="", now=T0)
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    put_invalid(store, 2)
+    assert [(u.kind, u.version) for u in await live.refresh(T0)] == [("rejected", 2)]
+    assert await live.refresh(T0) == []  # the same item is still reported once only
+    delete_item(store, 2)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="b", note="", now=LATER
+    )
+    updates = await live.refresh(LATER)
+    assert [(u.kind, u.version) for u in updates] == [("applied", 2)]
+    assert live.version == 2
+    assert live.current.risk.max_order_usd == Decimal(250)
+
+
+async def test_a_merge_rejected_item_that_is_replaced_by_a_valid_one_is_applied():
+    store = ForcedLatest()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store.forced = unchecked(2, order_timeout_s=-5.0)
+    assert [(u.kind, u.version) for u in await live.refresh(T0)] == [("rejected", 2)]
+    assert await live.refresh(T0) == []
+    store.forced = unchecked(2, at=LATER, order_timeout_s=30.0)  # same number, a new item
+    updates = await live.refresh(LATER)
+    assert [(u.kind, u.version) for u in updates] == [("applied", 2)]
+    assert live.current.order_timeout_s == 30.0
+
+
+async def test_a_start_rejected_item_that_is_replaced_by_a_valid_one_loads():
+    store = MemorySettingsStore()
+    store.put_raw(1, settings().model_dump(mode="json") | {"strategy": "nope"})
+    live = LiveSettings(store, settings())
+    assert [(u.kind, u.version) for u in await live.start(T0)] == [("rejected", 1)]
+    assert await live.refresh(T0) == []
+    store._items.pop(1)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=0, author="b", note="", now=LATER
+    )
+    assert [(u.kind, u.version) for u in await live.refresh(LATER)] == [("applied", 1)]
+    assert live.loaded and live.current.risk.max_order_usd == Decimal(250)
 
 
 async def test_an_error_while_merging_is_a_rejection_not_a_crash(monkeypatch):

@@ -53,11 +53,15 @@ class SettingsSuperseded(SettingsConflict):
 
 
 class SettingsInvalid(Exception):
-    """A stored version does not describe valid settings."""
+    """A stored version does not describe valid settings.
 
-    def __init__(self, version: int, problem: str) -> None:
+    ``at`` is the item's stored timestamp text when it has one. With the number it names
+    the item, so a bad version that is deleted and written again is a different item."""
+
+    def __init__(self, version: int, problem: str, at: str | None = None) -> None:
         super().__init__(f"settings version {version} is invalid: {problem}")
         self.version = version
+        self.at = at
 
 
 class SettingsStore(Protocol):
@@ -114,7 +118,10 @@ def _parse(item: dict[str, Any]) -> SettingsVersion:
             diff=diff,
         )
     except Exception as exc:
-        raise SettingsInvalid(version, _problem(exc)) from None
+        stored_at = item.get("at")
+        raise SettingsInvalid(
+            version, _problem(exc), None if stored_at is None else str(stored_at)
+        ) from None
 
 
 def _item(
@@ -319,7 +326,7 @@ class LiveSettings:
         #: a restart-only field; None otherwise. The engine reads it to say what a restart
         #: would change.
         self.pending: Settings | None = None
-        self._rejected: set[int] = set()
+        self._rejected: set[tuple[int, str | None]] = set()
         self.start_updates: list[SettingsUpdate] = []
 
     async def _bootstrap(self, now: datetime) -> SettingsVersion | None:
@@ -348,7 +355,7 @@ class LiveSettings:
             if latest is None:
                 latest = await self._bootstrap(now)
         except SettingsInvalid as exc:
-            self._rejected.add(exc.version)
+            self._rejected.add((exc.version, exc.at))
             return [SettingsUpdate("rejected", exc.version, str(exc))]
         except Exception as exc:
             return [SettingsUpdate("unreadable", None, f"{type(exc).__name__}: {exc}")]
@@ -364,9 +371,9 @@ class LiveSettings:
                 # The store could not be read at start-up and is empty now: seed it.
                 latest = await self._bootstrap(now)
         except SettingsInvalid as exc:
-            if exc.version in self._rejected:
+            if (exc.version, exc.at) in self._rejected:
                 return []
-            self._rejected.add(exc.version)
+            self._rejected.add((exc.version, exc.at))
             return [SettingsUpdate("rejected", exc.version, str(exc))]
         except Exception as exc:
             return [SettingsUpdate("unreadable", self.version, f"{type(exc).__name__}: {exc}")]
@@ -377,7 +384,8 @@ class LiveSettings:
             return []
         if latest.version == self.version:
             return []
-        if latest.version in self._rejected:
+        item = (latest.version, latest.at.isoformat())
+        if item in self._rejected:
             return []
         # Restart-only fields keep the values the running objects were built from, even
         # when the process loaded late: start() may have built them from the fallback.
@@ -389,7 +397,7 @@ class LiveSettings:
             restart = restart_changes(self.current, latest.settings)
             diff = settings_diff(self.current, merged)
         except Exception as exc:
-            self._rejected.add(latest.version)
+            self._rejected.add(item)
             detail = f"settings version {latest.version} cannot be applied: {_problem(exc)}"
             return [SettingsUpdate("rejected", latest.version, detail)]
         self.current, self.version, self.loaded = merged, latest.version, True

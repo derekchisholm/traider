@@ -201,6 +201,11 @@ async def test_a_version_rejected_at_start_is_reported_and_blocks_entries(tmp_pa
     h = await Harness.create(tmp_path, settings_store=store)
     assert (await h.events("settings_rejected"))[-1]["data"]["version"] == 1
     assert "settings_rejected:1" in h.alert_keys()
+    # The event stays, but the "check the table and the task role" alert would mislead.
+    assert [e["data"] for e in await h.events("entries_halted")] == [
+        {"reason": "settings not loaded"}
+    ]
+    assert alerts_for(h, "settings_not_loaded") == []
     (_, _, body) = alerts_for(h, "settings_rejected:1")[0]
     assert body.endswith(
         "No settings have loaded in this process, so no new positions open until a valid "
