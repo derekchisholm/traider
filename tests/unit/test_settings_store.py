@@ -17,6 +17,7 @@ from traider.settings_store import (
     MemorySettingsStore,
     SettingsConflict,
     SettingsInvalid,
+    SettingsSuperseded,
     SettingsVersion,
 )
 
@@ -205,6 +206,61 @@ async def test_a_damaged_item_without_a_version_is_reported_under_its_sort_key(s
         with pytest.raises(SettingsInvalid) as raised:
             await store.latest()
     assert raised.value.version == version
+
+
+class RacingTable:
+    """A table where a rival writes the next version right after our put, before our read."""
+
+    def __init__(self, table, *, rival_body: dict[str, Any] | None = None) -> None:
+        self._table = table
+        self._rival_body = rival_body
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._table, name)
+
+    def put_item(self, **kwargs: Any) -> Any:
+        result = self._table.put_item(**kwargs)
+        mine = kwargs["Item"]
+        rival = dict(mine)
+        rival["version"] = mine["version"] + 1
+        rival["sk"] = f"V#{rival['version']:09d}"
+        rival["author"] = "rival"
+        if self._rival_body is not None:
+            rival["body"] = json.dumps(self._rival_body)
+        self._table.put_item(Item=rival)
+        return result
+
+
+async def test_a_later_version_written_during_our_write_is_reported_as_superseded():
+    with mock_aws():
+        table = make_table()
+        plain = DynamoSettingsStore(table)
+        await plain.write(settings(), expected_version=0, author="a", note="", now=T0)
+        racing = DynamoSettingsStore(RacingTable(table))
+        with pytest.raises(SettingsSuperseded) as raised:
+            await racing.write(
+                settings(max_order_usd=Decimal(250)),
+                expected_version=1,
+                author="b",
+                note="",
+                now=T0,
+            )
+        assert (raised.value.written, raised.value.newest) == (2, 3)
+        assert isinstance(raised.value, SettingsConflict)
+        assert (await plain.get(2)).author == "b"  # ours is kept in history
+        assert (await plain.latest()).author == "rival"
+
+
+async def test_an_unreadable_later_version_during_our_write_still_counts_as_superseded():
+    bad = settings().model_dump(mode="json") | {"strategy": "nope"}
+    with mock_aws():
+        table = make_table()
+        plain = DynamoSettingsStore(table)
+        await plain.write(settings(), expected_version=0, author="a", note="", now=T0)
+        racing = DynamoSettingsStore(RacingTable(table, rival_body=bad))
+        with pytest.raises(SettingsSuperseded) as raised:
+            await racing.write(settings(), expected_version=1, author="b", note="", now=T0)
+        assert (raised.value.written, raised.value.newest) == (2, 3)
 
 
 async def test_history_is_newest_first_and_skips_invalid_versions(store):

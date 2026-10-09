@@ -40,6 +40,18 @@ class SettingsConflict(Exception):
     """Another version was written since the one this write was based on."""
 
 
+class SettingsSuperseded(SettingsConflict):
+    """The write succeeded, but a later version was written at the same moment, so it is
+    that one, not this one, that is current."""
+
+    def __init__(self, written: int, newest: int) -> None:
+        super().__init__(
+            f"version {written} was written, but version {newest} was written at the same time"
+        )
+        self.written = written
+        self.newest = newest
+
+
 class SettingsInvalid(Exception):
     """A stored version does not describe valid settings."""
 
@@ -253,11 +265,17 @@ class DynamoSettingsStore:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 raise SettingsConflict(f"version {version} already exists") from None
             raise
-        latest = await self.latest()
-        if latest is None or latest.version != version:
+        try:
+            latest = await self.latest()
+        except SettingsInvalid as exc:
+            # A later version landed between our put and this read, and it is unreadable.
+            raise SettingsSuperseded(version, exc.version) from None
+        if latest is None:
+            raise SettingsConflict(f"version {version} was written but cannot be read back")
+        if latest.version != version:
             # Someone wrote a later version between our put and this read. Ours stands in
             # history, but it is not current: tell the caller.
-            raise SettingsConflict(f"version {version} was superseded at once")
+            raise SettingsSuperseded(version, latest.version)
         return latest
 
     async def history(self, limit: int = 20) -> list[SettingsVersion]:

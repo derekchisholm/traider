@@ -12,7 +12,7 @@ from botocore.exceptions import ClientError
 from traider import cli
 from traider.config import Config
 from traider.settings import Settings
-from traider.settings_store import MemorySettingsStore, SettingsConflict
+from traider.settings_store import MemorySettingsStore, SettingsConflict, SettingsSuperseded
 
 T0 = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)
 
@@ -20,6 +20,11 @@ T0 = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)
 class ConflictingStore(MemorySettingsStore):
     async def write(self, *args, **kwargs):
         raise SettingsConflict("version 2 already exists")
+
+
+class SupersededStore(MemorySettingsStore):
+    async def write(self, *args, **kwargs):
+        raise SettingsSuperseded(2, 3)
 
 
 class DeniedStore(MemorySettingsStore):
@@ -161,6 +166,19 @@ async def test_apply_reports_a_conflict_and_returns_1(tmp_path):
     store = ConflictingStore()
     assert await cli.settings_apply(store, settings_file(tmp_path), out, note="", now=T0) == 1
     assert "not written" in out.getvalue()
+
+
+async def test_apply_says_which_version_won_when_it_was_superseded_at_once(tmp_path):
+    out = io.StringIO()
+    code = await cli.settings_apply(
+        SupersededStore(), settings_file(tmp_path), out, note="", now=T0
+    )
+    assert code == 1
+    assert out.getvalue() == (
+        "written as version 2, but version 3 was written at the same time and is the one "
+        "in force; run `traider settings show`\n"
+    )
+    assert "superseded at once" not in out.getvalue()
 
 
 def test_settings_reports_an_aws_error_in_one_line(monkeypatch, capsys):

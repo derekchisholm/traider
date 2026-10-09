@@ -55,6 +55,7 @@ from traider.settings_store import (
     SettingsConflict,
     SettingsInvalid,
     SettingsStore,
+    SettingsSuperseded,
 )
 from traider.timeutil import ET, SystemClock, trading_date
 
@@ -514,6 +515,12 @@ async def settings_apply(
         written = await store.write(
             settings, expected_version=expected, author="cli", note=note, now=now
         )
+    except SettingsSuperseded as exc:
+        out.write(
+            f"written as version {exc.written}, but version {exc.newest} was written at the "
+            "same time and is the one in force; run `traider settings show`\n"
+        )
+        return 1
     except SettingsConflict as exc:
         out.write(f"not written: {exc}. Run `traider settings show` and try again.\n")
         return 1
