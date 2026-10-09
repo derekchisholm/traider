@@ -343,7 +343,7 @@ class Engine:
                 changes or "No change to the settings in force.",
             )
             await self._refresh_universe(now)
-            await self._warn_unpinned_but_held(unpinned, version)
+            await self._warn_unpinned_but_held(unpinned, version, now)
         elif update.kind == "pending_restart":
             await self._event(
                 "settings_pending_restart", {"version": version, "fields": update.detail}, now
@@ -569,7 +569,9 @@ class Engine:
             if held.quantity != 0 and root_symbol(symbol) in roots
         )
 
-    async def _warn_unpinned_but_held(self, unpinned: set[str], version: int | None) -> None:
+    async def _warn_unpinned_but_held(
+        self, unpinned: set[str], version: int | None, now: datetime
+    ) -> None:
         """A version unpinned symbols the bot still holds. They stay managed for now, but
         a new process starts from the pinned symbols and will not pick them up."""
         account = self._account
@@ -578,6 +580,7 @@ class Engine:
         held = self._held_on(account, unpinned & set(self._universe))
         if not held:
             return
+        await self._event("unpinned_but_held", {"version": version, "symbols": held}, now)
         await self._alerts.send(
             f"unpinned_but_held:{version}",
             "Unpinned symbols are still held",
@@ -603,16 +606,19 @@ class Engine:
             quantity = held[symbol]
             await self._event("unmanaged_holding", {"symbol": symbol, "quantity": quantity}, now)
             option = (
-                " Because it is an option, there are no expiry alerts for it and the bot will "
-                "not sell it before it expires."
+                ", so as an option it gets no expiry alerts and is not sold before it expires"
                 if is_option_symbol(symbol)
                 else ""
             )
+            # It may be the operator's own holding, so pinning is not the default advice:
+            # a pinned symbol is the strategy's to buy and sell.
             await self._alerts.send(
                 f"unmanaged_holding:{symbol}",
                 f"{symbol} is held but not managed",
-                f"The account holds {quantity} of {symbol}. The bot does not trade it "
-                f"because it is not pinned.{option} Pin it or handle it yourself.",
+                f"The bot does not trade {symbol} because it is not pinned{option}. If the bot "
+                "bought it before it was unpinned, sell it yourself or pin it again. If the bot "
+                "did not buy it, you can ignore this; pinning would hand it to the strategy, "
+                "which may sell it.",
             )
 
     def _is_our_option(self, symbol: str) -> bool:

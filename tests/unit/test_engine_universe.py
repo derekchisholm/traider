@@ -198,6 +198,8 @@ async def test_unpinning_a_held_symbol_says_it_is_managed_only_until_a_restart(t
     assert "QQQ" in body
     assert "until they are flat or until the next restart" in body
     assert "sell them or keep them pinned" in body
+    events = await h.events("unpinned_but_held")
+    assert [e["data"] for e in events] == [{"version": 2, "symbols": ["QQQ"]}]
 
 
 async def test_unpinning_a_symbol_that_is_not_held_raises_no_held_alert(tmp_path):
@@ -205,6 +207,7 @@ async def test_unpinning_a_symbol_that_is_not_held_raises_no_held_alert(tmp_path
     h = await Harness.create(tmp_path, symbols=("SPY", "QQQ"), settings_store=store)
     await pin(h, store, ("SPY",))
     assert alerts_for(h, "unpinned_but_held:") == []
+    assert await h.events("unpinned_but_held") == []
 
 
 async def test_a_holding_outside_the_universe_is_reported_once_after_a_restart(tmp_path):
@@ -216,8 +219,11 @@ async def test_a_holding_outside_the_universe_is_reported_once_after_a_restart(t
     [(key, subject, body)] = alerts_for(h, "unmanaged_holding:")
     assert key == "unmanaged_holding:QQQ"
     assert subject == "QQQ is held but not managed"
-    assert "not pinned" in body
-    assert "expiry" not in body  # only options expire
+    assert body == (
+        "The bot does not trade QQQ because it is not pinned. If the bot bought it before "
+        "it was unpinned, sell it yourself or pin it again. If the bot did not buy it, you "
+        "can ignore this; pinning would hand it to the strategy, which may sell it."
+    )
     events = await h.events("unmanaged_holding")
     assert [e["data"] for e in events] == [{"symbol": "QQQ", "quantity": 2}]
 
@@ -247,5 +253,7 @@ async def test_an_unmanaged_option_is_reported_with_no_expiry_cover(tmp_path):
     await h.broker.place(OrderRequest(QQQ_CALL, Side.BUY, 1, OrderType.LIMIT, Decimal("2.10")))
     await h.run_for(31)
     [(_, _, body)] = alerts_for(h, f"unmanaged_holding:{QQQ_CALL}")
-    assert "no expiry alerts" in body
-    assert "will not sell it before it expires" in body
+    assert body.startswith(
+        f"The bot does not trade {QQQ_CALL} because it is not pinned, so as an option it "
+        "gets no expiry alerts and is not sold before it expires. If the bot bought it"
+    )
