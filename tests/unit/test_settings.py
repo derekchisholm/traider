@@ -53,14 +53,20 @@ def test_bad_symbols_are_rejected():
 
 
 @pytest.mark.parametrize("symbols", [[], None])
-def test_empty_pinned_symbols_are_rejected(symbols):
+def test_empty_pinned_symbols_are_accepted(symbols):
     body = base().model_dump(mode="json")
     if symbols is None:
-        del body["pinned_symbols"]  # leaving it out is no way round the rule
+        del body["pinned_symbols"]  # leaving it out gives the default: none
     else:
         body["pinned_symbols"] = symbols
-    with pytest.raises(ValidationError, match="pinned_symbols"):
-        Settings.model_validate(body)
+    assert Settings.model_validate(body).pinned_symbols == ()
+
+
+def test_settings_carry_research_settings_and_allow_no_pinned_symbols():
+    config = Config(symbols=(), research_table="r", research={"min_score": 70})
+    settings = Settings.from_config(config)
+    assert settings.pinned_symbols == ()
+    assert settings.research.min_score == 70
 
 
 def test_an_unknown_strategy_is_rejected():

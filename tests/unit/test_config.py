@@ -2,6 +2,7 @@ import json
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from traider.config import Config, ConfigError
 
@@ -120,3 +121,30 @@ def test_blank_optional_values_are_treated_as_unset():
 def test_settings_table_is_read_from_the_environment():
     cfg = Config.from_env({**BASE, "TRAIDER_SETTINGS_TABLE": "traider-dev-settings"})
     assert cfg.settings_table == "traider-dev-settings"
+
+
+def test_research_table_makes_symbols_optional():
+    cfg = Config.from_env({"TRAIDER_RESEARCH_TABLE": "traider-dev-research"})
+    assert cfg.symbols == ()
+    assert cfg.research_table == "traider-dev-research"
+
+
+def test_without_research_symbols_are_still_required():
+    with pytest.raises(ConfigError, match="TRAIDER_SYMBOLS"):
+        Config.from_env({})
+    with pytest.raises(ValidationError, match="at least one symbol"):
+        Config(symbols=())
+
+
+def test_research_settings_come_from_json():
+    cfg = Config.from_env({**BASE, "TRAIDER_RESEARCH": '{"min_score": 75, "intraday_share": 0.3}'})
+    assert cfg.research.min_score == 75
+    assert str(cfg.research.intraday_share) == "0.3"
+
+
+@pytest.mark.parametrize(
+    "bad", ['{"max_symbols": 26}', '{"intraday_share": 1.5}', '{"reduced_factor": 0}', '{"x": 1}']
+)
+def test_bad_research_settings_are_rejected(bad):
+    with pytest.raises(ConfigError):
+        Config.from_env({**BASE, "TRAIDER_RESEARCH": bad})
