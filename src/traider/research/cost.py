@@ -19,6 +19,11 @@ MTOK = Decimal(1_000_000)
 CENT_HUNDREDTHS = Decimal("0.0001")
 
 
+def _check_usage(usage: Usage) -> None:
+    if usage.input_tokens < 0 or usage.output_tokens < 0:
+        raise ValueError("token counts cannot be negative")
+
+
 class CostMeter:
     def __init__(
         self,
@@ -62,12 +67,14 @@ class CostMeter:
 
     def reserve(self, model: str, input_tokens: int, max_tokens: int) -> Decimal | None:
         """Hold the worst case for one call, or None (and ``exhausted``) if it may not run.
+        Once ``exhausted`` is set (budget refusal, overrun, or spend past the limit) nothing
+        more is reserved.
 
         ``input_tokens`` must be an upper bound on the request's real input size: the
         reservation is only as safe as that estimate."""
         if input_tokens < 0 or max_tokens < 0:
             raise ValueError("token counts cannot be negative")
-        if self.would_exceed(model, input_tokens, max_tokens):
+        if self.exhausted or self.would_exceed(model, input_tokens, max_tokens):
             self.exhausted = True
             return None
         amount = self.cost(model, input_tokens, max_tokens)
@@ -80,6 +87,8 @@ class CostMeter:
         than its reservation sets ``overrun`` and ``exhausted``: nothing more is spent."""
         if reserved > self.reserved:
             raise ValueError("settling more than is reserved")
+        if usage is not None:
+            _check_usage(usage)
         self.reserved -= reserved
         if usage is None:
             self.spent += reserved
@@ -92,6 +101,7 @@ class CostMeter:
         self.record(model, usage)
 
     def record(self, model: str, usage: Usage) -> None:
+        _check_usage(usage)
         self.spent += self.cost(model, usage.input_tokens, usage.output_tokens)
         self.tokens_in += usage.input_tokens
         self.tokens_out += usage.output_tokens

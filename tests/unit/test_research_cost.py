@@ -108,3 +108,25 @@ def test_a_double_settle_is_refused():
     with pytest.raises(ValueError, match="more than is reserved"):
         m.settle(MODEL, held, Usage(1000, 200))
     assert (m.spent, m.reserved) == (Decimal("0.004"), Decimal(0))
+
+
+def test_an_exhausted_meter_reserves_nothing_even_after_an_overrun_within_the_limit():
+    m = meter(run="3.00")
+    held = m.reserve(MODEL, 1000, 2000)  # 0.022
+    assert held is not None
+    m.settle(MODEL, held, Usage(10_000, 2000))  # 0.04: over the reservation, far under 3.00
+    assert m.overrun and m.exhausted and m.spent < m.limit
+    assert m.reserve(MODEL, 1, 1) is None
+
+
+def test_negative_usage_is_refused_by_record_and_settle():
+    m = meter()
+    with pytest.raises(ValueError, match="negative"):
+        m.record(MODEL, Usage(-1, 0))
+    with pytest.raises(ValueError, match="negative"):
+        m.record(MODEL, Usage(0, -1))
+    held = m.reserve(MODEL, 1000, 2000)
+    assert held is not None
+    with pytest.raises(ValueError, match="negative"):
+        m.settle(MODEL, held, Usage(-1, 0))
+    assert (m.spent, m.reserved) == (Decimal(0), held)  # refused before anything changed
