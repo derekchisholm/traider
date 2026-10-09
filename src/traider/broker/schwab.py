@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from traider.broker.base import AmbiguousOrder, BrokerError, BrokerUnavailable, OrderRejected
 from traider.models import AccountSnapshot, BrokerOrder, OrderRequest, Side
 from traider.schwab.client import SchwabClient, SchwabError, SchwabRejected, SchwabUnavailable
-from traider.schwab.orders import build_equity_order
+from traider.schwab.orders import build_order
 from traider.schwab.parse import ParseError, parse_account, parse_order, parse_order_tree
 from traider.timeutil import Clock
 
@@ -101,7 +101,7 @@ class SchwabBroker:
 
     async def place(self, request: OrderRequest) -> str | None:
         try:
-            payload = build_equity_order(request)
+            payload = build_order(request)
         except ValueError as exc:
             raise OrderRejected(f"not sent: {exc}") from None
         account_hash = await self._account_hash()  # failures here mean nothing was sent

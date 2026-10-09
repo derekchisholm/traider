@@ -146,6 +146,8 @@ once every 15 minutes.
 | X frozen: position mismatch | The account does not show what a confirmed fill should have produced. | The bot stops trading X, but only until its next restart, and the schedule restarts it every morning. Set `halt` until you have reconciled the position at Schwab. |
 | Open order on X the bot did not place | Somebody else's order is open on a symbol the bot trades. It is only noticed when the bot wants to trade X. | Cancel it or let it finish. The bot stays out of X meanwhile, sells included. With `cancelUnknownOrders` on, the bot cancels such orders itself, yours too. |
 | Order on X is not finishing / Cannot read order status for X | An order has been open for five minutes, or its status has been unreadable for about 30 seconds. | Look at the order at Schwab. Cancel it there if needed. |
+| X expires today | The account holds an option on its last day. Sent once, when the bot first sees it that day. | Decide whether to leave it to the bot, which tries to sell in the last hour if it is allowed to trade, or to close it yourself. |
+| X expires today and is still held | It is the last hour and the option is still in the account. Repeats while that is so. | One alert is normal: the sale is in progress. If it repeats, the bot is not getting it sold (halt, no bid, stale quote, frozen symbol). Sell it at Schwab or tell Schwab not to exercise it: an option that expires in the money becomes 100 shares per contract. |
 | Strategy error | The strategy raised an exception. | Buys are off until the next restart, which the schedule does every morning. Set `close_only` or `halt`, fix the strategy and deploy. |
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
@@ -235,6 +237,9 @@ Before you switch:
       keep.** The bot treats the whole position in each configured symbol as its
       own, and will sell it when the strategy says to hold none.
 - [ ] Nothing else trades the configured symbols in that account.
+- [ ] If options are on: the account has options approval at Schwab, it holds no
+      options on the configured symbols that you want to keep through their last
+      day, and you have read [Options](../README.md#options).
 - [ ] You have chosen the limits on purpose: `max_order_usd`, `max_position_usd`,
       `max_total_exposure_usd`, `max_daily_loss_usd`, `max_orders_per_day`.
 - [ ] Alerts reach you, on a device you will have with you.

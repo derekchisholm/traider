@@ -175,6 +175,75 @@ async def test_check_fails_safe_when_the_account_type_is_unknown(schwab, tmp_pat
     assert code == 0, text
 
 
+CALL = "SPY   261016C00500000"
+
+
+async def options_check(schwab, tmp_path, *, allow=True) -> tuple[int, str]:
+    sign_in(schwab, tmp_path)
+    schwab.set_quote("SPY", 512.30, 512.34)
+    schwab.set_quote("QQQ", 440.10, 440.15)
+    return await run_check(schwab, config(tmp_path, risk=RiskLimits(allow_options=allow)))
+
+
+async def test_check_reads_an_option_chain_and_quote_when_options_are_on(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10)
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 0, text
+    assert "1 contracts for SPY" in text
+    assert CALL in text and "2.00 x 2.10" in text
+
+
+async def test_check_does_not_touch_options_while_they_are_off(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10)
+    code, text = await options_check(schwab, tmp_path, allow=False)
+    assert code == 0, text
+    assert "option" not in text.lower()
+    assert schwab.calls("GET", "/marketdata/v1/chains") == []
+
+
+async def test_check_fails_when_the_option_chain_is_empty(schwab, tmp_path):
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "FAIL" in text and "no option contracts" in text
+
+
+async def test_check_fails_when_the_option_chain_cannot_be_read(schwab, tmp_path):
+    schwab.fail("GET", "/marketdata/v1/chains", 500, times=3)
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "option chain" in text and "FAIL" in text
+
+
+async def test_check_fails_on_delayed_option_quotes(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10, realtime=False)
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "delayed" in text
+
+
+async def test_check_fails_on_an_option_quote_schwab_does_not_call_normal(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10)
+    schwab.quotes[CALL]["quote"]["securityStatus"] = "Unknown"
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "Unknown" in text and "would not trade" in text
+
+
+async def test_check_fails_on_an_option_with_no_bid(schwab, tmp_path):
+    schwab.add_option(CALL, 0.0, 0.05)
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "no bid" in text
+
+
+async def test_check_fails_when_an_option_has_no_quote(schwab, tmp_path):
+    schwab.add_option(CALL, 2.00, 2.10)
+    del schwab.quotes[CALL]
+    code, text = await options_check(schwab, tmp_path)
+    assert code == 1
+    assert "no quote" in text
+
+
 async def test_check_keeps_going_after_a_failed_step(schwab, tmp_path):
     sign_in(schwab, tmp_path)
     schwab.set_quote("SPY", 512.30, 512.34)

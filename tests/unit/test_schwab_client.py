@@ -367,3 +367,17 @@ async def test_order_id_is_found_however_the_header_name_is_spelled(client, monk
 
     monkeypatch.setattr(client, "_request", reply)
     assert await client.place_order(ACCOUNT_HASH, ORDER) == "4455"
+
+
+async def test_option_chain_asks_for_a_bounded_slice(client, schwab):
+    schwab.add_option("SPY   261016C00500000", 4.1, 4.2)
+    raw = await client.option_chain("SPY", date(2026, 10, 9), date(2026, 11, 23), strikes=20)
+    assert raw["status"] == "SUCCESS"
+    (call,) = schwab.calls("GET", "/marketdata/v1/chains")
+    assert call["query"] == {
+        "symbol": "SPY",
+        "contractType": "ALL",
+        "strikeCount": "20",
+        "fromDate": "2026-10-09",
+        "toDate": "2026-11-23",
+    }

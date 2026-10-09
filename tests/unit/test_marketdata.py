@@ -1,7 +1,9 @@
 from datetime import timedelta
+from decimal import Decimal
 
 from tests.unit.helpers import T0, make_bar, make_quote
 from traider.marketdata import MarketData
+from traider.options import OptionQuote
 
 
 def test_unknown_symbol_has_no_quote():
@@ -83,3 +85,35 @@ def test_waker_is_called_for_quotes_and_bars():
     market.on_quote(make_quote())
     market.on_bar(make_bar())
     assert len(calls) == 2
+
+
+# ------------------------------------------------------------------------- options
+
+
+def test_watched_symbols_are_remembered_in_order_and_once():
+    data = MarketData()
+    data.watch("B")
+    data.watch("A")
+    data.watch("B")
+    assert data.watched() == ("B", "A")
+
+
+def test_an_unwatched_symbol_is_forgotten_with_its_quote():
+    data = MarketData()
+    data.watch("A")
+    data.on_quote(make_quote("A"))
+    data.unwatch("A")
+    assert (data.watched(), data.quote("A")) == ((), None)
+    data.unwatch("A")  # twice is harmless
+
+
+def test_a_chain_is_kept_per_underlying_and_empty_until_set():
+    data = MarketData()
+    line = OptionQuote("SPY   261016C00500000", Decimal("2.00"), Decimal("2.10"), None, 7)
+    assert data.chain("SPY") == ()
+    data.set_chain("SPY", [line])
+    assert (data.chain("SPY"), data.chain("QQQ")) == ((line,), ())
+    assert data.chains() == {"SPY": (line,)}
+    data.set_chain("SPY", [])
+    assert data.chain("SPY") == ()
+    assert not data.chains().get("SPY")

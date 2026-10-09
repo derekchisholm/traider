@@ -106,14 +106,71 @@ Schwab [said](https://www.schwab.com/learn/story/sec-approves-scrapping-25000-da
 it would stop counting day trades. The bot has no rule for it. The new rule concerns
 margin, which the bot does not use unless you turn `require_cash` off.
 
+### Options
+
+Off by default. Setting `allow_options: true` in `traider:risk` lets a strategy trade
+**long calls and long puts** on the configured symbols: bought to open, sold to
+close, one leg at a time. Nothing is ever written (sold short), so the most an
+option position can lose is the premium paid for it. The Schwab account needs
+options approval; without it Schwab rejects the orders.
+
+What changes when a target names an option contract instead of a share symbol:
+
+- **The dollar caps apply to the premium.** One contract is 100 shares, so a contract
+  quoted at 2.10 counts as 210 dollars against `max_order_usd`, `max_position_usd`,
+  `max_total_exposure_usd` and the cash rules. `max_contracts_per_order` caps the
+  count. With the default 500 dollar order cap, that is two such contracts.
+- **Limit orders only**, at the quoted price: buys at the ask, sells at the bid. An
+  unfilled order is cancelled after `orderTimeoutS` and priced again.
+- **Their own quote checks**: `max_option_spread_bps` and `min_option_price` replace
+  the share limits, because option spreads are far wider. The quote must still be
+  real-time and fresh.
+- **No buying on the last day.** `min_days_to_expiry` (default 1) is the fewest days
+  an option may have left when bought.
+- **Sold before expiry.** On its last day an option is sold in the final hour
+  (`option_expiry_exit_min`, default 60 minutes before the close), whatever the
+  strategy says. This applies to every long option on a configured symbol in the
+  account, not only ones the bot bought. You get one alert when the bot first sees
+  such a holding that day, and repeated alerts during the final hour for as long
+  as it is still in the account.
+
+That last rule exists because of the one way a long option can cost more than its
+premium: **an option left to expire in the money is exercised automatically**, which
+buys (call) or sells (put) 100 shares per contract at the strike. No limit here is
+sized for that. The exit is a limit order at the bid and can fail: no bid, a stale
+quote, the control switch on `halt`, a lapsed sign-in. The alerts are sent whether
+or not the bot is able to sell, but not if the bot is not running at all. If the
+contracts are still in the account near the close, sell them or tell Schwab not to
+exercise.
+
+Other things to know:
+
+- Option quotes are polled every `pollIntervalS` seconds, not streamed, so the bot
+  reacts to option prices in seconds, not sub-second.
+- A strategy picks contracts from `ctx.chain("SPY")`: bid, ask, delta and days to
+  expiry for strikes around the money, reloaded once a minute
+  (`traider:optionChainDays`, `traider:optionChainStrikes`).
+- Turning `allow_options` off stops buys and the expiry exit. A strategy can still
+  sell an option it names.
+- A thinly traded contract can go minutes without a new quote. The frozen-quote
+  check (`max_quote_lag_s`, 120 seconds) then blocks orders on it, sells included.
+  Stick to liquid contracts or raise it.
+- At most 20 contracts are tracked at once. Every contract a strategy names counts,
+  even with a target of 0, until the next day; contracts actually in the account
+  are always tracked.
+- **Backtests do not cover options.** There is no historical option data in a bar
+  file, so option targets in a backtest never trade.
+- Option proceeds settle the next business day, like shares, and the
+  [settled-cash](#settled-cash) rule covers them.
+
 ## What has and has not been verified
 
 Verified, on the machine this was written on:
 
-- More than 750 automated tests for the bot pass. They run it against an in-process
+- More than 850 automated tests for the bot pass. They run it against an in-process
   fake of the Schwab API (sign-in, accounts, orders, quotes, price history, market
   hours, the streaming socket, and failures of each) and against a fake AWS.
-- More than 90 tests run the Pulumi program against provider mocks and check what it
+- More than 100 tests run the Pulumi program against provider mocks and check what it
   would create: network rules, IAM policies down to the exact resource, the schedule,
   where secrets go, and that the example configuration matches the real defaults.
 - Each safety rule was checked the other way round as well: the rule was broken on
@@ -128,6 +185,14 @@ Not verified. Treat each as something to watch on first contact:
   (`schwab-py` and `schwabdev`). Field names, error formats and timing may differ in
   ways the fake does not capture. `traider check` is read-only and exists to be the
   first thing that touches the real API.
+- **Options are the least proven part.** The option symbol format, the order
+  instructions (`BUY_TO_OPEN`, `SELL_TO_CLOSE`), the chain and quote fields and how
+  Schwab reports an option position are all taken from the same two libraries, and
+  none of it has met the real API. Whether Schwab marks option quotes as real-time
+  for your app decides whether the bot will trade them at all; with `allow_options`
+  on, `traider check` reads a chain and one contract's quote and fails if the bot
+  would refuse to trade on it. Paper
+  trade options before anything else.
 - **`pulumi up` has never been run.** The mocks prove the program is self-consistent
   and uses argument names the providers accept. They do not prove AWS accepts every
   value. Expect to fix something small on the first `pulumi preview`.
@@ -310,6 +375,25 @@ Register it in `src/traider/strategy/__init__.py`, set `traider:strategy` to its
 name, write tests for it, backtest it, then run it on paper. `on_quote` is also
 available for decisions that cannot wait for the end of a bar.
 
+With [options](#options) switched on, a target may name a contract instead of a
+share symbol, and the quantity is then a number of contracts:
+
+```python
+        if any(held for symbol, held in ctx.positions.items() if symbol != bar.symbol):
+            return []  # already in a contract
+        calls = [c for c in ctx.chain(bar.symbol) if c.contract.right == "C"]
+        picks = [c for c in calls if 20 <= c.days_to_expiry <= 40 and c.delta is not None]
+        if picks:
+            best = min(picks, key=lambda c: abs(c.delta - Decimal("0.5")))
+            return [Target(best.symbol, quantity=1, reason="why")]
+```
+
+A target belongs to one contract and stands until the strategy changes it or the day
+ends. Asking for a different contract does not cancel the first: a strategy that
+names a new "best" contract on every bar ends up holding several. To close a
+position, return a target of 0 for that contract's symbol; `ctx.positions` lists
+what is held. Quotes for held contracts reach `on_quote` too.
+
 Keep a strategy deterministic and free of I/O. On a restart it is rebuilt from
 recent bars, and the engine only ever trades the difference between its target and
 the real position, so a restart is harmless.
@@ -358,8 +442,9 @@ policies name exact actions and resources.
 
 ## Limits worth knowing
 
-- US equities and ETFs, whole shares, regular session only. No options, no shorting,
-  no extended hours.
+- US equities and ETFs, whole shares, regular session only. No shorting, no extended
+  hours. [Options](#options) are long single calls and puts only: no spreads, no
+  covered calls, no selling to open.
 - One Schwab account per stack.
 - Bars are one minute. Quotes arrive faster and reach `on_quote`.
 - The bot starts each weekday at 09:00 and stops at 16:30 New York time unless

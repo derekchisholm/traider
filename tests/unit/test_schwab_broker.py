@@ -337,3 +337,17 @@ async def test_calendar_failure_is_raised_so_the_market_is_treated_as_closed(cli
     schwab.fail("GET", "/markets", 503, times=3)
     with pytest.raises(Exception, match="503"):
         await SchwabSessionProvider(client).session_for(date(2026, 10, 8))
+
+
+async def test_an_option_is_bought_to_open_and_shows_up_as_contracts(broker, schwab):
+    call = "SPY   261016C00500000"
+    schwab.add_option(call, 4.10, 4.20)
+    order_id = await broker.place(OrderRequest(call, Side.BUY, 2, OrderType.LIMIT, Decimal("4.20")))
+    placed = schwab.orders[int(order_id)]
+    assert placed.leg["instruction"] == "BUY_TO_OPEN"
+    assert placed.leg["instrument"] == {"symbol": call, "assetType": "OPTION"}
+    order = await broker.get_order(order_id)
+    assert (order.symbol, order.side, order.filled_quantity) == (call, Side.BUY, 2)
+    account = await broker.get_account()
+    assert account.position(call) == 2
+    assert account.cash_available == Decimal("9160.0")  # 2 contracts x 100 x 4.20

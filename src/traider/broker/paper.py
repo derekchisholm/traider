@@ -1,6 +1,7 @@
 """A simulated broker for paper trading and backtests.
 
-Fills use the current quote: buys at the ask, sells at the bid. A limit order
+Fills use the current quote: buys at the ask, sells at the bid. An option
+contract moves a hundred times its quoted price. A limit order
 that is not marketable rests and is re-checked whenever its status is read.
 There is no partial-fill, queue-position or market-impact modelling, so paper
 results are optimistic compared with live trading.
@@ -24,6 +25,7 @@ from traider.models import (
     Position,
     Side,
 )
+from traider.options import contract_size
 from traider.state.base import StateStore
 from traider.timeutil import Clock
 
@@ -86,7 +88,7 @@ class PaperBroker:
         for symbol, holding in self._holdings.items():
             quote = self._market.quote(symbol)
             mark = quote.bid if quote is not None and quote.bid > 0 else holding.avg_price
-            equity += mark * holding.quantity
+            equity += mark * holding.quantity * contract_size(symbol)
             positions[symbol] = Position(symbol, holding.quantity, holding.avg_price)
         return AccountSnapshot(
             equity=equity,
@@ -110,10 +112,9 @@ class PaperBroker:
             raise OrderRejected("limit order without a price")
         if request.side is Side.BUY:
             worst = request.limit_price if request.limit_price is not None else quote.ask
-            if worst * request.quantity > self._cash:
-                raise OrderRejected(
-                    f"not enough cash: need {worst * request.quantity:.2f}, have {self._cash:.2f}"
-                )
+            cost = worst * request.quantity * contract_size(request.symbol)
+            if cost > self._cash:
+                raise OrderRejected(f"not enough cash: need {cost:.2f}, have {self._cash:.2f}")
         else:
             held = self._holdings.get(request.symbol)
             if held is None or request.quantity > held.quantity:
@@ -221,7 +222,7 @@ class PaperBroker:
 
     def _apply_fill(self, request: OrderRequest, price: Decimal) -> bool:
         """Move cash and shares. Returns False if the account can no longer cover it."""
-        value = price * request.quantity
+        value = price * request.quantity * contract_size(request.symbol)
         held = self._holdings.get(request.symbol)
         if request.side is Side.BUY:
             if value > self._cash:
@@ -231,7 +232,7 @@ class PaperBroker:
                 self._holdings[request.symbol] = _Holding(request.quantity, price)
             else:
                 total = held.quantity + request.quantity
-                held.avg_price = (held.avg_price * held.quantity + value) / total
+                held.avg_price = (held.avg_price * held.quantity + price * request.quantity) / total
                 held.quantity = total
             return True
         if held is None or request.quantity > held.quantity:

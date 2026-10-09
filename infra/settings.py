@@ -24,6 +24,8 @@ _PASS_THROUGH = {
     "flattenBeforeCloseMin": "TRAIDER_FLATTEN_BEFORE_CLOSE_MIN",
     "feed": "TRAIDER_FEED",
     "pollIntervalS": "TRAIDER_POLL_INTERVAL_S",
+    "optionChainDays": "TRAIDER_OPTION_CHAIN_DAYS",
+    "optionChainStrikes": "TRAIDER_OPTION_CHAIN_STRIKES",
     "paperStartingCash": "TRAIDER_PAPER_STARTING_CASH",
     "accountLast4": "TRAIDER_SCHWAB_ACCOUNT_LAST4",
     "accountHash": "TRAIDER_SCHWAB_ACCOUNT_HASH",

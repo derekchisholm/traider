@@ -226,3 +226,50 @@ async def test_an_order_left_resting_before_a_restart_reads_as_cancelled(market)
     assert (order.status, order.filled_quantity) == (OrderStatus.CANCELED, 0)
     await restarted.cancel(order_id)  # and cancelling it is not an error
     assert (await restarted.get_account()).cash_available == Decimal(1000)
+
+
+# ------------------------------------------------------------------------- options
+
+CALL = "SPY   261016C00500000"
+
+
+def option_limit(side, qty, price) -> OrderRequest:
+    return OrderRequest(CALL, side, qty, OrderType.LIMIT, Decimal(price))
+
+
+@pytest.fixture
+def option_market(market):
+    market.on_quote(make_quote(CALL, "2.00", "2.10"))
+    return market
+
+
+async def test_an_option_contract_costs_a_hundred_times_its_price(option_market):
+    broker = PaperBroker(option_market, ManualClock(T0), starting_cash=Decimal(1000))
+    await broker.place(option_limit(Side.BUY, 2, "2.10"))
+    account = await broker.get_account()
+    assert account.cash_available == Decimal("580.00")
+    assert account.position(CALL) == 2
+    assert account.equity == Decimal("980.00")  # marked at the bid: 2 x 100 x 2.00
+
+
+async def test_an_option_buy_needs_cash_for_the_whole_contract(option_market):
+    broker = PaperBroker(option_market, ManualClock(T0), starting_cash=Decimal(200))
+    with pytest.raises(OrderRejected, match=r"not enough cash: need 210\.00"):
+        await broker.place(option_limit(Side.BUY, 1, "2.10"))
+
+
+async def test_selling_an_option_brings_in_a_hundred_times_its_price(option_market):
+    broker = PaperBroker(option_market, ManualClock(T0), starting_cash=Decimal(1000))
+    await broker.place(option_limit(Side.BUY, 1, "2.10"))
+    await broker.place(option_limit(Side.SELL, 1, "2.00"))
+    account = await broker.get_account()
+    assert (account.cash_available, account.position(CALL)) == (Decimal("990.00"), 0)
+
+
+async def test_adding_to_an_option_keeps_the_average_price_per_share(option_market):
+    broker = PaperBroker(option_market, ManualClock(T0), starting_cash=Decimal(1000))
+    await broker.place(option_limit(Side.BUY, 1, "2.10"))
+    option_market.on_quote(make_quote(CALL, "2.20", "2.30", at=T0 + timedelta(seconds=1)))
+    await broker.place(option_limit(Side.BUY, 1, "2.30"))
+    account = await broker.get_account()
+    assert account.positions[CALL].avg_price == Decimal("2.20")

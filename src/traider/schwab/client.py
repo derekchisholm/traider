@@ -159,6 +159,20 @@ class SchwabClient:
             {"symbols": ",".join(symbols), "fields": "quote", "indicative": "false"},
         )
 
+    async def option_chain(self, symbol: str, start: date, end: date, *, strikes: int) -> Any:
+        """Calls and puts expiring between two dates, ``strikes`` strikes around the money.
+        Kept narrow on purpose: Schwab fails on very large chain responses."""
+        return await self._get(
+            "/marketdata/v1/chains",
+            {
+                "symbol": symbol,
+                "contractType": "ALL",
+                "strikeCount": str(strikes),
+                "fromDate": start.isoformat(),
+                "toDate": end.isoformat(),
+            },
+        )
+
     async def price_history(self, symbol: str, start: datetime, end: datetime) -> Any:
         """One-minute candles for the regular session between two times."""
         return await self._get(
