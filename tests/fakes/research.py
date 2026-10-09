@@ -182,11 +182,14 @@ class FakeEvents:
 
     async def company_news(self, symbol: str, start: date, end: date) -> list[NewsItem]:
         self._enter("company_news", symbol)
-        return [n for n in self.news.get(symbol, []) if start <= n.at.date() <= end]
+        found = [n for n in self.news.get(symbol, []) if start <= n.at.date() <= end]
+        return sorted(found, key=lambda n: n.at, reverse=True)
 
     async def market_news(self, limit: int) -> list[NewsItem]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self._enter("market_news", limit)
-        return self.general[:limit]
+        return sorted(self.general, key=lambda n: n.at, reverse=True)[:limit]
 
     async def profile(self, symbol: str) -> Profile | None:
         self._enter("profile", symbol)

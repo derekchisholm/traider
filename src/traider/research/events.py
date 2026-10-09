@@ -95,7 +95,8 @@ def _positive(value: Any) -> float | None:
 
 
 def _hour(value: Any) -> EarningsHour:
-    return value if value in ("bmo", "amc") else "unknown"
+    hour = value.strip().lower() if isinstance(value, str) else ""
+    return "bmo" if hour == "bmo" else "amc" if hour == "amc" else "unknown"
 
 
 def parse_earnings(raw: Any) -> list[EarningsEvent]:
@@ -215,6 +216,8 @@ class FinnhubEvents:
         return parse_news(raw)
 
     async def market_news(self, limit: int) -> list[NewsItem]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         return parse_news(await self._get("/news", {"category": "general"}))[:limit]
 
     async def profile(self, symbol: str) -> Profile | None:
@@ -235,15 +238,16 @@ class FinnhubEvents:
                     allow_redirects=False,
                 ) as response:
                     status = response.status
-                    text = await response.text()
+                    body = await response.read()
             except (aiohttp.ClientError, TimeoutError) as exc:
                 failure = EventsUnavailable(f"finnhub {path}: {type(exc).__name__}")
                 continue
             if status == 200:
                 try:
-                    return json.loads(text)
-                except ValueError:
-                    raise EventsUnavailable(f"finnhub {path}: reply was not JSON") from None
+                    return json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, LookupError, ValueError):
+                    pass  # raised below, outside this block, so nothing is chained
+                raise EventsUnavailable(f"finnhub {path}: reply was not JSON")
             if status in (401, 403):
                 raise EventsUnavailable(f"finnhub {path}: the API key was refused (HTTP {status})")
             failure = EventsUnavailable(f"finnhub {path}: HTTP {status}")
@@ -254,21 +258,27 @@ class FinnhubEvents:
 
 def finnhub_key_from_secret(client: Any, secret_id: str) -> str:
     """The key from a secret holding ``{"api_key": "..."}``. Errors never echo the value."""
+    code: str | None = None
     try:
         response = client.get_secret_value(SecretId=secret_id)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "Unknown")
-        if code == "ResourceNotFoundException":
-            raise EventsUnavailable(
-                "the Finnhub secret has no value yet: store the key (see docs/runbook.md)"
-            ) from None
-        raise EventsUnavailable(f"cannot read the Finnhub secret: {code}") from None
     except BotoCoreError as exc:
-        raise EventsUnavailable(f"cannot read the Finnhub secret: {type(exc).__name__}") from None
+        code = type(exc).__name__
+    # Raised outside the except blocks so no cause or context is chained.
+    if code == "ResourceNotFoundException":
+        raise EventsUnavailable(
+            "the Finnhub secret has no value yet: store the key (see docs/runbook.md)"
+        )
+    if code is not None:
+        raise EventsUnavailable(f"cannot read the Finnhub secret: {code}")
+    malformed = False
     try:
         key = json.loads(response["SecretString"])["api_key"].strip()
         if not key:
             raise ValueError("empty")
     except (KeyError, TypeError, ValueError, AttributeError):
-        raise EventsUnavailable('the Finnhub secret must be JSON like {"api_key": "..."}') from None
+        malformed = True  # the JSONDecodeError holds the secret text, so it is not chained
+    if malformed:
+        raise EventsUnavailable('the Finnhub secret must be JSON like {"api_key": "..."}')
     return str(key)

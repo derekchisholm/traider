@@ -1,5 +1,6 @@
 """Finnhub through a fake server: parsing, the rate limit, errors, and keeping the key secret."""
 
+import inspect
 import json
 import logging
 from datetime import UTC, date, datetime
@@ -10,8 +11,10 @@ import pytest
 from moto import mock_aws
 
 from tests.fakes.finnhub_server import API_KEY
+from tests.fakes.research import FakeEvents, news
 from traider.research.events import (
     EarningsEvent,
+    EventsData,
     EventsUnavailable,
     FinnhubEvents,
     finnhub_key_from_secret,
@@ -261,7 +264,7 @@ def test_earnings_rows_that_are_malformed_are_skipped_not_repaired():
     ]
     found = parse_earnings({"earningsCalendar": rows})
     assert found == [
-        EarningsEvent(symbol="CCC", day=date(2026, 10, 9)),
+        EarningsEvent(symbol="CCC", day=date(2026, 10, 9), hour="bmo"),
         EarningsEvent(symbol="DDD", day=date(2026, 10, 9)),
     ]
 
@@ -317,3 +320,120 @@ async def test_the_key_is_in_no_error_and_no_repr(events, finnhub):
         assert API_KEY not in str(caught.value) + repr(caught.value) + repr(caught.value.args)
         assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert API_KEY not in repr(events) and API_KEY not in str(events)
+
+
+# --- review fixes ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("body", [b"\xff\xfe[]", b"\xc3\x28", b"not json", b""])
+async def test_a_reply_that_cannot_be_decoded_is_events_unavailable_and_not_retried(
+    events, finnhub, body
+):
+    finnhub.raw_replies["/news"] = body
+    with pytest.raises(EventsUnavailable, match="reply was not JSON") as caught:
+        await events.market_news(5)
+    assert len(finnhub.requests) == 1
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+async def test_a_redirect_is_not_followed_so_the_key_goes_nowhere_else(events, finnhub):
+    finnhub.redirects["/news"] = "/elsewhere"
+    with pytest.raises(EventsUnavailable, match="HTTP 302"):
+        await events.market_news(5)
+    assert len(finnhub.requests) == 1
+    assert not [r for r in finnhub.requests if r["path"].endswith("/elsewhere")]
+
+
+def test_a_secret_error_holds_no_trace_of_the_secret_text(secrets):
+    arn = secrets.create_secret(Name="finnhub", SecretString="plain-key-not-json-0123456789")["ARN"]
+    with pytest.raises(EventsUnavailable) as caught:
+        finnhub_key_from_secret(secrets, arn)
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    with pytest.raises(EventsUnavailable) as missing:
+        finnhub_key_from_secret(secrets, "does-not-exist")
+    assert missing.value.__context__ is None and missing.value.__cause__ is None
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_market_news_needs_a_positive_limit(events, finnhub, limit):
+    with pytest.raises(ValueError, match="at least 1"):
+        await events.market_news(limit)
+    assert finnhub.requests == []
+    with pytest.raises(ValueError, match="at least 1"):
+        await FakeEvents().market_news(limit)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_key_is_not_retried(events, finnhub, status):
+    finnhub.fail("/news", status, times=5)
+    with pytest.raises(EventsUnavailable, match="refused"):
+        await events.market_news(5)
+    assert len(finnhub.requests) == 1
+
+
+async def test_a_retry_uses_up_rate_budget_too(finnhub):
+    clock = {"now": 0.0}
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        clock["now"] += seconds
+
+    finnhub.fail("/news", 500, times=1)
+    async with aiohttp.ClientSession() as session:
+        events = FinnhubEvents(
+            session,
+            API_KEY,
+            base_url=finnhub.base_url,
+            max_per_minute=2,
+            backoff_s=0.0,
+            monotonic=lambda: clock["now"],
+            sleep=sleep,
+        )
+        await events.market_news(1)  # two attempts: the failure and its retry
+        assert len(finnhub.requests) == 2 and waits == [0.0]
+        await events.market_news(1)  # the budget is gone, so this one must wait
+    assert waits == [0.0, 60.0]
+
+
+@pytest.mark.parametrize("hour", ["BMO", " bmo ", "Bmo"])
+def test_the_earnings_hour_is_normalised(hour):
+    (found,) = parse_earnings(
+        {"earningsCalendar": [{"date": "2026-10-09", "symbol": "A", "hour": hour}]}
+    )
+    assert found.hour == "bmo"
+    rows = [{"date": "2026-10-09", "symbol": s, "hour": h} for s, h in (("B", "AMC "), ("C", "x"))]
+    assert [e.hour for e in parse_earnings({"earningsCalendar": rows})] == ["amc", "unknown"]
+    rows = [{"date": "2026-10-09", "symbol": "D", "hour": h} for h in (None, 5, "")]
+    assert {e.hour for e in parse_earnings({"earningsCalendar": rows})} == {"unknown"}
+
+
+# --- the fake and the real vendor both fit the protocol --------------------------------------
+
+_METHODS = ("earnings_calendar", "company_news", "market_news", "profile")
+
+
+def _as_events_data(vendor: EventsData) -> EventsData:  # mypy checks both fit
+    return vendor
+
+
+def test_both_vendors_have_the_protocol_methods_and_signatures():
+    fake: EventsData = _as_events_data(FakeEvents())
+    real: EventsData = _as_events_data(FinnhubEvents(None, API_KEY))  # type: ignore[arg-type]
+    for name in _METHODS:
+        spec = inspect.signature(getattr(EventsData, name))
+        for vendor in (fake, real):
+            method = getattr(vendor, name)
+            assert inspect.iscoroutinefunction(method)
+            assert list(inspect.signature(method).parameters) == [
+                p for p in spec.parameters if p != "self"
+            ]
+
+
+async def test_the_fake_gives_news_newest_first():
+    fake = FakeEvents()
+    items = news("NVDA", 4)
+    fake.news["NVDA"] = list(reversed(items))
+    fake.general = list(reversed(items))
+    assert await fake.company_news("NVDA", TODAY, TODAY) == items
+    assert await fake.market_news(3) == items[:3]

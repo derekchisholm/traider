@@ -22,6 +22,8 @@ class FakeFinnhub:
         self.profiles: dict[str, dict[str, Any]] = {}
         self.requests: list[dict[str, Any]] = []
         self.faults: list[dict[str, Any]] = []  # {"path": ..., "status": ..., "times": ...}
+        self.raw_replies: dict[str, bytes] = {}  # path fragment -> a 200 body sent as is
+        self.redirects: dict[str, str] = {}  # path fragment -> a 302 to this path
         self._server: TestServer | None = None
 
     async def start(self) -> None:
@@ -30,6 +32,7 @@ class FakeFinnhub:
         app.router.add_get("/api/v1/company-news", self._company_news)
         app.router.add_get("/api/v1/news", self._news)
         app.router.add_get("/api/v1/stock/profile2", self._profile)
+        app.router.add_get("/api/v1/elsewhere", self._news)  # where a redirect leads
         self._server = TestServer(app)
         await self._server.start_server()
 
@@ -59,8 +62,14 @@ class FakeFinnhub:
                     request.transport.close()
                     raise web.HTTPInternalServerError
                 return web.json_response({"error": "injected"}, status=int(fault["status"]))
+        for fragment, target in self.redirects.items():
+            if fragment in request.path:
+                raise web.HTTPFound(self.base_url + target)
         if request.headers.get("X-Finnhub-Token") != API_KEY:
             return web.json_response({"error": "Invalid API key"}, status=401)
+        for fragment, body in self.raw_replies.items():
+            if fragment in request.path:
+                return web.Response(body=body, content_type="application/json")
         response: web.StreamResponse = await handler(request)
         return response
 
