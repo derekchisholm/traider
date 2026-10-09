@@ -5,6 +5,7 @@
 * the bot's own open orders, so a restart resumes managing them
 * an append-only audit log of what it decided and did
 * the paper-trading account
+* which positions the bot opened itself (the ledger)
 """
 
 from __future__ import annotations
@@ -26,6 +27,40 @@ class DayState:
     orders: int = 0
     halted_reason: str | None = None
     sold_usd: Decimal = Decimal(0)  # proceeds of the bot's sales today; they settle tomorrow
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEntry:
+    """A position the bot opened itself, and how it was meant to be held."""
+
+    symbol: str
+    horizon: str  # "intraday" or "swing"
+    side: str  # "long" or "bearish"
+    opened_at: datetime
+    pick_run_id: str = ""
+    pick_rank: int = 0
+
+
+def ledger_to_dict(entry: LedgerEntry) -> dict[str, Any]:
+    return {
+        "symbol": entry.symbol,
+        "horizon": entry.horizon,
+        "side": entry.side,
+        "opened_at": entry.opened_at.isoformat(),
+        "pick_run_id": entry.pick_run_id,
+        "pick_rank": entry.pick_rank,
+    }
+
+
+def ledger_from_dict(data: Mapping[str, Any]) -> LedgerEntry:
+    return LedgerEntry(
+        symbol=str(data["symbol"]),
+        horizon=str(data["horizon"]),
+        side=str(data["side"]),
+        opened_at=datetime.fromisoformat(str(data["opened_at"])),
+        pick_run_id=str(data.get("pick_run_id", "")),
+        pick_rank=int(data.get("pick_rank", 0)),
+    )
 
 
 class StateStore(Protocol):
@@ -54,6 +89,12 @@ class StateStore(Protocol):
     async def load_paper(self) -> dict[str, Any] | None: ...
 
     async def save_paper(self, data: dict[str, Any]) -> None: ...
+
+    async def ledger(self) -> dict[str, LedgerEntry]: ...
+
+    async def put_ledger(self, entry: LedgerEntry) -> None: ...
+
+    async def delete_ledger(self, symbol: str) -> None: ...
 
 
 def jsonable(data: Mapping[str, Any]) -> dict[str, Any]:

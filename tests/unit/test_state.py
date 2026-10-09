@@ -8,6 +8,7 @@ import pytest
 from moto import mock_aws
 
 from traider.models import OrderRecord, OrderStatus, OrderType, Side
+from traider.state.base import LedgerEntry
 from traider.state.dynamo import DynamoStateStore
 from traider.state.memory import MemoryStateStore
 
@@ -251,3 +252,40 @@ async def test_namespaces_are_isolated(make_store):
     assert (live_day.orders, live_day.halted_reason, live_day.sold_usd) == (0, None, Decimal(0))
     assert await live.open_orders() == []
     assert await live.load_paper() is None
+
+
+# --- position ledger: the positions the bot opened itself ---------------------------
+
+
+def entry(symbol="NVDA", **overrides) -> LedgerEntry:
+    fields = {"symbol": symbol, "horizon": "intraday", "side": "long", "opened_at": T0}
+    return LedgerEntry(**(fields | overrides))
+
+
+async def test_the_ledger_starts_empty(store):
+    assert await store.ledger() == {}
+
+
+async def test_ledger_entries_are_kept_replaced_and_deleted(store):
+    await store.put_ledger(entry("NVDA", pick_run_id="r1", pick_rank=2))
+    await store.put_ledger(entry("AMD", horizon="swing"))
+    await store.put_ledger(entry("NVDA", horizon="swing"))  # same symbol: replaced
+    ledger = await store.ledger()
+    assert set(ledger) == {"NVDA", "AMD"}
+    assert ledger["NVDA"].horizon == "swing"
+    assert ledger["AMD"] == entry("AMD", horizon="swing")
+    await store.delete_ledger("NVDA")
+    await store.delete_ledger("MISSING")  # deleting nothing is fine
+    assert set(await store.ledger()) == {"AMD"}
+
+
+async def test_the_ledger_survives_a_restart_and_keeps_modes_apart(make_store):
+    await make_store("paper").put_ledger(entry())
+    assert set(await make_store("paper").ledger()) == {"NVDA"}
+    assert await make_store("live").ledger() == {}
+
+
+async def test_pick_provenance_survives_a_round_trip(store):
+    original = entry("NVDA", pick_run_id="run-42", pick_rank=3)
+    await store.put_ledger(original)
+    assert (await store.ledger())["NVDA"] == original
