@@ -158,6 +158,17 @@ class FakeBroker(PaperBroker):
             ),
         )
 
+    def fill_part(self, order_id: str, quantity: int) -> None:
+        """Fill some of a resting order and leave the rest working (keep hold_fills on)."""
+        request, order = self._orders[order_id]
+        quote = self._market.quote(request.symbol)
+        price = quote.ask if request.side is Side.BUY else quote.bid
+        assert self._apply_fill(replace(request, quantity=quantity), price)
+        self._orders[order_id] = (
+            request,
+            replace(order, filled_quantity=quantity, avg_fill_price=price),
+        )
+
     def add_foreign_order(self, symbol="SPY", order_id="F1", side=Side.BUY, quantity=1):
         self.foreign_orders.append(
             BrokerOrder(

@@ -24,7 +24,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
 from typing import Any
@@ -49,7 +49,7 @@ from traider.risk import Decision, RiskContext, RiskManager
 from traider.session import SessionTracker
 from traider.state.base import DayState, StateStore
 from traider.strategy.base import Strategy, StrategyContext
-from traider.timeutil import Clock, trading_date
+from traider.timeutil import Clock, previous_weekday, trades_without_settling, trading_date
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +88,7 @@ class Engine:
     CONTROL_REFRESH_S = 10.0
     LEASE_TTL_S = 30.0
     LEASE_RENEW_S = 10.0
+    LEASE_MARGIN_S = 5.0  # no order is sent this close to the lease running out
     ACCOUNT_REFRESH_S = 30.0
     ACCOUNT_RETRY_S = 2.0  # while the snapshot is known to be out of date
     ORDER_POLL_S = 1.0
@@ -142,6 +143,10 @@ class Engine:
         self._day = DayState(trading_date(clock.now()).isoformat(), halted_reason="not loaded yet")
         self._day_ok = False
         self._day_attempt_at: datetime | None = None
+        self._carried_usd = Decimal(0)  # earlier sales that have not settled by today
+        self._unsaved_sold = Decimal(0)  # day-state writes that failed and await a retry
+        self._unsaved_halt: str | None = None
+        self._unsaved_attempt_at: datetime | None = None
         self._account: AccountSnapshot | None = None
         self._account_at: datetime | None = None
         self._account_attempt_at: datetime | None = None
@@ -150,6 +155,7 @@ class Engine:
         self._strategy_error: str | None = None
         self._control_at: datetime | None = None
         self._lease_at: datetime | None = None
+        self._lease_until: datetime | None = None
         self._heartbeat_at: datetime | None = None
         self._pretrade: tuple[datetime, AccountSnapshot, list[BrokerOrder]] | None = None
         self._throttled: dict[str, datetime] = {}
@@ -165,19 +171,23 @@ class Engine:
         return self._symbols[symbol].target
 
     async def start(self) -> None:
-        """Load today's counters and pick up any orders a previous run left open."""
-        now = self._clock.now()
-        await self._roll_day(now)
+        """Load today's counters. Open orders are picked up when the lease is won."""
+        await self._roll_day(self._clock.now())
+
+    async def _adopt_open_orders(self) -> None:
+        """Take over the orders the previous holder of the lease left open. Only the
+        instance that holds the lease may touch them, so this runs on gaining it."""
         for record in await self._state.open_orders():
-            self._seen_order_ids.add(record.order_id)
             st = self._symbols.setdefault(record.symbol, _SymbolState())
             if st.working is None:
+                self._seen_order_ids.add(record.order_id)
                 st.working = record
+                st.last_poll_at = None
                 log.info("resuming order %s (%s)", record.order_id, record.symbol)
-            else:
-                # Two open orders on one symbol should not happen. Get rid of the extra.
-                log.warning("extra open order %s on %s: cancelling", record.order_id, record.symbol)
-                await self._cancel_quietly(record.order_id)
+            elif st.working.order_id != record.order_id:
+                # Two open orders on one symbol should not happen. The pre-trade check
+                # will see the extra as an order the bot does not manage and keep out.
+                log.warning("extra open order %s on %s", record.order_id, record.symbol)
 
     async def step(self) -> None:
         """One pass of the loop. Safe to call as often as you like."""
@@ -232,6 +242,7 @@ class Engine:
             await self._renew_lease(now)
         await self._session.refresh(now)
         await self._roll_day(now)
+        await self._save_unsaved(now)
         interval = self.ACCOUNT_RETRY_S if self._account_dirty else self.ACCOUNT_REFRESH_S
         if _due(self._account_attempt_at, now, interval):
             await self._refresh_account(now)
@@ -256,9 +267,17 @@ class Engine:
     async def _renew_lease(self, now: datetime) -> None:
         try:
             leader = await self._state.acquire_lease(self._instance, self.LEASE_TTL_S, now)
+            if leader:
+                self._lease_until = now + timedelta(seconds=self.LEASE_TTL_S)
+                if not self._leader:
+                    await self._adopt_open_orders()
         except Exception as exc:
             self._log_throttled("lease", now, "lease check failed, not trading: %s", exc)
             leader = False
+        if not leader and self._leader:
+            # Whoever holds the lease now owns the open orders.
+            for st in self._symbols.values():
+                st.working = None
         if self._leader and not leader:
             await self._alerts.send(
                 "lease_lost",
@@ -276,8 +295,26 @@ class Engine:
         if self._day.day == day and not _due(self._day_attempt_at, now, self.DAY_RETRY_S):
             return
         self._day_attempt_at = now
+        if self._day.day != day:
+            # A new trading day. Yesterday's wishes are not today's: the strategy must
+            # ask again, on today's prices, before anything is bought or sold.
+            for st in self._symbols.values():
+                st.target = None
+            self._unsaved_sold, self._unsaved_halt = Decimal(0), None
         try:
-            self._day = await self._state.get_day(day)
+            loaded = await self._state.get_day(day)
+            carried = Decimal(0)
+            today = date.fromisoformat(day)
+            if trades_without_settling(today):
+                # Banks are shut, so the last trading day's sales have not settled yet.
+                carried = (await self._state.get_day(previous_weekday(today).isoformat())).sold_usd
+            self._carried_usd = carried
+            # Keep what could not be written earlier today.
+            self._day = replace(
+                loaded,
+                sold_usd=loaded.sold_usd + self._unsaved_sold,
+                halted_reason=loaded.halted_reason or self._unsaved_halt,
+            )
             self._day_ok = True
         except Exception as exc:
             # Without today's counters the limits cannot be enforced: no entries.
@@ -433,7 +470,8 @@ class Engine:
         try:
             await self._state.halt_day(self._day.day, reason)
         except Exception:
-            log.exception("could not persist the daily halt")
+            log.exception("could not persist the daily halt; will retry")
+            self._unsaved_halt = reason
         await self._event("entries_halted", {"reason": reason}, now)
         await self._alerts.send(
             "day_halted",
@@ -460,11 +498,38 @@ class Engine:
         try:
             await self._state.add_sold(self._day.day, proceeds)
         except Exception:
-            log.exception("could not persist today's sale proceeds")
+            log.exception("could not persist today's sale proceeds; will retry")
+            self._unsaved_sold += proceeds
+
+    async def _save_unsaved(self, now: datetime) -> None:
+        """Retry day-state writes that failed, so a restart does not forget them."""
+        if not (self._unsaved_sold or self._unsaved_halt):
+            return
+        if not _due(self._unsaved_attempt_at, now, self.DAY_RETRY_S):
+            return
+        self._unsaved_attempt_at = now
+        try:
+            if self._unsaved_sold:
+                await self._state.add_sold(self._day.day, self._unsaved_sold)
+                self._unsaved_sold = Decimal(0)
+            if self._unsaved_halt:
+                await self._state.halt_day(self._day.day, self._unsaved_halt)
+                self._unsaved_halt = None
+        except Exception as exc:
+            self._log_throttled("unsaved", now, "day state still cannot be written: %s", exc)
 
     # ------------------------------------------------------------ working orders
 
+    def _lease_is_safe(self) -> bool:
+        """True while this instance certainly still holds the lease. Checked against the
+        clock right now, because a slow broker call can outlast the lease mid-step."""
+        until = self._lease_until
+        margin = timedelta(seconds=self.LEASE_MARGIN_S)
+        return self._leader and until is not None and self._clock.now() < until - margin
+
     async def _manage_working_orders(self, now: datetime) -> None:
+        # Only the lease holder ever has working orders: they are adopted on winning
+        # the lease and dropped on losing it.
         for symbol, st in self._symbols.items():
             record = st.working
             if record is None or not _due(st.last_poll_at, now, self.ORDER_POLL_S):
@@ -722,9 +787,42 @@ class Engine:
                 session=self._session.view(now),
                 token_seconds_left=self._auth_seconds_left(),
                 seconds_since_last_order=since,
-                unsettled_usd=self._day.sold_usd,
+                unsettled_usd=self._day.sold_usd
+                + self._carried_usd
+                + self._in_flight(Side.SELL, account),
+                committed_usd=self._in_flight(Side.BUY, account),
             )
         )
+
+    def _in_flight(self, side: Side, account: AccountSnapshot) -> Decimal:
+        """Dollar value of the bot's orders on ``side`` that the account snapshot may not
+        reflect yet: working orders in full, and fills still waiting to show up.
+
+        For buys this is cash already spoken for. For sells it is money that is, or is
+        about to be, in the account but has not settled. Counting a working order in
+        full errs on the side of not trading.
+        """
+        total = Decimal(0)
+        for symbol, st in self._symbols.items():
+            quote = self._market.quote(symbol)
+            shares, price = 0, None
+            record, pending = st.working, st.pending
+            if record is not None and record.side is side:
+                shares, price = record.quantity, record.limit_price
+            elif pending is not None:
+                moved = pending.expected - account.position(symbol)
+                if (moved > 0) == (side is Side.BUY) and moved != 0:
+                    shares = abs(moved)
+                    price = pending.order.limit_price if pending.order is not None else None
+            if shares == 0:
+                continue
+            if price is None and quote is not None:
+                price = quote.ask if side is Side.BUY else quote.bid
+            if price is None:
+                held = account.positions.get(symbol)
+                price = held.avg_price if held is not None else Decimal(0)
+            total += price * shares
+        return total
 
     def _entries_halted(self, now: datetime) -> str | None:
         if self._day.halted_reason:
@@ -826,6 +924,11 @@ class Engine:
     async def _place(
         self, symbol: str, st: _SymbolState, order: OrderRequest, position: int, now: datetime
     ) -> None:
+        if not self._lease_is_safe():
+            self._log_throttled("lease-late", now, "lease about to lapse, not placing an order")
+            self._lease_at = None  # renew on the next pass
+            st.hold_until = now + timedelta(seconds=self.ORDER_POLL_S)
+            return
         # Count the order before sending it. If the counter cannot be written, do not trade.
         try:
             count = await self._state.incr_orders(self._day.day)

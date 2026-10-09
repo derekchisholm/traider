@@ -47,6 +47,7 @@ class RiskContext:
     token_seconds_left: float | None  # None when there is no login to expire (backtests)
     seconds_since_last_order: float | None  # for this symbol
     unsettled_usd: Decimal  # proceeds of the bot's sales today, which settle tomorrow
+    committed_usd: Decimal  # cash already promised to the bot's buys still on their way
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,9 +157,18 @@ class RiskManager:
             return None
         if quote.delayed:
             reject("quote_delayed", "quote is delayed, not real-time")
+        if quote.halted:
+            reject("halted", f"{order.symbol} is not trading normally")
         age = (ctx.now - quote.received_at).total_seconds()
+        lag = (ctx.now - quote.ts).total_seconds()
         if age > limits.max_quote_age_s:
             reject("quote_stale", f"quote is {age:.0f}s old, limit {limits.max_quote_age_s:.0f}s")
+        elif lag > limits.max_quote_lag_s:
+            reject(
+                "quote_stale",
+                f"the market last updated this quote {lag:.0f}s ago, "
+                f"limit {limits.max_quote_lag_s:.0f}s",
+            )
         # A positive bid with an ask at or above it; that also rules out a zero ask.
         if quote.bid <= 0 or quote.ask < quote.bid:
             reject("bad_quote", f"unusable quote {quote.bid} x {quote.ask}")
@@ -213,13 +223,16 @@ class RiskManager:
             cash = ctx.account.cash_available
             if cash is None:
                 reject("cash", "broker did not report available cash")
-            elif notional > cash:
-                reject("cash", f"order value {notional:.2f} over available cash {cash:.2f}")
-            elif limits.settled_cash_only and notional > cash - ctx.unsettled_usd:
+                return
+            # The snapshot may not show buys that are working or have only just filled.
+            free = cash - ctx.committed_usd
+            if notional > free:
+                reject("cash", f"order value {notional:.2f} over available cash {free:.2f}")
+            elif limits.settled_cash_only and notional > free - ctx.unsettled_usd:
                 reject(
                     "unsettled_cash",
                     f"order value {notional:.2f} over settled cash "
-                    f"{cash - ctx.unsettled_usd:.2f}: {ctx.unsettled_usd:.2f} from today's "
+                    f"{free - ctx.unsettled_usd:.2f}: {ctx.unsettled_usd:.2f} from today's "
                     "sales settles on the next business day",
                 )
 
