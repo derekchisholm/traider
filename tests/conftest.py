@@ -52,3 +52,14 @@ async def client(schwab, signed_in):
 
     async with aiohttp.ClientSession() as session:
         yield SchwabClient(session, signed_in, base_url=schwab.base_url, backoff_s=0.01)
+
+
+@pytest.fixture
+async def finnhub():
+    """A fake Finnhub API listening on localhost."""
+    from tests.fakes.finnhub_server import FakeFinnhub
+
+    server = FakeFinnhub()
+    await server.start()
+    yield server
+    await server.stop()

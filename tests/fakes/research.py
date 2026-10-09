@@ -6,9 +6,10 @@ Each records what it was asked and can be told to fail.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
+from traider.research.events import EarningsEvent, EventsUnavailable, NewsItem, Profile
 from traider.research.market import DailyBar, MarketQuote, PutContract, QuoteBatch
 from traider.session import Session
 from traider.timeutil import ET, previous_weekday
@@ -149,3 +150,57 @@ def calm_context(market: FakeMarketData, *, vix: float = 18.0, spy_gap: float = 
         market.quote_map[etf] = quote(
             etf, 100.0 + i / 10, 100.0, asset_type="COLLECTIVE_INVESTMENT"
         )
+
+
+# ----------------------------------------------------------------------------- events
+
+
+class FakeEvents:
+    def __init__(self) -> None:
+        self.calendar: list[EarningsEvent] = []
+        self.news: dict[str, list[NewsItem]] = {}
+        self.general: list[NewsItem] = []
+        self.profiles: dict[str, Profile] = {}
+        self.failures: dict[str, Exception] = {}  # method name -> raised on every call
+        self.calls: list[tuple[str, Any]] = []
+
+    def _enter(self, name: str, detail: Any) -> None:
+        self.calls.append((name, detail))
+        if name in self.failures:
+            raise self.failures[name]
+
+    def called(self, name: str) -> list[Any]:
+        return [detail for called, detail in self.calls if called == name]
+
+    def fail_everything(self) -> None:
+        for name in ("earnings_calendar", "company_news", "market_news", "profile"):
+            self.failures[name] = EventsUnavailable(f"finnhub {name}: HTTP 503")
+
+    async def earnings_calendar(self, start: date, end: date) -> list[EarningsEvent]:
+        self._enter("earnings_calendar", (start, end))
+        return [e for e in self.calendar if start <= e.day <= end]
+
+    async def company_news(self, symbol: str, start: date, end: date) -> list[NewsItem]:
+        self._enter("company_news", symbol)
+        return [n for n in self.news.get(symbol, []) if start <= n.at.date() <= end]
+
+    async def market_news(self, limit: int) -> list[NewsItem]:
+        self._enter("market_news", limit)
+        return self.general[:limit]
+
+    async def profile(self, symbol: str) -> Profile | None:
+        self._enter("profile", symbol)
+        return self.profiles.get(symbol)
+
+
+def news(symbol: str, count: int, *, day: date = TODAY, text: str = "") -> list[NewsItem]:
+    at = datetime.combine(day, time(6, 0), tzinfo=ET)
+    return [
+        NewsItem(
+            at=at - timedelta(hours=i),
+            source="Wire",
+            headline=f"{symbol} headline {i}",
+            summary=text or f"{symbol} summary {i}",
+        )
+        for i in range(count)
+    ]
