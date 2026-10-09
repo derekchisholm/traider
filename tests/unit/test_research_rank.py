@@ -97,6 +97,13 @@ def test_rule_2_needs_a_fresh_quote_that_is_trading():
     assert reasons(rank([item()], fresh=halted)) == {"NVDA": "halted"}
 
 
+@pytest.mark.parametrize("last", [0.0, float("inf"), float("nan"), -5.0])
+def test_rule_2_a_last_price_that_is_not_a_positive_finite_number_is_no_quote(last):
+    # MarketQuote normalises these itself; the rule must hold even if a quote slips through.
+    bad = quote("NVDA", 104, 100).model_copy(update={"last": last})
+    assert reasons(rank([item()], fresh={"NVDA": bad})) == {"NVDA": "no_quote"}
+
+
 @pytest.mark.parametrize(
     ("side", "invalidation", "ok"),
     [
@@ -172,6 +179,26 @@ def test_swing_expiry_day(day, hour, expiry):
     assert swing_expiry_day(TODAY, 5, [event]) == expiry
 
 
+def test_swing_expiry_day_earnings_on_the_expiry_day_after_the_close_clamps_to_the_day_before():
+    friday = EarningsEvent(symbol="X", day=date(2026, 10, 16), hour="amc")
+    assert swing_expiry_day(TODAY, 5, [friday]) == date(2026, 10, 15)
+
+
+def test_swing_expiry_day_earnings_on_a_weekend_clamps_to_the_friday_before():
+    saturday = EarningsEvent(symbol="X", day=date(2026, 10, 17), hour="unknown")
+    assert swing_expiry_day(TODAY, 10, [saturday]) == date(2026, 10, 16)
+    sunday = EarningsEvent(symbol="X", day=date(2026, 10, 18), hour="amc")
+    assert swing_expiry_day(TODAY, 10, [sunday]) == date(2026, 10, 16)
+
+
+def test_swing_expiry_day_with_several_events_the_earliest_wins():
+    late = EarningsEvent(symbol="X", day=date(2026, 10, 15), hour="amc")
+    early = EarningsEvent(symbol="X", day=date(2026, 10, 13), hour="amc")
+    middle = EarningsEvent(symbol="X", day=date(2026, 10, 14), hour="bmo")
+    assert swing_expiry_day(TODAY, 10, [late, early, middle]) == date(2026, 10, 12)
+    assert swing_expiry_day(TODAY, 10, [early, middle, late]) == date(2026, 10, 12)
+
+
 def test_rule_5_a_swing_pick_with_earnings_next_trading_day_is_too_close():
     monday = EarningsEvent(symbol="NVDA", day=date(2026, 10, 12), hour="bmo")
     result = rank([item(horizon="swing", swing_days=5, earnings=[monday])])
@@ -185,11 +212,23 @@ def test_rule_5_intraday_is_refused_only_for_earnings_today_at_an_unknown_hour()
     assert rank([item(earnings=[tonight])]).picks
 
 
+def test_rule_5_intraday_earnings_today_at_an_unknown_hour_is_refused_without_a_calendar_flag():
+    unknown = EarningsEvent(symbol="NVDA", day=TODAY, hour="unknown")
+    result = rank([item(earnings=[unknown])], earnings_ok=False)
+    assert reasons(result) == {"NVDA": "earnings_too_close"}
+
+
 def test_rule_6_blended_score():
     assert blended_score(82, 89, 0.7) == 84  # 57.4 + 26.7 = 84.1
     assert blended_score(65, 35, 0.7) == 56
     assert blended_score(50, 51, 0.5) == 51  # 50.5 rounds up
     assert blended_score(100, 100, 1.0) == 100
+
+
+def test_rule_6_blend_rounds_exact_halves_up_despite_float_error():
+    # 0.7 x 96 + 0.3 x 51 = 82.5 and 0.7 x 96 + 0.3 x 41 = 79.5 exactly, but not in floats.
+    assert blended_score(96, 51, 0.7) == 83
+    assert blended_score(96, 41, 0.7) == 80
 
 
 def test_rule_7_ranked_by_score_with_a_sector_cap_and_a_cut():
@@ -214,6 +253,18 @@ def test_an_unknown_sector_is_one_bucket():
     )
     assert [p.symbol for p in result.picks] == ["A"]
     assert reasons(result) == {"B": "sector_cap"}
+
+
+def test_a_real_sector_named_unknown_is_not_the_missing_sector_bucket():
+    settings = RankSettings(max_per_sector=1)
+    inputs = [
+        item("A", score=90, sector="unknown"),
+        item("B", score=80, sector=None),
+        item("C", score=70, sector=""),
+    ]
+    result = rank(inputs, settings=settings)
+    assert [p.symbol for p in result.picks] == ["A", "B"]
+    assert reasons(result) == {"C": "sector_cap"}  # "" and None are one bucket
 
 
 def test_ties_go_to_the_higher_pre_score_then_the_symbol():
@@ -262,6 +313,25 @@ async def test_a_chain_that_cannot_be_read_means_illiquid():
         settings=SETTINGS,
     )
     assert reasons(result) == {"AMD": "illiquid_puts"}
+    assert result.chain_failures == 1
+
+
+async def test_a_failed_chain_read_is_logged_by_symbol_and_type_only(caplog):
+    market = FakeMarketData()
+    market.quote_map = {"AMD": quote("AMD", 48, 50)}
+    market.failures["puts"] = RuntimeError("secret-vendor-text")
+    with caplog.at_level("WARNING", logger="traider.research.rank"):
+        await rank_and_validate(
+            [item("AMD", side="bearish", invalidation=49.0, atr=1.0)],
+            market=market,
+            run_id=RUN,
+            today=TODAY,
+            close=CLOSE,
+            earnings_ok=True,
+            settings=SETTINGS,
+        )
+    assert "AMD" in caplog.text and "RuntimeError" in caplog.text
+    assert "secret-vendor-text" not in caplog.text
 
 
 async def test_a_halted_name_is_dropped_and_its_chain_is_not_read():

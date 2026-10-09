@@ -27,7 +27,6 @@ alignment = 1 if bias != 0, else 0. A rank is the percentile within the survivin
 
 from __future__ import annotations
 
-import math
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -37,6 +36,7 @@ from traider.config import check_symbols
 from traider.research.events import EarningsEvent
 from traider.research.job_settings import ScreenSettings, ScreenWeights
 from traider.research.market import DailyBar, MarketQuote
+from traider.research.numbers import round_half_up
 from traider.timeutil import next_weekday, previous_weekday, weekdays_between
 
 MIN_BARS = 60
@@ -275,11 +275,6 @@ def percentile_ranks(values: Sequence[float]) -> list[float]:
     return ranks
 
 
-def _round_half_up(value: float) -> int:
-    # Round to 9 places first: float error must not turn an exact .5 into .4999...
-    return math.floor(round(value, 9) + 0.5)
-
-
 def score_rows(rows: Sequence[ScreenRow], weights: ScreenWeights) -> list[ScreenRow]:
     """``rows`` with ``pre_score`` set, in the same order."""
     if not rows:
@@ -299,7 +294,7 @@ def score_rows(rows: Sequence[ScreenRow], weights: ScreenWeights) -> list[Screen
             + weights.catalyst * catalyst
             + weights.alignment * alignment
         )
-        scored.append(replace(row, pre_score=max(0, min(100, _round_half_up(100 * total)))))
+        scored.append(replace(row, pre_score=max(0, min(100, round_half_up(100 * total)))))
     return scored
 
 

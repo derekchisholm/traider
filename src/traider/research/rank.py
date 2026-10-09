@@ -23,9 +23,10 @@ not. Per assessment, in order; the first failure drops the name with its reason 
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
@@ -34,7 +35,10 @@ from traider.research.events import EarningsEvent
 from traider.research.job_settings import RankSettings
 from traider.research.market import MarketData, MarketQuote, PutContract, liquid_puts
 from traider.research.models import Horizon, Pick, PickSide
+from traider.research.numbers import round_half_up
 from traider.timeutil import ET, previous_weekday, weekdays_after
+
+log = logging.getLogger(__name__)
 
 THESIS_MAX_CHARS = 2000
 _EPSILON = 1e-9  # so a stop exactly on a bound is not lost to float rounding
@@ -61,6 +65,7 @@ class Rejection:
 class RankResult:
     picks: tuple[Pick, ...]
     rejected: tuple[Rejection, ...]
+    chain_failures: int = 0  # put-chain reads that failed (counted as illiquid)
 
 
 def close_of(day: date) -> datetime:
@@ -84,7 +89,7 @@ def swing_expiry_day(
 
 def blended_score(llm_score: int, pre_score: int, llm_weight: float) -> int:
     value = llm_weight * llm_score + (1 - llm_weight) * pre_score
-    return max(0, min(100, math.floor(value + 0.5)))
+    return max(0, min(100, round_half_up(value)))
 
 
 def _thesis(assessment: Assessment) -> str:
@@ -140,7 +145,7 @@ def validate_and_rank(
                 continue
         if a.horizon == "intraday":
             today_unknown = any(e.day == today and e.hour == "unknown" for e in item.earnings)
-            if earnings_ok and today_unknown:
+            if today_unknown:  # refused even without a calendar flag: this event is in hand
                 rejected.append(Rejection(item.symbol, "earnings_too_close"))
                 continue
             horizon, expires = Horizon.INTRADAY, close
@@ -158,10 +163,10 @@ def validate_and_rank(
         passing.append((score, item, horizon, expires, price))
 
     passing.sort(key=lambda p: (-p[0], -p[1].pre_score, p[1].symbol))
-    per_sector: dict[str, int] = {}
+    per_sector: dict[str | None, int] = {}
     picks: list[Pick] = []
     for score, item, horizon, expires, price in passing:
-        sector = item.sector or "unknown"
+        sector = item.sector or None
         if per_sector.get(sector, 0) >= settings.max_per_sector:
             rejected.append(Rejection(item.symbol, "sector_cap"))
             continue
@@ -210,15 +215,19 @@ async def rank_and_validate(
     wanted = [i.symbol for i in inputs if i.assessment.side != "pass"]
     fresh = (await market.quotes(wanted)).quotes if wanted else {}
     puts: dict[str, Sequence[PutContract] | None] = {}
+    failed = 0
     for item in inputs:
         q = fresh.get(item.symbol)
         if item.assessment.side != "bearish" or q is None or q.last is None or q.halted:
             continue
         try:
             puts[item.symbol] = await market.puts(item.symbol, q.last, today)
-        except Exception:
+        except Exception as exc:
+            # Type name only: the message could carry vendor text.
+            log.warning("put chain read failed for %s: %s", item.symbol, type(exc).__name__)
             puts[item.symbol] = None  # unknown liquidity counts as illiquid
-    return validate_and_rank(
+            failed += 1
+    result = validate_and_rank(
         inputs,
         fresh=fresh,
         puts=puts,
@@ -228,3 +237,4 @@ async def rank_and_validate(
         earnings_ok=earnings_ok,
         settings=settings,
     )
+    return replace(result, chain_failures=failed)
