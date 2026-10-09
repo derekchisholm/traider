@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -82,6 +82,8 @@ class Feed:
         self._chain_strikes = chosen.option_chain_strikes
         self._chain_tried_at: dict[str, datetime] = {}
         self._bars_fetched_for: datetime | None = None
+        self._pending_warmup: dict[str, None] = {}  # symbols to replay history for; ordered
+        self._warmup_bars = 0  # set by run(); 0 means no warm-up is wanted
         self._complained_at: datetime | None = None
 
     # -------------------------------------------------- sink for the stream
@@ -98,6 +100,37 @@ class Feed:
 
     def on_alive(self, when: datetime) -> None:
         self._market.mark_alive(when)
+
+    # -------------------------------------------------------------- symbols
+
+    def set_symbols(self, symbols: Sequence[str]) -> None:
+        """Follow the engine's universe. New symbols are warmed up from history on the
+        next poll; the stream resubscribes."""
+        new = tuple(symbols)
+        for symbol in new:
+            if symbol not in self._symbols:
+                self._pending_warmup[symbol] = None
+        for symbol in list(self._pending_warmup):
+            if symbol not in new:
+                del self._pending_warmup[symbol]  # dropped before it was warmed up
+        self._symbols = new
+        if self._stream is not None:
+            self._stream.set_symbols(new)
+
+    async def _warm_pending(self, now: datetime) -> None:
+        if not self._pending_warmup or self._warmup_bars <= 0:
+            self._pending_warmup.clear()
+            return
+        for symbol in list(self._pending_warmup):
+            try:
+                raw = await self._client.price_history(symbol, now - self.WARMUP_LOOKBACK, now)
+            except SchwabError as exc:
+                self._complain(now, "warm-up history for %s not available yet: %s", symbol, exc)
+                continue  # stays queued for the next poll
+            closed = [bar for bar in parse_candles(raw, symbol) if bar.start + _MINUTE <= now]
+            for bar in closed[-self._warmup_bars :]:
+                self._market.on_bar(bar, warmup=True)
+            self._pending_warmup.pop(symbol, None)
 
     # --------------------------------------------------------------- status
 
@@ -125,6 +158,7 @@ class Feed:
         warmup_retry_s: float = 30.0,
     ) -> None:
         """Warm up, then feed the market until cancelled."""
+        self._warmup_bars = warmup_bars
         while not await self.warmup(warmup_bars):
             await self._sleep(warmup_retry_s)
         interval = self._poll_interval_s if poll_interval_s is None else poll_interval_s
@@ -161,16 +195,18 @@ class Feed:
         """One REST refresh: options always, share quotes and bars unless the stream is
         doing that job."""
         now = self._clock.now()
+        await self._warm_pending(now)
         if not self._session.view(now).is_open:
             return
         await self._poll_options(now)
         if self.stream_healthy():
             return
-        try:
-            for quote in parse_quotes(await self._client.quotes(self._symbols), now).values():
-                self._market.on_quote(quote)
-        except SchwabError as exc:
-            self._complain(now, "quote poll failed: %s", exc)
+        if self._symbols:
+            try:
+                for quote in parse_quotes(await self._client.quotes(self._symbols), now).values():
+                    self._market.on_quote(quote)
+            except SchwabError as exc:
+                self._complain(now, "quote poll failed: %s", exc)
 
         minute = now.replace(second=0, microsecond=0)
         due = (now - minute).total_seconds() >= self.BAR_DELAY_S
