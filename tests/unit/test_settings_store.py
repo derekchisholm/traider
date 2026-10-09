@@ -217,6 +217,35 @@ async def test_history_is_newest_first_and_skips_invalid_versions(store):
     assert [v.version for v in await store.history(limit=1)] == [2]
 
 
+async def test_get_returns_any_stored_version(store):
+    await store.write(settings(), expected_version=0, author="a", note="first", now=T0)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="b", note="", now=T0
+    )
+    old = await store.get(1)
+    assert old is not None
+    assert (old.version, old.author, old.note, old.at) == (1, "a", "first", T0)
+    assert old.settings == settings()
+    new = await store.get(2)
+    assert new is not None and new.settings.risk.max_order_usd == Decimal(250)
+
+
+@pytest.mark.parametrize(("stored", "version"), [(0, 1), (1, 0), (1, 2), (1, 99)])
+async def test_get_of_a_version_that_does_not_exist_is_none(store, stored, version):
+    for n in range(stored):
+        await store.write(settings(), expected_version=n, author="a", note="", now=T0)
+    assert await store.get(version) is None
+
+
+async def test_get_of_an_invalid_version_raises_with_its_number(store):
+    await store.write(settings(), expected_version=0, author="a", note="", now=T0)
+    put_invalid(store, 2)
+    with pytest.raises(SettingsInvalid) as raised:
+        await store.get(2)
+    assert raised.value.version == 2
+    assert (await store.get(1)).version == 1
+
+
 class BrokenStore(MemorySettingsStore):
     def __init__(self) -> None:
         super().__init__()

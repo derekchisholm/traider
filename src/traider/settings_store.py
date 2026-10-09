@@ -51,6 +51,8 @@ class SettingsInvalid(Exception):
 class SettingsStore(Protocol):
     async def latest(self) -> SettingsVersion | None: ...
 
+    async def get(self, version: int) -> SettingsVersion | None: ...
+
     async def write(
         self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime
     ) -> SettingsVersion: ...
@@ -156,6 +158,10 @@ class MemorySettingsStore:
             return None
         return _parse(self._items[max(self._items)])
 
+    async def get(self, version: int) -> SettingsVersion | None:
+        item = self._items.get(version)
+        return _parse(item) if item is not None else None
+
     async def write(
         self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime
     ) -> SettingsVersion:
@@ -209,6 +215,13 @@ class DynamoSettingsStore:
     async def latest(self) -> SettingsVersion | None:
         items = await self._newest(1)
         return _parse(items[0]) if items else None
+
+    async def get(self, version: int) -> SettingsVersion | None:
+        response = await self._call(
+            self._table.get_item, Key={"pk": PK, "sk": _sk(version)}, ConsistentRead=True
+        )
+        item = response.get("Item")
+        return _parse(item) if item is not None else None
 
     async def write(
         self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime

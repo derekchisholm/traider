@@ -224,8 +224,18 @@ uv run --env-file .env traider settings history
 
 Limits, order settings and flattening apply at once. The strategy, its parameters,
 the pinned symbols, the option-chain span and `allow_options` wait for a restart.
-To go back, apply an older version's body as a new version. Stack settings in
-Pulumi only seed version 1 when the table is empty; after that the table wins.
+`show` prints only the JSON on stdout (the version line goes to stderr), so the file
+can be given straight back to `apply`. To go back, print an older version and apply it
+as a new version:
+
+```sh
+uv run --env-file .env traider settings history
+uv run --env-file .env traider settings show --version 3 > old.json
+uv run --env-file .env traider settings apply old.json --note "back to 3"
+```
+
+Stack settings in Pulumi only seed version 1 when the table is empty; after that the
+table wins.
 If the newest version is damaged and has no readable version number,
 `traider settings apply` refuses and tells you to delete that item from the settings
 table first.

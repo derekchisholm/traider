@@ -453,17 +453,24 @@ async def _backtest(args: argparse.Namespace, config: Config, out: TextIO) -> in
 # ------------------------------------------------------------------------- settings
 
 
-async def settings_show(store: SettingsStore, out: TextIO) -> int:
+async def settings_show(
+    store: SettingsStore, out: TextIO, err: TextIO, *, version: int | None = None
+) -> int:
+    """Print one version's settings as JSON on ``out`` and nothing else, so the output can be
+    saved and given back to ``apply``. The version line and any problem go to ``err``."""
     try:
-        latest = await store.latest()
+        shown = await (store.latest() if version is None else store.get(version))
     except SettingsInvalid as exc:
-        out.write(f"{exc}\n")
+        err.write(f"{exc}\n")
         return 1
-    if latest is None:
-        out.write("no settings stored yet; the bot writes version 1 when it first starts\n")
+    if shown is None:
+        if version is None:
+            err.write("no settings stored yet; the bot writes version 1 when it first starts\n")
+        else:
+            err.write(f"no settings version {version}; `traider settings history` lists them\n")
         return 1
-    out.write(f"version {latest.version} by {latest.author} at {latest.at.isoformat()}\n")
-    out.write(json.dumps(latest.settings.model_dump(mode="json"), indent=2) + "\n")
+    err.write(f"version {shown.version} by {shown.author} at {shown.at.isoformat()}\n")
+    out.write(json.dumps(shown.settings.model_dump(mode="json"), indent=2) + "\n")
     return 0
 
 
@@ -553,7 +560,8 @@ def _parser() -> argparse.ArgumentParser:
     backtest.add_argument("--cash", type=float, help="starting cash (default from configuration)")
     settings = commands.add_parser("settings", help="read or change the bot's versioned settings")
     actions = settings.add_subparsers(dest="action", required=True)
-    actions.add_parser("show", help="print the settings in force")
+    show = actions.add_parser("show", help="print the settings in force as JSON")
+    show.add_argument("--version", type=int, metavar="N", help="print version N instead")
     history = actions.add_parser("history", help="list earlier versions")
     history.add_argument("--limit", type=int, default=20)
     apply = actions.add_parser("apply", help="write a JSON file as the next version")
@@ -591,7 +599,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
             store = _settings_store(config)
             if args.action == "show":
-                return asyncio.run(settings_show(store, sys.stdout))
+                return asyncio.run(
+                    settings_show(store, sys.stdout, sys.stderr, version=args.version)
+                )
             if args.action == "history":
                 return asyncio.run(settings_history(store, sys.stdout, limit=args.limit))
             return asyncio.run(
