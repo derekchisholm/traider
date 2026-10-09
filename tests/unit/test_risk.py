@@ -630,3 +630,69 @@ def test_the_horizon_budget_bounds_entries():
 def test_no_intraday_entries_in_the_flatten_window():
     gate = ResearchGate(pick_side="long", horizon="intraday", intraday_closing=True)
     assert check(gated(gate)).codes == {"intraday_closing"}
+
+
+def test_an_exit_passes_the_most_hostile_gate():
+    gate = ResearchGate(
+        pick_side=None,
+        posture="stand_aside",
+        intraday_closing=True,
+        horizon="intraday",
+        horizon_exposure_usd=Decimal(10_000),
+        horizon_cap_usd=Decimal(1000),
+        cap_factor=Decimal("0.01"),
+    )
+    assert check(gated(gate, order=sell(), **holding())).allowed
+
+
+def test_reduced_days_can_trip_the_position_cap_alone():
+    # Holding 5 (about 500); buying 2 more takes the position to about 700.35.
+    # The order is 200.10, well under the 1000 order cap even at 0.5.
+    limits = RiskLimits(max_order_usd=Decimal(1000), max_position_usd=Decimal(1000))
+    reduced = ResearchGate(pick_side="long", cap_factor=Decimal("0.5"))
+    assert check(gated(reduced, order=buy(2), **holding(5)), limits).codes == {"max_position_usd"}
+    normal = ResearchGate(pick_side="long")
+    assert check(gated(normal, order=buy(2), **holding(5)), limits).allowed
+
+
+def test_a_horizon_budget_used_to_the_cent_is_allowed():
+    gate = ResearchGate(
+        pick_side="long",
+        horizon_exposure_usd=Decimal("799.90"),
+        horizon_cap_usd=Decimal("1000.00"),
+    )
+    assert check(gated(gate)).allowed  # 799.90 + 200.10 == 1000.00
+    over = replace(gate, horizon_exposure_usd=Decimal("799.91"))
+    assert check(gated(over)).codes == {"horizon_budget"}
+
+
+def test_an_option_entry_counts_its_hundred_shares_against_the_budget():
+    # One contract at 2.05 is 205.00 of budget, not 2.05.
+    gate = ResearchGate(
+        pick_side="long", horizon_exposure_usd=Decimal(850), horizon_cap_usd=Decimal(1000)
+    )
+    assert check(option_ctx(research=gate), OPTIONS).codes == {"horizon_budget"}
+    roomy = replace(gate, horizon_exposure_usd=Decimal(700))
+    assert check(option_ctx(research=roomy), OPTIONS).allowed
+
+
+def test_the_gate_accepts_its_edge_values():
+    ResearchGate(pick_side=None, cap_factor=Decimal(1), horizon_cap_usd=Decimal(0))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"posture": "stand-aside"},
+        {"pick_side": "short"},
+        {"horizon": "day"},
+        {"cap_factor": Decimal(0)},
+        {"cap_factor": Decimal("-0.5")},
+        {"cap_factor": Decimal("1.5")},
+        {"horizon_exposure_usd": Decimal("-1")},
+        {"horizon_cap_usd": Decimal("-1")},
+    ],
+)
+def test_a_malformed_gate_fails_loudly(bad):
+    with pytest.raises(ValueError):
+        ResearchGate(**{"pick_side": "long", **bad})

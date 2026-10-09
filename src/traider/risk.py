@@ -30,6 +30,10 @@ from traider.timeutil import trading_date
 
 _Reject = Callable[[str, str], None]
 
+_POSTURES = frozenset({"trade", "reduced", "stand_aside"})
+_PICK_SIDES = frozenset({None, "long", "bearish"})
+_HORIZONS = frozenset({"intraday", "swing"})
+
 
 @dataclass(frozen=True, slots=True)
 class SessionView:
@@ -51,6 +55,21 @@ class ResearchGate:
     horizon_cap_usd: Decimal | None = None  # None: no horizon budget
     cap_factor: Decimal = Decimal(1)  # order and position caps are multiplied by this
     intraday_closing: bool = False  # inside the window where intraday positions are sold
+
+    def __post_init__(self) -> None:
+        # The engine builds this, so a typo must fail loudly rather than mean "trade".
+        if self.posture not in _POSTURES:
+            raise ValueError(f"unknown posture {self.posture!r}")
+        if self.pick_side not in _PICK_SIDES:
+            raise ValueError(f"unknown pick_side {self.pick_side!r}")
+        if self.horizon not in _HORIZONS:
+            raise ValueError(f"unknown horizon {self.horizon!r}")
+        if not Decimal(0) < self.cap_factor <= Decimal(1):
+            raise ValueError(f"cap_factor must be in (0, 1], got {self.cap_factor}")
+        if self.horizon_exposure_usd < 0:
+            raise ValueError(f"negative horizon_exposure_usd {self.horizon_exposure_usd}")
+        if self.horizon_cap_usd is not None and self.horizon_cap_usd < 0:
+            raise ValueError(f"negative horizon_cap_usd {self.horizon_cap_usd}")
 
 
 @dataclass(frozen=True, slots=True)
