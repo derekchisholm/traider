@@ -1,6 +1,14 @@
 from datetime import UTC, date, datetime, timedelta
 
-from traider.timeutil import ET, ManualClock, SystemClock, trading_date
+import pytest
+
+from traider.timeutil import (
+    ET,
+    ManualClock,
+    SystemClock,
+    trades_without_settling,
+    trading_date,
+)
 
 
 def test_trading_date_uses_new_york_calendar_not_utc():
@@ -34,3 +42,21 @@ def test_system_clock_returns_aware_utc_now():
     now = SystemClock().now()
     assert now.tzinfo is not None
     assert abs(now - datetime.now(UTC)) < timedelta(seconds=5)
+
+
+@pytest.mark.parametrize(
+    ("day", "expected"),
+    [
+        (date(2026, 10, 12), True),  # Columbus Day: second Monday of October
+        (date(2026, 10, 5), False),  # the first Monday is an ordinary day
+        (date(2026, 10, 13), False),
+        (date(2026, 11, 11), True),  # Veterans Day, a Wednesday
+        (date(2027, 11, 11), True),  # a Thursday
+        (date(2028, 11, 10), False),  # 2028-11-11 is a Saturday: banks open on the Friday
+        (date(2029, 11, 12), True),  # 2029-11-11 is a Sunday: banks closed on the Monday
+        (date(2029, 11, 11), False),
+        (date(2026, 7, 3), False),  # markets are closed anyway; nothing to carry
+    ],
+)
+def test_days_the_market_trades_but_nothing_settles(day, expected):
+    assert trades_without_settling(day) is expected

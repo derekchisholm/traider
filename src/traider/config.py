@@ -53,6 +53,9 @@ class RiskLimits(BaseModel):
     min_price: PositiveDecimal = Decimal(5)
     max_spread_bps: PositiveDecimal = Decimal(20)
     max_quote_age_s: PositiveFloat = 15.0
+    # ...and how far behind the market's own timestamp on the quote may be. Catches a
+    # frozen or halted quote that keeps arriving. Quiet symbols may need this raised.
+    max_quote_lag_s: PositiveFloat = 120.0
     max_feed_silence_s: PositiveFloat = 30.0
     max_limit_deviation_bps: PositiveDecimal = Decimal(100)
 

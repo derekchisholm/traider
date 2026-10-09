@@ -257,9 +257,23 @@ async def test_expired_access_token_is_refreshed_and_the_request_repeated(client
     assert len(schwab.calls("POST", "/v1/oauth/token")) == 2
 
 
-async def test_order_after_an_expired_token_is_placed_exactly_once(client, schwab):
+async def test_an_order_refused_for_its_token_is_reported_unsent_and_never_sent_again(
+    client, schwab
+):
     await client.account_numbers()
     schwab.expire_access_tokens()
+    with pytest.raises(SchwabUnavailable) as caught:
+        await client.place_order(ACCOUNT_HASH, ORDER)
+    assert (caught.value.status, caught.value.sent) == (401, False)
+    assert len(schwab.calls("POST", f"/trader/v1/accounts/{ACCOUNT_HASH}/orders")) == 1
+    assert schwab.orders == {}
+
+
+async def test_the_next_order_after_a_refused_token_uses_a_new_one(client, schwab):
+    await client.account_numbers()
+    schwab.expire_access_tokens()
+    with pytest.raises(SchwabUnavailable):
+        await client.place_order(ACCOUNT_HASH, ORDER)
     await client.place_order(ACCOUNT_HASH, ORDER)
     assert len(schwab.orders) == 1
 
@@ -345,3 +359,11 @@ async def test_client_requests_go_through_the_limiter(schwab, signed_in):
         for _ in range(3):
             await limited.account_numbers()
     assert clock.slept == [pytest.approx(60.0)]
+
+
+async def test_order_id_is_found_however_the_header_name_is_spelled(client, monkeypatch):
+    async def reply(*_args, **_kwargs):
+        return 201, {"location": "https://api.schwabapi.com/trader/v1/accounts/H/orders/4455"}, ""
+
+    monkeypatch.setattr(client, "_request", reply)
+    assert await client.place_order(ACCOUNT_HASH, ORDER) == "4455"

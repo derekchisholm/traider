@@ -20,10 +20,20 @@ NOW = datetime(2026, 10, 8, 15, 0, tzinfo=UTC)
 LIMITS = RiskLimits()  # 500 / 1000 / 2000 USD, 20 orders, 20 bps spread, $5 min price
 
 
-def quote(bid="100.00", ask="100.02", *, age_s=1.0, delayed=False) -> Quote:
+def quote(
+    bid="100.00", ask="100.02", *, age_s=1.0, delayed=False, halted=False, market_age_s=None
+) -> Quote:
     seen = NOW - timedelta(seconds=age_s)
+    made = seen if market_age_s is None else NOW - timedelta(seconds=market_age_s)
     return Quote(
-        "SPY", Decimal(bid), Decimal(ask), Decimal(bid), ts=seen, received_at=seen, delayed=delayed
+        "SPY",
+        Decimal(bid),
+        Decimal(ask),
+        Decimal(bid),
+        ts=made,
+        received_at=seen,
+        delayed=delayed,
+        halted=halted,
     )
 
 
@@ -62,6 +72,7 @@ def ctx(**overrides) -> RiskContext:
         token_seconds_left=5 * 86400,
         seconds_since_last_order=None,
         unsettled_usd=Decimal(0),
+        committed_usd=Decimal(0),
     )
     return replace(base, **overrides)
 
@@ -175,6 +186,27 @@ def test_delayed_quotes_are_not_tradeable(order):
 @pytest.mark.parametrize("order", [buy(), sell(2)])
 def test_stale_quote_is_rejected(order):
     assert "quote_stale" in check(ctx(order=order, quote=quote(age_s=16), **holding(5))).codes
+
+
+@pytest.mark.parametrize("order", [buy(), sell(2)])
+def test_a_halted_security_is_not_traded(order):
+    context = ctx(order=order, quote=quote(halted=True), **holding(5))
+    assert "halted" in check(context).codes
+
+
+@pytest.mark.parametrize("order", [buy(), sell(2)])
+def test_a_quote_just_received_but_made_long_ago_is_stale(order):
+    # Fetched a second ago, but the market last updated it five minutes ago.
+    context = ctx(order=order, quote=quote(market_age_s=300), **holding(5))
+    assert "quote_stale" in check(context).codes
+
+
+def test_a_quote_made_within_the_allowed_lag_is_accepted():
+    assert check(ctx(quote=quote(market_age_s=120))).allowed
+
+
+def test_a_quote_stamped_slightly_ahead_of_our_clock_is_accepted():
+    assert check(ctx(quote=quote(market_age_s=-3))).allowed
 
 
 def test_quote_at_the_age_limit_is_still_accepted():
@@ -301,6 +333,27 @@ def test_unknown_cash_blocks_buys_by_default():
 def test_cash_check_can_be_turned_off():
     limits = RiskLimits(require_cash=False)
     assert check(ctx(account=account(cash=None)), limits).allowed
+
+
+def test_cash_already_promised_to_other_buys_cannot_be_spent_twice():
+    # 300 on hand, 200 of it promised to a buy still on its way; this one needs 200.10.
+    context = ctx(account=account(cash="300"), committed_usd=Decimal("200"))
+    assert check(context).codes == {"cash"}
+
+
+def test_cash_left_after_other_buys_can_be_spent():
+    assert check(ctx(account=account(cash="500"), committed_usd=Decimal("200"))).allowed
+
+
+def test_promised_cash_and_unsettled_cash_both_count_against_a_buy():
+    context = ctx(
+        account=account(cash="500"), committed_usd=Decimal("150"), unsettled_usd=Decimal("150")
+    )
+    assert check(context).codes == {"unsettled_cash"}  # 200 free, 200.10 needed
+
+
+def test_promised_cash_never_blocks_an_exit():
+    assert check(ctx(order=sell(5), committed_usd=Decimal("99999"), **holding(5))).allowed
 
 
 # --- settled cash ----------------------------------------------------------------

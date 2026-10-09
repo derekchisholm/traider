@@ -214,3 +214,15 @@ async def test_find_order_prefers_the_most_recent_match(market):
     second = await broker.place(market_order(Side.BUY, 2))
     found = await broker.find_order("SPY", Side.BUY, 2, T0 - timedelta(seconds=5))
     assert found.order_id == second
+
+
+async def test_an_order_left_resting_before_a_restart_reads_as_cancelled(market):
+    store = MemoryStateStore("paper")
+    first = PaperBroker(market, ManualClock(T0), starting_cash=Decimal(1000), store=store)
+    order_id = await first.place(limit(Side.BUY, 2, "90.00"))  # rests: far below the market
+    restarted = PaperBroker(market, ManualClock(T0), starting_cash=Decimal(1000), store=store)
+    await restarted.load()
+    order = await restarted.get_order(order_id)
+    assert (order.status, order.filled_quantity) == (OrderStatus.CANCELED, 0)
+    await restarted.cancel(order_id)  # and cancelling it is not an error
+    assert (await restarted.get_account()).cash_available == Decimal(1000)

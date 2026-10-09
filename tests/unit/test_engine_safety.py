@@ -145,6 +145,47 @@ async def test_shutdown_releases_the_lease_for_the_next_instance(tmp_path):
     assert follower.engine.is_leader is True
 
 
+async def test_a_standby_leaves_the_leaders_working_order_alone(tmp_path):
+    quick = {"order_timeout_s": 10}
+    leader = await Harness.create(tmp_path, instance="bot-1", config=quick)
+    leader.broker.hold_fills = True
+    await leader.target("SPY", 3)
+    standby = await Harness.create(tmp_path, restart_of=leader, instance="bot-2", config=quick)
+    await standby.run_for(15)  # past the order timeout, inside the leader's lease
+    assert standby.engine.is_leader is False
+    assert standby.broker.cancelled == []
+    await standby.engine.shutdown()
+    assert standby.broker.cancelled == []
+    assert await leader.store.open_orders() != []  # and the leader's record is still there
+
+
+async def test_a_standby_that_takes_over_picks_up_the_orders_left_behind(tmp_path):
+    quick = {"order_timeout_s": 10}
+    leader = await Harness.create(tmp_path, instance="bot-1", config=quick)
+    leader.broker.hold_fills = True
+    await leader.target("SPY", 3)
+    standby = await Harness.create(tmp_path, restart_of=leader, instance="bot-2", config=quick)
+    await standby.run_for(50)  # the leader is gone; its lease runs out
+    assert standby.engine.is_leader is True
+    assert standby.broker.cancelled == ["P1"]  # the stale order is managed, not duplicated
+    assert standby.broker.calls["place"] == 1
+
+
+async def test_no_order_goes_out_once_the_lease_has_run_out_mid_step(h):
+    slow = h.broker.get_open_orders
+
+    async def stalled():
+        h.clock.advance(31)  # the broker call hangs for longer than the lease lasts
+        return await slow()
+
+    h.broker.get_open_orders = stalled
+    await h.target("SPY", 3)
+    assert h.broker.calls["place"] == 0
+    h.broker.get_open_orders = slow
+    await h.settle(20)  # lease renewed: now it may trade
+    assert h.position() == 3
+
+
 async def test_no_trading_when_the_lease_cannot_be_checked(h, monkeypatch):
     async def broken(*_args, **_kwargs):
         raise RuntimeError("dynamodb unreachable")
@@ -403,6 +444,76 @@ async def test_yesterdays_sales_have_settled_by_the_next_session(tmp_path):
     assert second.position() == 4
 
 
+async def test_fridays_sales_are_still_unsettled_on_a_monday_when_banks_are_shut(tmp_path):
+    friday = datetime(2026, 10, 9, 15, 0, tzinfo=UTC)
+    first = await Harness.create(tmp_path, cash="500", start=friday)
+    await bought(first, 4)
+    await sold_everything(first)
+
+    first.clock.advance(3 * 24 * 3600)  # Monday 12 October 2026, Columbus Day
+    monday = await Harness.create(tmp_path, restart_of=first)
+    await monday.target("SPY", 4)
+    await monday.run_for(30)
+    assert monday.position() == 0
+    assert (await monday.events("order_blocked"))[-1]["data"]["codes"] == ["unsettled_cash"]
+
+    first.clock.advance(24 * 3600)  # Tuesday: settled
+    tuesday = await Harness.create(tmp_path, restart_of=monday)
+    await tuesday.target("SPY", 4)
+    await tuesday.settle()
+    assert tuesday.position() == 4
+
+
+async def test_a_sale_that_could_not_be_saved_is_saved_once_the_store_is_back(
+    tmp_path, monkeypatch
+):
+    h = await Harness.create(tmp_path, cash="350")
+    await bought(h, 3)
+    working = h.store.add_sold
+
+    async def broken(day, amount):
+        raise RuntimeError("state store down")
+
+    monkeypatch.setattr(h.store, "add_sold", broken)
+    await sold_everything(h)
+    assert await sold_today(h) == 0
+    monkeypatch.setattr(h.store, "add_sold", working)
+    await h.run_for(15)
+    assert await sold_today(h) == Decimal("300.00")
+    await h.run_for(30)
+    assert await sold_today(h) == Decimal("300.00")  # and only once
+
+
+async def test_a_halt_that_could_not_be_saved_is_saved_once_the_store_is_back(h, monkeypatch):
+    await bought(h, 5)
+    working = h.store.halt_day
+
+    async def broken(day, reason):
+        raise RuntimeError("state store down")
+
+    monkeypatch.setattr(h.store, "halt_day", broken)
+    h.price("SPY", "79.00", "79.02")
+    await h.run_for(40)
+    assert (await h.store.get_day("2026-10-08")).halted_reason is None
+    monkeypatch.setattr(h.store, "halt_day", working)
+    await h.run_for(15)
+    assert (await h.store.get_day("2026-10-08")).halted_reason is not None
+
+
+async def test_yesterdays_unfilled_wish_is_not_acted_on_before_the_strategy_speaks(tmp_path):
+    h = await Harness.create(tmp_path)
+    h.auth_seconds_left = 1800  # something blocks the buy all day
+    await h.target("SPY", 3)
+    await h.run_for(30)
+    h.auth_seconds_left = None
+    h.clock.advance(24 * 3600)  # Friday, same time: the block is gone
+    await h.run_for(30)
+    assert h.broker.calls["place"] == 0
+    await h.target("SPY", 3)  # the strategy says so again, today
+    await h.settle()
+    assert h.position() == 3
+
+
 async def test_a_margin_account_can_turn_the_settled_cash_rule_off(tmp_path):
     h = await Harness.create(tmp_path, cash="500", risk={"settled_cash_only": False})
     await bought(h, 4)
@@ -429,6 +540,43 @@ async def test_a_sale_the_bot_never_saw_confirmed_still_counts(h):
     await h.settle()
     assert h.position() == 0
     assert await sold_today(h) == Decimal("299.85")  # 3 at the limit price it was sent with
+
+
+async def test_two_buys_in_one_step_cannot_both_spend_the_same_cash(tmp_path):
+    h = await Harness.create(tmp_path, symbols=("SPY", "QQQ"), cash="1000")
+    h.broker.hold_fills = True
+    h.strategy.bar_targets += [Target("SPY", 6), Target("QQQ", 6)]  # about 600 each
+    h.bar("SPY")
+    await h.engine.step()
+    await h.run_for(10)
+    assert [o.symbol for o in h.broker.placed] == ["SPY"]
+    (blocked,) = await h.events("order_blocked")
+    assert (blocked["data"]["symbol"], blocked["data"]["codes"]) == ("QQQ", ["cash"])
+
+
+async def test_a_buy_does_not_spend_cash_a_fill_is_about_to_take(tmp_path):
+    h = await Harness.create(tmp_path, symbols=("SPY", "QQQ"), cash="1000")
+    stale = await h.broker.get_account()
+    await h.target("SPY", 6)
+    h.broker.frozen_account = stale  # the fill happened; the account has not caught up
+    await h.target("QQQ", 6)
+    await h.run_for(20)
+    assert h.broker.calls["place"] == 1  # the second buy was never even sent
+
+
+async def test_a_sale_still_working_already_counts_as_unsettled(tmp_path):
+    h = await Harness.create(
+        tmp_path, symbols=("SPY", "QQQ"), cash="1000", config={"order_timeout_s": 600}
+    )
+    await bought(h, 9)  # leaves 99.82
+    h.broker.hold_fills = True
+    await h.target("SPY", 0)
+    (resting,) = await h.broker.get_open_orders()
+    h.broker.fill_part(resting.order_id, 5)  # 500 comes in; the sell keeps working
+    await h.target("QQQ", 4)  # about 400: only possible with the sale's money
+    await h.run_for(40)
+    assert [o.symbol for o in h.broker.placed if o.side is Side.BUY] == ["SPY"]
+    assert "unsettled_cash" in (await h.events("order_blocked"))[-1]["data"]["codes"]
 
 
 async def test_a_buy_the_bot_never_saw_confirmed_is_not_mistaken_for_a_sale(h):

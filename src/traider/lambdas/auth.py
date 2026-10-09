@@ -154,15 +154,17 @@ class AuthApp:
     # --------------------------------------------------------------- /callback
 
     def _callback(self, query: Mapping[str, str]) -> dict[str, Any]:
-        if query.get("error"):
-            detail = f"{query['error']} {query.get('error_description', '')}".strip()[:300]
-            return message(400, "Schwab did not complete the sign-in", f"Schwab said: {detail}")
+        # State first: without ours, nothing in the request came from a sign-in we started,
+        # and none of it is shown.
         if not self._state_ok(query.get("state")):
             return message(
                 400,
                 "This sign-in link has expired",
                 "Open the sign-in link again and complete the Schwab login within ten minutes.",
             )
+        if query.get("error"):
+            detail = f"{query['error']} {query.get('error_description', '')}".strip()[:300]
+            return message(400, "Schwab did not complete the sign-in", f"Schwab said: {detail}")
         code = query.get("code")
         if not code:
             return message(400, "No authorization code", "Schwab did not send a code. Start again.")

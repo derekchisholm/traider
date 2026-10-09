@@ -9,7 +9,7 @@ from traider.broker.base import AmbiguousOrder, BrokerError, BrokerUnavailable, 
 from traider.models import AccountSnapshot, BrokerOrder, OrderRequest, Side
 from traider.schwab.client import SchwabClient, SchwabError, SchwabRejected, SchwabUnavailable
 from traider.schwab.orders import build_equity_order
-from traider.schwab.parse import ParseError, parse_account, parse_order
+from traider.schwab.parse import ParseError, parse_account, parse_order, parse_order_tree
 from traider.timeutil import Clock
 
 log = logging.getLogger(__name__)
@@ -17,8 +17,9 @@ log = logging.getLogger(__name__)
 
 class SchwabBroker:
     #: How far back to look for open orders. The bot only places day orders, but an
-    #: order somebody left open on one of its symbols should still block it.
-    OPEN_ORDER_LOOKBACK = timedelta(days=3)
+    #: order somebody left open on one of its symbols should still block it, and a
+    #: good-till-cancelled order can rest for about six months.
+    OPEN_ORDER_LOOKBACK = timedelta(days=185)
     #: Search a little past "now" so an order entered this instant is not missed to
     #: timestamp rounding or a small clock difference.
     SEARCH_AHEAD = timedelta(minutes=1)
@@ -158,7 +159,7 @@ class SchwabBroker:
         account_hash = await self._account_hash()
         try:
             raw = await self._client.orders(account_hash, start, end)
-            return [parse_order(item) for item in raw]
+            return [order for item in raw for order in parse_order_tree(item)]
         except SchwabUnavailable as exc:
             raise BrokerUnavailable(str(exc)) from None
         except (SchwabError, ParseError) as exc:

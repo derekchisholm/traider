@@ -137,14 +137,26 @@ class PaperBroker:
         await self._evaluate(order_id)
         return order_id
 
+    def _lost_in_a_restart(self, order_id: str) -> bool:
+        """Resting orders are not saved. An id this broker once issued but no longer
+        knows belonged to an order that was resting when the process stopped."""
+        number = order_id.removeprefix("P")
+        return order_id.startswith("P") and number.isdigit() and int(number) < self._next_id
+
     async def get_order(self, order_id: str) -> BrokerOrder:
         if order_id not in self._orders:
+            if self._lost_in_a_restart(order_id):
+                return BrokerOrder(
+                    order_id, "", Side.BUY, 0, 0, OrderStatus.CANCELED, raw_status="CANCELED"
+                )
             raise BrokerError(f"unknown paper order {order_id}")
         await self._evaluate(order_id)
         return self._orders[order_id][1]
 
     async def cancel(self, order_id: str) -> None:
         if order_id not in self._orders:
+            if self._lost_in_a_restart(order_id):
+                return
             raise BrokerError(f"unknown paper order {order_id}")
         request, order = self._orders[order_id]
         if not order.status.is_terminal:

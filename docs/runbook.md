@@ -25,8 +25,11 @@ every 10 seconds. It can read the value but has no permission to change it.
 | `live` | yes | yes | Only in a stack deployed with `tradingMode: live`. |
 
 `paper` in a live stack, or `live` in a paper stack, trades nothing and raises an
-alert. A missing or misspelled value counts as `halt`, and so does a switch the bot
-has been unable to read for a minute.
+alert. A switch the bot has been unable to read for a minute counts as `halt`.
+
+**AWS refuses a misspelled value** (`Halt`, `stop`) and the switch keeps its old
+value, which may be `live`. Read the command's output, then confirm with
+`get-parameter`. The AWS CLI must be using the stack's account and region.
 
 ```sh
 CONTROL=$(pulumi stack output controlParameter)       # /traider-dev/control
@@ -39,6 +42,11 @@ aws ssm put-parameter --name "$CONTROL" --value live --overwrite
 
 A deploy never changes the switch. A new paper stack starts at `paper`; a new live
 stack starts at `halt`.
+
+The bot acts on a change normally within 10 to 15 seconds, longer if Schwab or AWS
+is slow. Cancelling working orders needs a working Schwab sign-in, and an order
+whose placement reply was lost cannot be cancelled by the bot at all: after a
+`halt`, look at Schwab's order list yourself.
 
 **`halt` does not sell anything.** There is no "sell everything now" command. To get
 out of positions in a hurry: set `halt`, then sell at Schwab yourself. Leave the
@@ -56,8 +64,8 @@ pulumi stack output reauthUrl --show-secrets
 ```
 
 Open the link, log in at Schwab, approve access for the account the bot uses. You
-land on a page that says *Signed in* and when the sign-in expires. The bot picks the
-new sign-in up within a minute. You also get a *Schwab sign-in completed* alert: if
+land on a page that says *Signed in* and when the sign-in expires. A bot that was
+waiting picks the new sign-in up within a minute; one renewing early, within five. You also get a *Schwab sign-in completed* alert: if
 you ever receive one you did not cause, set the switch to `halt` and change your
 Schwab password.
 
@@ -71,8 +79,22 @@ What happens as expiry approaches:
 - When it lapses, the bot has no market data and cannot trade. **It cannot sell what
   it holds.** It alerts you and waits; nothing needs restarting after you sign in.
 
-If you would rather never hold positions through a lapse, set
-`traider:flattenBeforeCloseMin` so the bot is flat every evening.
+`traider:flattenBeforeCloseMin` makes the bot try to sell what it holds before each
+close, which shortens the time positions sit unattended. It is an attempt, not a
+guarantee: it uses ordinary orders, needs everything an ordinary sell needs (quotes,
+the lease, a sign-in, a switch that allows sells), and raises no alert if shares are
+left. Check positions after the close.
+
+### Nights, weekends and restarts
+
+Nothing is sold when the task stops at 16:30, on a deploy or on a restart. Working
+orders are cancelled on the way down if Schwab can be reached; positions stay, with
+no bot watching and no stop order at the broker. In the morning the bot reads the
+positions from Schwab and waits for the strategy to say what it wants today.
+
+A restart forgets what was only in memory: a frozen symbol, a strategy error,
+cooldowns, and which alerts were sent in the last 15 minutes. The day's order
+count, loss halt and sales total are kept.
 
 ### If Schwab will not accept the hosted callback
 
@@ -112,17 +134,19 @@ once every 15 minutes.
 | Schwab sign-in has expired | From the daily watchdog. | Sign in. Check positions at Schwab. |
 | Schwab sign-in completed | A new sign-in was stored. | Nothing, unless it was not you: `halt`, change your Schwab password. |
 | Schwab sign-in restored | The bot is connected again. | Nothing. |
-| Cannot reach Schwab sign-in | Token requests have failed for five minutes. | Usually Schwab or the network. Check the logs if it persists. |
+| Cannot reach Schwab sign-in | For five minutes, token requests have failed or the stored key or sign-in could not be read. | Usually Schwab or the network. Check the logs if it persists. |
+| Cannot read the Schwab sign-in | From the daily watchdog: the stored sign-in is unreadable. | Sign in again; that replaces it. |
+| The bot's task stopped unexpectedly | The container crashed or could not start. Comes from AWS, not from the bot. | ECS restarts it. If it repeats, read the logs; a bad deploy shows up here at the next 09:00 start. |
 | traider started in LIVE mode | A live task started. | Expected after a deploy or the morning start. |
 | Control does not match deploy | The switch says `paper` in a live stack, or `live` in a paper one. | Set the switch to the deployed mode, or to `halt`. |
-| Daily loss limit hit | Equity is down by more than `max_daily_loss_usd` since the day's first reading. | No new buys today. Positions are untouched: decide yourself whether to exit. |
+| Daily loss limit hit | The whole account's value is down by more than `max_daily_loss_usd` since the day's first reading (around 09:00). Other holdings and withdrawals count. | No new buys today. Positions are untouched: decide yourself whether to exit. |
 | A sale could not be valued | The broker reported a fill with no price. | No new buys today. Check the fill at Schwab. |
 | Broker rejected an order on X | Schwab refused the order. | Read the reason. The bot retries after a minute while the strategy still wants the trade; `halt` if it keeps happening. |
 | Order on X may or may not have gone through | The reply to an order was lost. | Usually resolves itself: the bot looks the order up and does not resend. Check Schwab's order list if you get no follow-up. |
-| X frozen: position mismatch | The account does not show what a confirmed fill should have produced. | The bot stops trading X. Reconcile the position at Schwab, then restart the bot. |
-| Open order on X the bot did not place | Somebody else's order is open on a symbol the bot trades. | Cancel it or let it finish. The bot stays out of X meanwhile. |
-| Order on X is not finishing / Cannot read order status for X | An order has been open for five minutes, or its status cannot be read. | Look at the order at Schwab. Cancel it there if needed. |
-| Strategy error | The strategy raised an exception. | Buys are off until restart; exits work. Fix the strategy and deploy. |
+| X frozen: position mismatch | The account does not show what a confirmed fill should have produced. | The bot stops trading X, but only until its next restart, and the schedule restarts it every morning. Set `halt` until you have reconciled the position at Schwab. |
+| Open order on X the bot did not place | Somebody else's order is open on a symbol the bot trades. It is only noticed when the bot wants to trade X. | Cancel it or let it finish. The bot stays out of X meanwhile, sells included. With `cancelUnknownOrders` on, the bot cancels such orders itself, yours too. |
+| Order on X is not finishing / Cannot read order status for X | An order has been open for five minutes, or its status has been unreadable for about 30 seconds. | Look at the order at Schwab. Cancel it there if needed. |
+| Strategy error | The strategy raised an exception. | Buys are off until the next restart, which the schedule does every morning. Set `close_only` or `halt`, fix the strategy and deploy. |
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
 
@@ -157,7 +181,9 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `unknown_order`, `symbol_frozen`, `entries_halted` | See the matching alerts above. |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
-restarts. To start it over, delete it and restart the bot:
+restarts. To start it over, set `halt`, delete it and restart the bot. If the old
+account was worth more than the new starting cash, the day's loss limit trips at
+once; that clears the next day.
 
 ```sh
 aws dynamodb delete-item --table-name "$(pulumi stack output stateTable)" \
@@ -214,16 +240,19 @@ Before you switch:
 - [ ] Alerts reach you, on a device you will have with you.
 - [ ] You know how to set `halt` from your phone.
 
-Then:
+Then, switch first:
 
 ```sh
+aws ssm put-parameter --name "$(pulumi stack output controlParameter)" --value halt --overwrite
+aws ssm get-parameter --name "$(pulumi stack output controlParameter)" --query Parameter.Value --output text
 pulumi config set traider:tradingMode live
 pulumi config set traider:accountLast4 1234     # last four digits of the account
 pulumi up
 ```
 
-The bot restarts in live mode and does nothing: the switch still says `paper`, which
-does not match. You get a *Control does not match deploy* alert. When you are ready:
+A deploy never touches the switch, so whatever it said before, it says now: that is
+why it goes to `halt` first. The bot restarts in live mode and does nothing. When
+you are ready:
 
 ```sh
 aws ssm put-parameter --name "$(pulumi stack output controlParameter)" --value live --overwrite
@@ -232,7 +261,8 @@ aws ssm put-parameter --name "$(pulumi stack output controlParameter)" --value l
 Start with limits small enough that the worst day is an amount you would shrug at.
 Watch the first orders at Schwab as they happen.
 
-To go back to paper, set the switch to `halt`, change `tradingMode` back and deploy.
+To go back to paper, set the switch to `halt`, change `tradingMode` back, deploy,
+then set the switch to `paper`.
 
 ## First-deploy problems
 
@@ -252,8 +282,8 @@ Nobody has run this deployment yet, so expect a few of these.
 - **No alert emails.** Confirm the SNS subscription from the email AWS sent, and
   check spam.
 - **`traider check` fails on sign-in.** The app is probably still *Approved -
-  Pending*, the callback registered with Schwab differs by a character from
-  `callbackUrl`, or the key and secret were pasted with a stray space.
+  Pending*, or the callback registered with Schwab differs by a character from
+  `callbackUrl`.
 - **`traider check` fails on quotes with "delayed".** The account or app lacks
   real-time market data. The bot will not trade on delayed quotes.
 - **Sign-in page says the link has expired.** Complete the Schwab login within ten

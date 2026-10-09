@@ -133,11 +133,11 @@ async def run_backtest(
     await engine.start()
 
     half_spread = spread_bps / BPS / 2
-    last_close: dict[str, Decimal] = {}
+    closes: dict[str, Decimal] = {}  # only the symbols that printed a bar this minute
 
     def publish_quotes() -> None:
         now = clock.now()
-        for symbol, close in last_close.items():
+        for symbol, close in closes.items():
             edge = close * half_spread
             market.on_quote(
                 Quote(symbol, close - edge, close + edge, close, ts=now, received_at=now)
@@ -150,9 +150,10 @@ async def run_backtest(
         moment = in_session[index].start
         clock.set(moment + _MINUTE)  # the bar is known once its minute has closed
         days.add(trading_date(clock.now()).isoformat())
+        closes.clear()  # a symbol with no bar gets no fresh quote, so it cannot trade
         while index < len(in_session) and in_session[index].start == moment:
             bar = in_session[index]
-            last_close[bar.symbol] = bar.close
+            closes[bar.symbol] = bar.close
             market.on_bar(bar)
             index += 1
         publish_quotes()

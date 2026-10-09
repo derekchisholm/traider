@@ -47,3 +47,24 @@ def _require_aware(when: datetime) -> datetime:
 def trading_date(when: datetime) -> date:
     """The New York calendar date, which is what a 'trading day' means for US equities."""
     return when.astimezone(ET).date()
+
+
+def trades_without_settling(day: date) -> bool:
+    """True on the two days a year when US stock markets are open but banks are shut,
+    so nothing settles: Columbus Day (second Monday of October) and Veterans Day
+    (11 November, or the Monday after when that is a Sunday). Money from a sale on
+    the trading day before is still unsettled on such a day."""
+    if day.month == 10:
+        return day.weekday() == 0 and 8 <= day.day <= 14
+    if day.month == 11:
+        if day.day == 11:
+            return day.weekday() < 5
+        return day.day == 12 and day.weekday() == 0
+    return False
+
+
+def previous_weekday(day: date) -> date:
+    day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day

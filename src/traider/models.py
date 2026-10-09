@@ -54,6 +54,7 @@ class Quote:
     ts: datetime  # exchange quote time when the feed gives one
     received_at: datetime  # when this process saw it
     delayed: bool = False
+    halted: bool = False  # the broker says the security is not trading normally
 
     @property
     def mid(self) -> Decimal:

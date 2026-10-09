@@ -113,6 +113,11 @@ def load() -> Settings:
     if architecture not in ("ARM64", "X86_64"):
         raise ValueError("traider:cpuArchitecture must be ARM64 or X86_64")
 
+    start_time = _time(config, "startTime", "09:00")
+    stop_time = _time(config, "stopTime", "16:30")
+    if stop_time <= start_time:
+        raise ValueError("traider:stopTime must be later in the day than traider:startTime")
+
     return Settings(
         prefix=prefix,
         trading_mode=mode,
@@ -121,8 +126,8 @@ def load() -> Settings:
         alert_email=alert_email,
         callback_url=config.get("schwabCallbackUrl"),
         always_on=bool(config.get_bool("alwaysOn")),
-        start_time=_time(config, "startTime", "09:00"),
-        stop_time=_time(config, "stopTime", "16:30"),
+        start_time=start_time,
+        stop_time=stop_time,
         cpu_architecture=architecture,
         image=config.get("image"),
         log_retention_days=config.get_int("logRetentionDays") or 30,

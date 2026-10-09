@@ -17,6 +17,7 @@ Nothing in here logs or raises a token or the app secret.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -156,7 +157,7 @@ def _token_request(
             status=exc.code,
             rejected=rejected,
         ) from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         raise OAuthError(f"token request ({grant}) could not reach Schwab: {reason}") from None
     try:

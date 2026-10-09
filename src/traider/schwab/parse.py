@@ -157,6 +157,20 @@ def parse_order(raw: Any) -> BrokerOrder:
     )
 
 
+def parse_order_tree(raw: Any) -> list[BrokerOrder]:
+    """An order and every order nested under it. Brackets and one-cancels-other orders
+    keep their working legs in ``childOrderStrategies``; each of them is an open order
+    on its symbol and must be seen as one."""
+    parent = parse_order(raw)
+    found = [parent]
+    children = _mapping(raw).get("childOrderStrategies")
+    for number, child in enumerate(children if isinstance(children, list) else [], start=1):
+        entry = dict(_mapping(child))
+        entry.setdefault("orderId", f"{parent.order_id}/{number}")
+        found.extend(parse_order_tree(entry))
+    return found
+
+
 def _average_fill_price(order: Mapping[str, Any]) -> Decimal | None:
     """Quantity-weighted price over real executions. Cancel records carry a zero price
     and must not be averaged in."""
@@ -187,14 +201,18 @@ def parse_quotes(raw: Any, received_at: datetime) -> dict[str, Quote]:
         if bid is None or ask is None:
             continue
         last = _decimal(fields.get("lastPrice"))
+        times = [t for t in map(_from_ms, (fields.get("quoteTime"), fields.get("tradeTime"))) if t]
+        status = fields.get("securityStatus")
         quotes[symbol] = Quote(
             symbol=symbol,
             bid=bid,
             ask=ask,
             last=last if last is not None else bid,
-            ts=_from_ms(fields.get("quoteTime")) or received_at,
+            ts=max(times) if times else received_at,
             received_at=received_at,
-            delayed=entry.get("realtime") is False,
+            # Only an explicit "realtime: true" counts. Anything else is not trusted.
+            delayed=entry.get("realtime") is not True,
+            halted=status is not None and status != "Normal",
         )
     return quotes
 

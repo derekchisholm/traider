@@ -256,6 +256,7 @@ class TokenManager:
     RELOAD_OK_S = 300.0  # how often to look for a newer sign-in while all is well
     RELOAD_WAITING_S = 30.0  # ...and while waiting for one
     RETRY_TEMPORARY_S = 30.0
+    MIN_REPLACE_S = 30.0  # a token the API rejects is replaced at most this often
     RETRY_REJECTED_S = 300.0
 
     def __init__(
@@ -279,6 +280,7 @@ class TokenManager:
         self._detail = "not started"
         self._retry_at = 0.0
         self._reload_at = 0.0
+        self._invalidated_at = float("-inf")
 
     # ---------------------------------------------------------------- public
 
@@ -315,9 +317,12 @@ class TokenManager:
     async def invalidate(self, token: str) -> None:
         """Call when the API answered 401 for ``token``. The next call fetches a new one."""
         async with self._lock:
-            if token == self._access:
-                self._access = None
-                self._access_expires_at = 0.0
+            now = self._now()
+            if token != self._access or now - self._invalidated_at < self.MIN_REPLACE_S:
+                return  # an old token, or one replaced moments ago: not the token's fault
+            self._invalidated_at = now
+            self._access = None
+            self._access_expires_at = 0.0
 
     async def poll(self) -> None:
         """Background upkeep: notice a new sign-in, keep the access token warm. Never raises."""

@@ -13,6 +13,7 @@ from traider.schwab.parse import (
     parse_candles,
     parse_market_hours,
     parse_order,
+    parse_order_tree,
     parse_quotes,
 )
 
@@ -297,6 +298,29 @@ def test_order_with_no_legs_parses_with_an_empty_symbol_so_it_blocks_nothing():
     assert parse_order(raw).symbol == ""
 
 
+def test_legs_of_a_bracket_or_one_cancels_other_order_are_listed_too():
+    stop = order(status="AWAITING_PARENT_ORDER", orderId=202)
+    target = order(status="WORKING", orderId=203)
+    parent = order(status="WORKING", orderId=201)
+    parent["orderLegCollection"] = []  # an OCO parent has no legs of its own
+    parent["orderStrategyType"] = "OCO"
+    parent["childOrderStrategies"] = [
+        stop,
+        {**target, "childOrderStrategies": [order(orderId=204)]},
+    ]
+    listed = parse_order_tree(parent)
+    assert [o.order_id for o in listed] == ["201", "202", "203", "204"]
+    assert [o.symbol for o in listed][1:] == ["SPY", "SPY", "SPY"]
+
+
+def test_a_child_order_without_an_id_is_still_listed():
+    parent = order(orderId=301)
+    child = order()
+    del child["orderId"]
+    parent["childOrderStrategies"] = [child]
+    assert [o.order_id for o in parse_order_tree(parent)] == ["301", "301/1"]
+
+
 # --- quotes ----------------------------------------------------------------------------------
 
 
@@ -333,6 +357,27 @@ def test_non_realtime_quote_is_marked_delayed():
     assert parse_quotes(payload, NOW)["AAPL"].delayed is True
 
 
+def test_quote_that_does_not_say_it_is_realtime_is_treated_as_delayed():
+    payload = quote_payload()
+    del payload["AAPL"]["realtime"]
+    assert parse_quotes(payload, NOW)["AAPL"].delayed is True
+
+
+@pytest.mark.parametrize(
+    ("status", "halted"), [("Normal", False), (None, False), ("Halted", True), ("Closed", True)]
+)
+def test_a_security_that_is_not_trading_normally_is_flagged(status, halted):
+    payload = quote_payload(securityStatus=status)
+    if status is None:
+        del payload["AAPL"]["quote"]["securityStatus"]
+    assert parse_quotes(payload, NOW)["AAPL"].halted is halted
+
+
+def test_quote_time_is_the_newer_of_the_last_quote_and_the_last_trade():
+    payload = quote_payload(quoteTime=1760972400000, tradeTime=1760972460000)
+    assert parse_quotes(payload, NOW)["AAPL"].ts == datetime.fromtimestamp(1760972460, UTC)
+
+
 def test_quote_without_a_bid_or_ask_is_skipped():
     payload = quote_payload()
     del payload["AAPL"]["quote"]["bidPrice"]
@@ -342,6 +387,7 @@ def test_quote_without_a_bid_or_ask_is_skipped():
 def test_quote_without_a_timestamp_uses_the_receive_time():
     payload = quote_payload()
     del payload["AAPL"]["quote"]["quoteTime"]
+    del payload["AAPL"]["quote"]["tradeTime"]
     assert parse_quotes(payload, NOW)["AAPL"].ts == NOW
 
 

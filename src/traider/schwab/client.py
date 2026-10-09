@@ -142,7 +142,7 @@ class SchwabClient:
         _, headers, _ = await self._request(
             "POST", f"/trader/v1/accounts/{account_hash}/orders", json_body=order, idempotent=False
         )
-        location = headers.get("Location", "")
+        location = {name.lower(): value for name, value in headers.items()}.get("location", "")
         order_id = location.rstrip("/").rsplit("/", 1)[-1]
         return order_id if order_id.isdigit() else None
 
@@ -235,9 +235,11 @@ class SchwabClient:
                 failure = SchwabUnavailable(f"{what}: {type(exc).__name__}", sent=True)
             else:
                 if status == 401:
-                    # Not processed. Get a new token and try once more, even for an order.
+                    # Refused for its token. Reads get a new token and one more try. An
+                    # order is never sent twice from here: the caller is told it was not
+                    # sent and decides again with fresh information.
                     await self._tokens.invalidate(token)
-                    if not reauthorised:
+                    if idempotent and not reauthorised:
                         reauthorised = True
                         attempt -= 1
                         continue
