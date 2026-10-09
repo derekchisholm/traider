@@ -1,0 +1,11 @@
+# Allow-list: nothing reaches the image build unless it is named here. That keeps
+# .env files, saved tokens, Pulumi state and the test suite out of the image.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+
+**/__pycache__/
+**/*.py[cod]
