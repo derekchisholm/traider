@@ -52,7 +52,7 @@ from traider.risk import Decision, ResearchGate, RiskContext, RiskManager
 from traider.session import SessionTracker
 from traider.settings import Settings
 from traider.settings_store import LiveSettings, SettingsUpdate
-from traider.state.base import DayState, StateStore
+from traider.state.base import DayState, LedgerEntry, StateStore
 from traider.strategy.base import Strategy, StrategyContext
 from traider.timeutil import Clock, previous_weekday, trades_without_settling, trading_date
 from traider.universe import compute_universe, root_symbol
@@ -115,6 +115,7 @@ class Engine:
     STUCK_ORDER_ALERT_S = 300.0
     BLOCK_LOG_INTERVAL_S = 60.0
     DAY_RETRY_S = 5.0
+    LEDGER_RETRY_S = 5.0
     HEARTBEAT_S = 2.0
     IDLE_TICK_S = 1.0
     MAX_OPTION_SYMBOLS = 20  # contracts tracked at once; each one is polled for quotes
@@ -161,6 +162,12 @@ class Engine:
         # Research picks and the day's posture. None: research is off and the old rules hold.
         self._research = research
         self._research_at: datetime | None = None
+        # The positions the bot opened itself. Only used with research on: then the bot
+        # trades what it opened (and pinned symbols) and leaves every other holding alone.
+        self._ledger: dict[str, LedgerEntry] = {}
+        self._ledger_ok = False
+        self._ledger_attempt_at: datetime | None = None
+        self._foreign: set[str] = set()  # held, not opened by the bot, not pinned
 
         # The equity symbols the bot trades right now: see _refresh_universe.
         self._on_universe = on_universe
@@ -214,6 +221,7 @@ class Engine:
         """Load today's counters. Open orders are picked up when the lease is won."""
         now = self._clock.now()
         await self._roll_day(now)
+        await self._load_ledger(now)
         if self._live_settings is not None:
             for update in self._live_settings.start_updates:
                 await self._on_settings(update, now)
@@ -300,6 +308,13 @@ class Engine:
                 self._settings_unreadable_reported = False
             for update in updates:
                 await self._on_settings(update, now)
+        if (
+            self._research is not None
+            and not self._ledger_ok
+            and _due(self._ledger_attempt_at, now, self.LEDGER_RETRY_S)
+            and await self._load_ledger(now)
+        ):
+            await self._refresh_universe(now)  # the bot's positions rejoin the universe
         if self._research is not None and _due(
             self._research_at, now, self._settings.research.poll_s
         ):
@@ -531,26 +546,111 @@ class Engine:
                     await self._warn_of_expiry(symbol, held.quantity, now)
         await self._settle_pending(account, now)
         await self._check_daily_loss(account, now)
+        await self._update_ledger(account, now)
         await self._refresh_universe(now)
         await self._report_unmanaged(account, now)
+
+    # ------------------------------------------------------------------ ledger
+
+    async def _load_ledger(self, now: datetime) -> bool:
+        """Read the positions the bot opened. Until this works there are no entries and
+        nothing counts as foreign: a missing ledger must not block the bot's own exits."""
+        if self._research is None:
+            return False
+        self._ledger_attempt_at = now
+        try:
+            self._ledger = dict(await self._state.ledger())
+        except Exception as exc:
+            self._ledger_ok = False
+            self._log_throttled(
+                "ledger",
+                now,
+                "position ledger unreadable, no entries: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        self._ledger_ok = True
+        return True
+
+    async def _update_ledger(self, account: AccountSnapshot, now: datetime) -> None:
+        """Forget positions the bot has closed, and spot holdings it did not open."""
+        if self._research is None or not self._ledger_ok:
+            return
+        for symbol in list(self._ledger):
+            st = self._symbols.get(symbol)
+            if account.position(symbol) != 0 or (st is not None and self._busy(st)):
+                continue
+            try:
+                await self._state.delete_ledger(symbol)
+            except Exception as exc:
+                # Kept in memory and retried on the next snapshot.
+                self._log_throttled(
+                    "ledger-delete", now, "could not clear %s from the ledger: %s", symbol, exc
+                )
+                continue
+            del self._ledger[symbol]
+        pinned = set(self._settings.pinned_symbols)
+        foreign = {
+            symbol: held.quantity
+            for symbol, held in account.positions.items()
+            if held.quantity != 0
+            and root_symbol(symbol) not in pinned
+            and symbol not in self._ledger
+        }
+        new = sorted(foreign.keys() - self._foreign)
+        self._foreign = set(foreign)  # flat (or pinned) again: no longer foreign
+        for symbol in new:
+            await self._event(
+                "unknown_holding", {"symbol": symbol, "quantity": foreign[symbol]}, now
+            )
+            await self._alerts.send(
+                f"unknown_holding:{symbol}",
+                f"{symbol} is held but the bot did not open it",
+                "The bot will not trade it, sells included. Use an account that is the "
+                "bot's alone.",
+            )
+
+    def _ledger_horizon(self, symbol: str) -> str:
+        entry = self._ledger.get(symbol)
+        return entry.horizon if entry is not None else "swing"
+
+    def _intraday_closing(self, now: datetime) -> bool:
+        """Inside the window before the close where intraday positions are sold."""
+        if self._research is None:
+            return False
+        view = self._session.view(now)
+        return (
+            view.is_open
+            and view.minutes_to_close is not None
+            and view.minutes_to_close <= self._settings.research.intraday_flatten_min
+        )
+
+    def _intraday_flatten(self, symbol: str, now: datetime) -> bool:
+        """An intraday position the bot opened, and the close is near: it is sold."""
+        entry = self._ledger.get(symbol)
+        return entry is not None and entry.horizon == "intraday" and self._intraday_closing(now)
 
     # ---------------------------------------------------------------- universe
 
     def _required_symbols(self) -> set[str]:
         """Roots that must stay in the universe: anything in it with an order working or
-        unsettled (or frozen), and anything in it the bot holds, shares or options."""
+        unsettled (or frozen), anything in it the bot holds, shares or options, and
+        everything in the bot's ledger (so a restart keeps positions whose pick expired).
+        Holdings the bot did not open are not required."""
         required = {
             root
             for symbol, st in self._symbols.items()
             if self._busy(st) and (root := root_symbol(symbol)) in self._universe
         }
+        required |= {root_symbol(symbol) for symbol in self._ledger}
         account = self._account
         if account is None:
             # Nothing is known to be flat before the first account read: drop nothing.
             return required | set(self._universe)
         for symbol, held in account.positions.items():
             root = root_symbol(symbol)
-            if held.quantity != 0 and root in self._universe:
+            if held.quantity != 0 and root in self._universe and symbol not in self._foreign:
                 required.add(root)
         return required
 
@@ -1135,6 +1235,8 @@ class Engine:
     def _effective_target(self, symbol: str, st: _SymbolState, now: datetime) -> int | None:
         if self._expiring_now(symbol, now):
             return 0  # whatever the strategy says: see _expiring_now
+        if self._intraday_flatten(symbol, now):
+            return 0  # whatever the strategy says: intraday positions are flat by the close
         if st.target is None:
             return None  # the strategy has said nothing: hands off
         return 0 if self._flatten_now(now) else st.target.quantity
@@ -1174,6 +1276,8 @@ class Engine:
         now = self._clock.now()
         if self._flatten_now(now) and side is Side.SELL:
             reason = "flatten before close"
+        if self._intraday_flatten(symbol, now) and side is Side.SELL:
+            reason = "intraday position: flatten before close"
         option = is_option_symbol(symbol)
         if option and self._expiring_now(symbol, now) and side is Side.SELL:
             reason = "option expires today"
@@ -1209,7 +1313,8 @@ class Engine:
             self._log_throttled(
                 "gate", now, "research gate failed, no entries: %s: %s", type(exc).__name__, exc
             )
-            gate = _NO_ENTRIES_GATE
+            # A holding the bot did not open stays untouched, gate or no gate.
+            gate = replace(_NO_ENTRIES_GATE, foreign=order.symbol in self._foreign)
         return self._risk.check(
             RiskContext(
                 now=now,
@@ -1244,11 +1349,24 @@ class Engine:
         pick = view.pick(root, now)
         level = view.level
         factor = s.reduced_factor if level is PostureLevel.REDUCED else Decimal(1)
+        entry = self._ledger.get(order.symbol)
+        if entry is not None:
+            horizon = entry.horizon
+        else:
+            horizon = pick.horizon.value if pick is not None else "swing"
+        share = s.intraday_share if horizon == "intraday" else 1 - s.intraday_share
+        account = self._account
+        held = self._exposure(account, horizon=horizon) if account is not None else Decimal(0)
         return ResearchGate(
             pick_side=pick.side.value if pick else None,
             pinned=root in self._settings.pinned_symbols,
             posture=level.value,
+            foreign=order.symbol in self._foreign,
+            horizon=horizon,
+            horizon_exposure_usd=held,
+            horizon_cap_usd=self._risk.limits.max_total_exposure_usd * share,
             cap_factor=factor,
+            intraday_closing=horizon == "intraday" and self._intraday_closing(now),
         )
 
     def _in_flight(self, side: Side, account: AccountSnapshot) -> Decimal:
@@ -1284,6 +1402,8 @@ class Engine:
     def _entries_halted(self, now: datetime) -> str | None:
         if self._live_settings is not None and not self._live_settings.loaded:
             return "settings not loaded"
+        if self._research is not None and not self._ledger_ok:
+            return "position ledger not loaded"
         if self._day.halted_reason:
             return self._day.halted_reason
         if self._equity_unknown:
@@ -1294,10 +1414,13 @@ class Engine:
             return "flattening before the close"
         return None
 
-    def _exposure(self, account: AccountSnapshot) -> Decimal:
-        """Value of what the bot holds, plus buys that are on their way."""
+    def _exposure(self, account: AccountSnapshot, *, horizon: str | None = None) -> Decimal:
+        """Value of what the bot holds, plus buys that are on their way. With ``horizon``,
+        only the symbols held under it (by their ledger entry; "swing" without one)."""
         total = Decimal(0)
         for symbol, st in list(self._symbols.items()):
+            if horizon is not None and self._ledger_horizon(symbol) != horizon:
+                continue
             held = account.positions.get(symbol)
             size = contract_size(symbol)
             quote = self._market.quote(symbol)
@@ -1397,6 +1520,8 @@ class Engine:
             st.hold_until = now + timedelta(seconds=self.PRETRADE_RETRY_S)
             return
         self._day = replace(self._day, orders=count)
+        if not await self._book_entry(symbol, st, order, now):
+            return
         details: dict[str, Any] = {
             "symbol": symbol,
             "side": order.side.value,
@@ -1464,6 +1589,33 @@ class Engine:
         self._seen_order_ids.add(order_id)
         await self._save_order(record)
         await self._event("order_submitted", {**details, "order_id": order_id}, now)
+
+    async def _book_entry(
+        self, symbol: str, st: _SymbolState, order: OrderRequest, now: datetime
+    ) -> bool:
+        """With research on, record a buy in the ledger before it is sent: a position the
+        bot cannot prove it opened would be foreign after a restart. False: do not send."""
+        if self._research is None or order.side is not Side.BUY or symbol in self._ledger:
+            return True
+        pick = self._research.view.pick(root_symbol(symbol), now)
+        entry = LedgerEntry(
+            symbol,
+            horizon=pick.horizon.value if pick is not None else "swing",
+            side=pick.side.value if pick is not None else "long",
+            opened_at=now,
+            pick_run_id=pick.run_id if pick is not None else "",
+            pick_rank=pick.rank if pick is not None else 0,
+        )
+        try:
+            await self._state.put_ledger(entry)
+        except Exception as exc:
+            self._log_throttled(
+                "ledger-write", now, "%s: could not write the ledger, not buying: %s", symbol, exc
+            )
+            st.hold_until = now + timedelta(seconds=self.PRETRADE_RETRY_S)
+            return False
+        self._ledger[symbol] = entry
+        return True
 
     # ----------------------------------------------------------------- helpers
 

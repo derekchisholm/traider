@@ -150,6 +150,7 @@ once every 15 minutes.
 | X expires today and is still held | It is the last hour and the option is still in the account. Repeats while that is so. | One alert is normal: the sale is in progress. If it repeats, the bot is not getting it sold (halt, no bid, stale quote, frozen symbol). Sell it at Schwab or tell Schwab not to exercise it: an option that expires in the money becomes 100 shares per contract. |
 | Unpinned symbols are still held | A settings version unpinned symbols the bot still holds (shares, or options on them). The alert names them. The bot keeps managing them until they are flat or the next restart (every morning on the schedule); after that it does not. | Sell them, or pin them again. |
 | X is held but not managed | The account holds X but X (or, for an option, its underlying) is not pinned, so the bot does not trade it. For an option that also means no expiry alerts and no sale before it expires. Once per symbol each time the bot starts (every morning on the schedule), and again if the position comes back after going flat. | If the bot bought it before it was unpinned, sell it yourself or pin it again. If the bot did not buy it, ignore this: pinning would hand it to the strategy, which may sell it. |
+| X is held but the bot did not open it | With research on, the account holds X but the bot's ledger has no record of buying it, and X is not pinned. | The bot leaves X alone, sells included. Sell it yourself, or pin it if the bot should manage it. Keep the bot's account to the bot. |
 | Strategy error | The strategy raised an exception. | Buys are off until the next restart, which the schedule does every morning. Set `close_only` or `halt`, fix the strategy and deploy. |
 | Lost the trading lease | This instance is no longer the one allowed to trade. | Check that exactly one task is running. |
 | Engine error | An unexpected error in the loop. | The bot keeps running. Read the logs. |
@@ -195,6 +196,7 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `settings_rejected` | The newest version does not validate. The bot kept the settings it had. |
 | `settings_unreadable` | The settings table stayed unreadable for five minutes. `since` says when it began, `detail` what went wrong. Recorded once per outage. |
 | `unmanaged_holding` | The account holds `symbol` (`quantity`) outside the bot's universe, so the bot does not manage it. Recorded with the alert. |
+| `unknown_holding` | The account holds a position the bot did not open (not in its ledger, not pinned). The bot will not trade it. |
 | `unpinned_but_held` | A settings `version` unpinned `symbols` the bot still holds. Recorded with the alert. |
 | `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
 | `research_stale` | Research could not be read for longer than `research.max_stale_s`. No new entries until it can. |
