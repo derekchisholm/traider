@@ -14,7 +14,7 @@ import pytest
 from traider.config import RiskLimits
 from traider.control import ControlMode, effective_permissions
 from traider.models import AccountSnapshot, OrderRequest, OrderType, Position, Quote, Side
-from traider.risk import RiskContext, RiskManager, SessionView
+from traider.risk import ResearchGate, RiskContext, RiskManager, SessionView
 
 NOW = datetime(2026, 10, 8, 15, 0, tzinfo=UTC)
 LIMITS = RiskLimits()  # 500 / 1000 / 2000 USD, 20 orders, 20 bps spread, $5 min price
@@ -546,3 +546,87 @@ def test_an_option_can_be_sold_on_its_last_day_and_when_options_are_switched_off
 def test_options_are_never_bought_at_market():
     order = OrderRequest(CALL, Side.BUY, 1, OrderType.MARKET, None)
     assert "order_type" in check(option_ctx(order=order), OPTIONS).codes
+
+
+# --- research gate ---------------------------------------------------------------
+#
+# The research rules only apply when the context carries a ResearchGate. PUT is a
+# put on the same underlying as CALL; the option helpers above build both.
+
+PUT = "SPY   261016P00500000"
+
+
+def gated(gate: ResearchGate, **overrides) -> RiskContext:
+    return ctx(research=gate, **overrides)
+
+
+def put_ctx(gate: ResearchGate) -> RiskContext:
+    put_quote = replace(option_quote(), symbol=PUT)
+    return option_ctx(research=gate, order=option_buy(symbol=PUT), quote=put_quote)
+
+
+def test_without_a_gate_nothing_changes():
+    assert check(ctx()).allowed
+
+
+def test_a_live_long_pick_allows_shares():
+    assert check(gated(ResearchGate(pick_side="long"))).allowed
+
+
+def test_no_pick_blocks_entries_but_not_exits():
+    decision = check(gated(ResearchGate(pick_side=None)))
+    assert decision.codes == {"no_pick"}
+    assert check(gated(ResearchGate(pick_side=None), order=sell(), **holding())).allowed
+
+
+def test_pinned_symbols_need_no_pick():
+    assert check(gated(ResearchGate(pick_side=None, pinned=True))).allowed
+
+
+def test_stand_aside_blocks_entries_even_on_pinned_symbols_but_not_exits():
+    gate = ResearchGate(pick_side="long", pinned=True, posture="stand_aside")
+    assert check(gated(gate)).codes == {"posture"}
+    assert check(gated(gate, order=sell(), **holding())).allowed
+
+
+def test_bearish_picks_are_traded_with_puts_only():
+    gate = ResearchGate(pick_side="bearish")
+    assert check(gated(gate)).codes == {"pick_side"}
+    assert check(option_ctx(research=gate), OPTIONS).codes == {"pick_side"}  # a call
+    assert check(put_ctx(gate), OPTIONS).allowed
+
+
+def test_a_put_on_a_long_pick_is_refused():
+    assert check(put_ctx(ResearchGate(pick_side="long")), OPTIONS).codes == {"pick_side"}
+
+
+def test_a_foreign_holding_is_never_traded_sells_included():
+    gate = ResearchGate(pick_side="long", foreign=True)
+    assert "foreign_holding" in check(gated(gate)).codes
+    assert check(gated(gate, order=sell(), **holding())).codes == {"foreign_holding"}
+
+
+def test_reduced_days_shrink_the_order_and_position_caps():
+    # 5 x 100.05 = 500.25: fine at a 600 cap with the normal factor, refused at 0.5.
+    roomy = RiskLimits(max_order_usd=Decimal(600))
+    order = buy(qty=5)
+    assert check(gated(ResearchGate(pick_side="long"), order=order), roomy).allowed
+    reduced = gated(ResearchGate(pick_side="long", cap_factor=Decimal("0.5")), order=order)
+    assert check(reduced, roomy).codes >= {"max_order_usd"}
+
+
+def test_the_horizon_budget_bounds_entries():
+    gate = ResearchGate(
+        pick_side="long",
+        horizon="intraday",
+        horizon_exposure_usd=Decimal(900),
+        horizon_cap_usd=Decimal(1000),
+    )
+    assert check(gated(gate)).codes == {"horizon_budget"}  # 900 + 200.10 > 1000
+    roomy = replace(gate, horizon_exposure_usd=Decimal(700))
+    assert check(gated(roomy)).allowed
+
+
+def test_no_intraday_entries_in_the_flatten_window():
+    gate = ResearchGate(pick_side="long", horizon="intraday", intraday_closing=True)
+    assert check(gated(gate)).codes == {"intraday_closing"}

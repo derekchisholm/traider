@@ -8,6 +8,11 @@ The bot is long-only: a BUY opens or adds to a position (an *entry*), a SELL
 reduces one (an *exit*). Exits are exempt from the caps that exist to stop the
 bot taking on risk, because blocking an exit leaves risk on the table. Exits
 still need the control switch, an open market and sane market data.
+
+With research on, a ``ResearchGate`` adds the research rules: an entry needs a
+live pick on the right side, the day's posture can stop or shrink entries, intraday
+and swing positions have separate budgets, and a position the bot did not open is
+never touched, sells included.
 """
 
 from __future__ import annotations
@@ -34,6 +39,21 @@ class SessionView:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchGate:
+    """What research says about one order's symbol. Built by the engine; None without research."""
+
+    pick_side: str | None  # side of the live pick on the symbol (or its underlying); None: no pick
+    pinned: bool = False  # pinned symbols need no pick
+    posture: str = "trade"  # "trade" | "reduced" | "stand_aside"
+    foreign: bool = False  # held, but not opened by the bot: never traded
+    horizon: str = "swing"  # the budget this entry counts against
+    horizon_exposure_usd: Decimal = Decimal(0)  # already held in that horizon
+    horizon_cap_usd: Decimal | None = None  # None: no horizon budget
+    cap_factor: Decimal = Decimal(1)  # order and position caps are multiplied by this
+    intraday_closing: bool = False  # inside the window where intraday positions are sold
+
+
+@dataclass(frozen=True, slots=True)
 class RiskContext:
     now: datetime
     order: OrderRequest
@@ -50,6 +70,7 @@ class RiskContext:
     seconds_since_last_order: float | None  # for this symbol
     unsettled_usd: Decimal  # proceeds of the bot's sales today, which settle tomorrow
     committed_usd: Decimal  # cash already promised to the bot's buys still on their way
+    research: ResearchGate | None = None  # None: research rules do not apply
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +112,8 @@ class RiskManager:
             out.append(Rejection(code, detail))
 
         self._check_control(ctx, is_entry, reject)
+        if ctx.research is not None:
+            self._check_research(ctx, is_entry, reject)
         if is_entry and is_option_symbol(order.symbol):
             self._check_option_entry(ctx, reject)
         self._check_shape(ctx, reject)
@@ -110,6 +133,27 @@ class RiskManager:
         allowed = ctx.permissions.allow_entries if is_entry else ctx.permissions.allow_exits
         if not allowed:
             reject("control", ctx.permissions.reason)
+
+    @staticmethod
+    def _check_research(ctx: RiskContext, is_entry: bool, reject: _Reject) -> None:
+        gate, symbol = ctx.research, ctx.order.symbol
+        assert gate is not None
+        if gate.foreign:
+            reject("foreign_holding", f"{symbol} is held but the bot did not open it")
+        if not is_entry:
+            return
+        if gate.posture == "stand_aside":
+            reject("posture", "research says stand aside today")
+        if not gate.pinned:
+            put = is_option_symbol(symbol) and parse_option_symbol(symbol).right == "P"
+            if gate.pick_side is None:
+                reject("no_pick", f"no live research pick for {symbol}")
+            elif gate.pick_side == "long" and put:
+                reject("pick_side", "a put on a long pick")
+            elif gate.pick_side == "bearish" and not put:
+                reject("pick_side", "bearish picks are traded with long puts only")
+        if gate.intraday_closing:
+            reject("intraday_closing", "intraday positions are being closed for the day")
 
     def _check_option_entry(self, ctx: RiskContext, reject: _Reject) -> None:
         limits, order = self.limits, ctx.order
@@ -230,15 +274,16 @@ class RiskManager:
         if reference is None or order.quantity <= 0:
             return  # already rejected for the missing price or bad quantity
         notional = reference * order.quantity * size
-        if notional > limits.max_order_usd:
-            reject(
-                "max_order_usd", f"order value {notional:.2f} over the {limits.max_order_usd} cap"
-            )
+        factor = ctx.research.cap_factor if ctx.research is not None else Decimal(1)
+        max_order = limits.max_order_usd * factor
+        max_position = limits.max_position_usd * factor
+        if notional > max_order:
+            reject("max_order_usd", f"order value {notional:.2f} over the {max_order} cap")
         position_value = reference * (ctx.position + order.quantity) * size
-        if position_value > limits.max_position_usd:
+        if position_value > max_position:
             reject(
                 "max_position_usd",
-                f"position would be {position_value:.2f}, cap {limits.max_position_usd}",
+                f"position would be {position_value:.2f}, cap {max_position}",
             )
         exposure = ctx.exposure_usd + notional
         if exposure > limits.max_total_exposure_usd:
@@ -246,6 +291,15 @@ class RiskManager:
                 "max_total_exposure_usd",
                 f"total exposure would be {exposure:.2f}, cap {limits.max_total_exposure_usd}",
             )
+        gate = ctx.research
+        if gate is not None and gate.horizon_cap_usd is not None:
+            after = gate.horizon_exposure_usd + notional
+            if after > gate.horizon_cap_usd:
+                reject(
+                    "horizon_budget",
+                    f"{gate.horizon} positions would be {after:.2f}, "
+                    f"budget {gate.horizon_cap_usd:.2f}",
+                )
         if limits.require_cash and ctx.account is not None:
             cash = ctx.account.cash_available
             if cash is None:
