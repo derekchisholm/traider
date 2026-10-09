@@ -283,3 +283,21 @@ async def test_an_unreadable_newer_posture_makes_the_bot_stand_aside(caplog):
     await src.refresh(NOW)
     assert src.view.level is PostureLevel.STAND_ASIDE
     assert "1 unreadable item" in caplog.text
+
+
+async def test_a_view_that_cannot_be_built_goes_stale_like_a_failed_read(monkeypatch):
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1"), [pick("NVDA", hours=30)], posture())
+    src = source(store, max_stale_s=600)
+
+    def broken(*args):
+        raise ValueError("bad data")
+
+    monkeypatch.setattr(src, "_build", broken)
+    assert await src.refresh(NOW) == []
+    assert await src.refresh(NOW + timedelta(seconds=300)) == []  # not a success
+    updates = await src.refresh(NOW + timedelta(seconds=601))
+    assert [(u.kind, u.detail) for u in updates] == [("stale", "ValueError: bad data")]
+    assert src.view.stale and src.view.picks == {}
+    assert await src.refresh(NOW + timedelta(seconds=700)) == []  # still failing: no "restored"
+    assert src.view.stale

@@ -78,6 +78,9 @@ class ResearchSource:
             self._first_try = now
         try:
             results = [await self._store.day(d.isoformat()) for d in self._days(now, settings)]
+            # Built before anything counts as a success: a view that cannot be built is
+            # no better than a table that cannot be read.
+            view = self._build(now, results, settings)
         except Exception as exc:
             return self._failed(now, settings, f"{type(exc).__name__}: {exc}")
         updates: list[ResearchUpdate] = []
@@ -85,7 +88,7 @@ class ResearchSource:
             updates.append(ResearchUpdate("restored", "research table readable again"))
         self._stale_reported = False
         self._last_ok = now
-        self.view = self._build(now, results, settings)
+        self.view = view
         return updates
 
     def _failed(

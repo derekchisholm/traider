@@ -304,7 +304,16 @@ class Engine:
             self._research_at, now, self._settings.research.poll_s
         ):
             self._research_at = now
-            for research_update in await self._research.refresh(now):
+            try:
+                research_updates = await self._research.refresh(now)
+            except Exception as exc:
+                # Never let research stop the rest of the step: exits, the lease and the
+                # account refresh come after this.
+                self._log_throttled(
+                    "research", now, "research refresh failed: %s: %s", type(exc).__name__, exc
+                )
+                research_updates = []
+            for research_update in research_updates:
                 await self._on_research(research_update, now)
             await self._refresh_universe(now)
         if _due(self._control_at, now, self.CONTROL_REFRESH_S):

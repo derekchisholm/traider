@@ -4,7 +4,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from tests.unit.engine_harness import Harness
-from traider.models import OrderRequest, OrderType, Side
+from traider.models import OrderRequest, OrderType, Side, Target
 from traider.research.models import Pick, Posture, RunMeta
 from traider.research.store import MemoryResearchStore
 
@@ -258,3 +258,67 @@ async def test_with_research_on_a_holding_outside_the_universe_is_not_reported(t
     assert "QQQ" not in h.engine.universe
     assert not await h.events("unmanaged_holding")
     assert not [key for key in h.alert_keys() if key.startswith("unmanaged_holding")]
+
+
+async def test_a_research_refresh_that_raises_does_not_stop_the_step(tmp_path, monkeypatch):
+    h = await researched(tmp_path, picks=[("NVDA",)])
+    h.price("NVDA", "100.00", "100.02")
+    await h.target("NVDA", 2)
+    await h.settle()
+    assert h.research is not None
+
+    async def broken(now):
+        raise RuntimeError("bug in research")
+
+    monkeypatch.setattr(h.research, "refresh", broken)
+    h.clock.advance(60)  # research is due again, and so are the lease and the account
+    h.requote()
+    await h.target("NVDA", 0)  # this step polls research, which raises
+    assert h.broker.placed[-1].side is Side.SELL
+    await h.settle()
+    assert h.position("NVDA") == 0
+
+
+# --- options on research picks ------------------------------------------------------
+
+NVDA_PUT = "NVDA  261016P00100000"  # eight days out from the bench's clock
+NVDA_CALL = "NVDA  261016C00100000"
+SPY_CALL = "SPY   261016C00500000"
+
+
+async def optioned(tmp_path, **kwargs) -> Harness:
+    h = await researched(tmp_path, risk={"allow_options": True}, **kwargs)
+    for symbol in ("NVDA", "SPY"):
+        h.price(symbol, "100.00", "100.02")
+    for symbol in (NVDA_PUT, NVDA_CALL, SPY_CALL):
+        h.price(symbol, "2.00", "2.10")
+    return h
+
+
+async def ask_for_on(h: Harness, underlying: str, symbol: str, quantity: int) -> None:
+    """The strategy asks for an option position while hearing a bar of the underlying."""
+    h.strategy.bar_targets.append(Target(symbol, quantity, "test"))
+    h.bar(underlying)
+    await h.engine.step()
+
+
+async def test_a_put_on_a_bearish_pick_is_bought(tmp_path):
+    h = await optioned(tmp_path, picks=[("NVDA", "bearish")])
+    await ask_for_on(h, "NVDA", NVDA_PUT, 1)
+    await h.settle()
+    assert h.position(NVDA_PUT) == 1
+
+
+async def test_a_call_on_a_bearish_pick_is_refused(tmp_path):
+    h = await optioned(tmp_path, picks=[("NVDA", "bearish")])
+    await ask_for_on(h, "NVDA", NVDA_CALL, 1)
+    await h.settle()
+    assert h.position(NVDA_CALL) == 0
+    assert "pick_side" in await blocked_codes(h)
+
+
+async def test_an_option_on_a_pinned_underlying_needs_no_pick(tmp_path):
+    h = await optioned(tmp_path, picks=[("NVDA", "bearish")], symbols_extra=("SPY",))
+    await ask_for_on(h, "SPY", SPY_CALL, 1)
+    await h.settle()
+    assert h.position(SPY_CALL) == 1
