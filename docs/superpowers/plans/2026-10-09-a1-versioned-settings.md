@@ -471,7 +471,11 @@ async def test_first_write_is_version_one(store):
 async def test_each_write_records_what_changed(store):
     await store.write(settings(), expected_version=0, author="cli", note="", now=T0)
     second = await store.write(
-        settings(max_order_usd=Decimal(250)), expected_version=1, author="cli", note="smaller", now=T0
+        settings(max_order_usd=Decimal(250)),
+        expected_version=1,
+        author="cli",
+        note="smaller",
+        now=T0,
     )
     assert second.version == 2
     assert second.diff == {"risk.max_order_usd": ["500", "250"]}
@@ -480,7 +484,9 @@ async def test_each_write_records_what_changed(store):
 
 async def test_a_stale_writer_gets_a_conflict_and_nothing_is_written(store):
     await store.write(settings(), expected_version=0, author="a", note="", now=T0)
-    await store.write(settings(max_order_usd=Decimal(250)), expected_version=1, author="a", note="", now=T0)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="a", note="", now=T0
+    )
     with pytest.raises(SettingsConflict):
         await store.write(
             settings(max_order_usd=Decimal(100)), expected_version=1, author="b", note="", now=T0
@@ -511,7 +517,9 @@ async def test_an_invalid_latest_version_is_reported_with_its_number(store):
 
 async def test_history_is_newest_first_and_skips_invalid_versions(store):
     await store.write(settings(), expected_version=0, author="a", note="", now=T0)
-    await store.write(settings(max_order_usd=Decimal(250)), expected_version=1, author="b", note="", now=T0)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="b", note="", now=T0
+    )
     put_invalid(store, 3)
     assert [v.version for v in await store.history()] == [2, 1]
     assert [v.version for v in await store.history(limit=1)] == [2]
@@ -826,7 +834,9 @@ async def test_refresh_applies_a_new_version_and_reports_the_diff():
     store = MemorySettingsStore()
     live = LiveSettings(store, settings())
     await live.start(T0)
-    await store.write(settings(max_order_usd=Decimal(250)), expected_version=1, author="cli", note="", now=T0)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="cli", note="", now=T0
+    )
     updates = await live.refresh(T0)
     assert [(u.kind, u.version) for u in updates] == [("applied", 2)]
     assert updates[0].diff == {"risk.max_order_usd": ["500", "250"]}
@@ -1173,9 +1183,7 @@ Class constant (next to `CONTROL_REFRESH_S`):
 and change the symbol table line to:
 
 ```python
-        self._symbols: dict[str, _SymbolState] = {
-            s: _SymbolState() for s in self._settings.pinned_symbols
-        }
+self._symbols: dict[str, _SymbolState] = {s: _SymbolState() for s in self._settings.pinned_symbols}
 ```
 
 Public property (next to `is_leader`):
@@ -1189,56 +1197,52 @@ Public property (next to `is_leader`):
 In `_housekeeping`, before the control refresh:
 
 ```python
-        if self._live_settings is not None and _due(
-            self._settings_at, now, self.SETTINGS_REFRESH_S
-        ):
-            self._settings_at = now
-            for update in await self._live_settings.refresh(now):
-                await self._on_settings(update, now)
+if self._live_settings is not None and _due(self._settings_at, now, self.SETTINGS_REFRESH_S):
+    self._settings_at = now
+    for update in await self._live_settings.refresh(now):
+        await self._on_settings(update, now)
 ```
 
 New method (put it after `_update_permissions`):
 
 ```python
-    async def _on_settings(self, update: SettingsUpdate, now: datetime) -> None:
-        live = self._live_settings
-        assert live is not None
-        version = update.version
-        if update.kind == "applied":
-            self._settings = live.current
-            self._risk.limits = self._settings.risk
-            await self._event(
-                "settings_applied",
-                {"version": version, "author": update.detail, "diff": update.diff},
-                now,
-            )
-            changes = "\n".join(f"{k}: {old} -> {new}" for k, (old, new) in update.diff.items())
-            await self._alerts.send(
-                f"settings_applied:{version}",
-                f"Settings version {version} applied",
-                changes or "No change to the settings in force.",
-            )
-        elif update.kind == "pending_restart":
-            await self._event(
-                "settings_pending_restart", {"version": version, "fields": update.detail}, now
-            )
-            await self._alerts.send(
-                f"settings_restart:{version}",
-                f"Settings version {version} needs a restart",
-                f"These fields only change when the bot restarts: {update.detail}. "
-                "Everything else in the version is in force now.",
-            )
-        elif update.kind == "rejected":
-            await self._event(
-                "settings_rejected", {"version": version, "detail": update.detail}, now
-            )
-            await self._alerts.send(
-                f"settings_rejected:{version}",
-                f"Settings version {version} rejected",
-                f"{update.detail}. The bot keeps the settings it was running with.",
-            )
-        else:
-            self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
+async def _on_settings(self, update: SettingsUpdate, now: datetime) -> None:
+    live = self._live_settings
+    assert live is not None
+    version = update.version
+    if update.kind == "applied":
+        self._settings = live.current
+        self._risk.limits = self._settings.risk
+        await self._event(
+            "settings_applied",
+            {"version": version, "author": update.detail, "diff": update.diff},
+            now,
+        )
+        changes = "\n".join(f"{k}: {old} -> {new}" for k, (old, new) in update.diff.items())
+        await self._alerts.send(
+            f"settings_applied:{version}",
+            f"Settings version {version} applied",
+            changes or "No change to the settings in force.",
+        )
+    elif update.kind == "pending_restart":
+        await self._event(
+            "settings_pending_restart", {"version": version, "fields": update.detail}, now
+        )
+        await self._alerts.send(
+            f"settings_restart:{version}",
+            f"Settings version {version} needs a restart",
+            f"These fields only change when the bot restarts: {update.detail}. "
+            "Everything else in the version is in force now.",
+        )
+    elif update.kind == "rejected":
+        await self._event("settings_rejected", {"version": version, "detail": update.detail}, now)
+        await self._alerts.send(
+            f"settings_rejected:{version}",
+            f"Settings version {version} rejected",
+            f"{update.detail}. The bot keeps the settings it was running with.",
+        )
+    else:
+        self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
 ```
 
 In `_entries_halted`, as the first check:
@@ -1666,20 +1670,18 @@ In `_parser`, after the backtest parser:
 In `main`, after `logging.basicConfig(...)` and before the `try:`:
 
 ```python
-    if args.command == "settings":
-        if not config.settings_table:
-            print("TRAIDER_SETTINGS_TABLE is not set", file=sys.stderr)
-            return 2
-        store = _settings_store(config)
-        if args.action == "show":
-            return asyncio.run(settings_show(store, sys.stdout))
-        if args.action == "history":
-            return asyncio.run(settings_history(store, sys.stdout, limit=args.limit))
-        return asyncio.run(
-            settings_apply(
-                store, args.file, sys.stdout, note=args.note, now=SystemClock().now()
-            )
-        )
+if args.command == "settings":
+    if not config.settings_table:
+        print("TRAIDER_SETTINGS_TABLE is not set", file=sys.stderr)
+        return 2
+    store = _settings_store(config)
+    if args.action == "show":
+        return asyncio.run(settings_show(store, sys.stdout))
+    if args.action == "history":
+        return asyncio.run(settings_history(store, sys.stdout, limit=args.limit))
+    return asyncio.run(
+        settings_apply(store, args.file, sys.stdout, note=args.note, now=SystemClock().now())
+    )
 ```
 
 - [ ] **Step 4: Run the tests**
@@ -1734,7 +1736,9 @@ def test_live_settings_table_is_protected_from_deletion(live, paper):
 
 
 def test_bot_is_told_where_its_settings_live(paper):
-    assert environment(paper)["TRAIDER_SETTINGS_TABLE"] == paper.one(TABLE, "settings").inputs["name"]
+    assert (
+        environment(paper)["TRAIDER_SETTINGS_TABLE"] == paper.one(TABLE, "settings").inputs["name"]
+    )
     assert paper.outputs["settingsTable"] == paper.one(TABLE, "settings").inputs["name"]
 
 
@@ -1780,12 +1784,14 @@ and return `Data(app_secret, token_secret, control, table, settings_table, topic
 `infra/bot.py`: in the task policy statements (next to the `"State"` statement), add:
 
 ```python
-                    {
-                        "Sid": "Settings",
-                        "Effect": "Allow",
-                        "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"],
-                        "Resource": data.settings_table.arn,
-                    },
+(
+    {
+        "Sid": "Settings",
+        "Effect": "Allow",
+        "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"],
+        "Resource": data.settings_table.arn,
+    },
+)
 ```
 
 and in `environment`: `"TRAIDER_SETTINGS_TABLE": data.settings_table.name,`.
