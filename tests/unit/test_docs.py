@@ -94,3 +94,31 @@ def test_readme_defaults_match_the_code():
     assert f"({caps} dollars)" in readme
     assert Config(symbols=("SPY",)).trading_mode == "paper"
     assert "It starts in **paper mode**" in readme
+
+
+def test_the_research_run_commands_in_the_docs_parse(capsys):
+    shown = set()
+    for doc in DOCS:
+        shown |= set(re.findall(r"traider (research run [a-z -]+)", text_of(doc)))
+    assert "research run --kind premarket --dry-run" in {s.strip() for s in shown}
+    for command in shown:
+        with pytest.raises(SystemExit) as exit_:
+            cli.main([*command.split(), "--help"])
+        assert exit_.value.code == 0, f"`traider {command}` does not parse"
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
+def test_research_job_settings_named_in_the_docs_exist(doc):
+    from pydantic import BaseModel
+
+    from traider.research.job_settings import ResearchJobSettings
+
+    named = re.findall(r"`research_jobs\.([a-z_.]+)`", text_of(doc))
+    for path in named:
+        model: type[BaseModel] | None = ResearchJobSettings
+        for part in path.split("."):
+            assert model is not None and part in model.model_fields, f"research_jobs.{path}"
+            annotation = model.model_fields[part].annotation
+            is_model = isinstance(annotation, type) and issubclass(annotation, BaseModel)
+            model = annotation if is_model else None

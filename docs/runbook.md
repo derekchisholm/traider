@@ -9,6 +9,7 @@ come from `pulumi stack output`.
 - [Alerts and what to do](#alerts-and-what-to-do)
 - [Seeing what the bot did](#seeing-what-the-bot-did)
 - [Restarting, changing settings, tearing down](#restarting-changing-settings-tearing-down)
+- [Research jobs](#research-jobs)
 - [Seeding research by hand](#seeding-research-by-hand)
 - [Going live](#going-live)
 - [First-deploy problems](#first-deploy-problems)
@@ -174,6 +175,12 @@ once every 15 minutes.
 | Settings table unreadable | The settings table has been unreadable for five minutes. If settings had loaded, the last good version stays in force and newer versions, tighter limits included, do not apply. If not, no new positions open. Sent once per outage. | Check the table and the task role. If you need tighter limits now, set the control switch to `close_only` or `halt`. |
 | Research is stale | The research table has been unreadable for longer than `research.max_stale_s` (10 minutes by default). | No new positions open; exits still work. Check the research table, the task role and the research jobs. |
 | Research readable again | It recovered. | Nothing. |
+| Research DATE: ok | The pre-market research run finished. The alert gives the posture, each pick (L long, B bearish, its horizon and score) and the cost. | Nothing. `traider research show` before the open shows what the bot will act on. |
+| Research DATE: partial | The run finished, but planned work did not happen: a budget stopped Bedrock calls, a deadline passed, Finnhub failed, daily history was unreadable for half the names or more, or the trail could not be written. The alert ends with the reasons. By default the bot ignores a partial run, posture included, so it stands aside today. | Read the reasons. Once the cause has passed, run it again (see [Research jobs](#research-jobs)). To trade on partial runs anyway, set `research.accept_partial_runs`; it applies to every partial run. |
+| Research DATE: failed | The run stopped at the stage it names (for example `collect`, `posture` or `dive`; a run that took longer than `research_jobs.max_run_s` plus 9 minutes fails too). It wrote no posture, so the bot stands aside today. | An expired Schwab sign-in is the usual cause: sign in, then run it again. Otherwise read the research logs. |
+| The research run stopped with an error | From AWS, not from the run: the research task exited with an error (it failed, it could not start, or another run held the lock). | Read the research logs (below). A run that cannot even start (no Finnhub key stored, no Bedrock access) writes no run record, so this alert is the only sign. If the task could not start, check the image and the roles. |
+| Alarm: the scheduler could not start the research run | The scheduler gave up on starting the task (two retries within 10 minutes) and put the request in a dead-letter queue. No task ran, so the alert above cannot fire. The bot stands aside today. | Read the message, then **purge the queue** (below). If you do not, the alarm stays in ALARM and later failures send no new alert. |
+| No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) No summary means the run did not finish, or never ran. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
 
 ## Seeing what the bot did
 
@@ -304,9 +311,153 @@ aws dynamodb update-table --table-name "$(pulumi stack output researchTable)" \
   --no-deletion-protection-enabled
 ```
 
+## Research jobs
+
+The pre-market research run reads the market at 08:00 New York time on weekdays and
+writes the day's posture and ranked picks (README, "The pre-market research run"). Its
+picks feed a strategy you choose; this is not financial advice. It is opt-in. **The
+schedule is live as soon as `traider:researchJobs` is deployed,** so do these in order.
+
+**1. Bedrock model access.** In the AWS console, in the stack's region, open Amazon
+Bedrock and request access to the Claude model in `research_jobs.dive.model`
+(`anthropic.claude-sonnet-5-5` by default; whether your account can use it is not
+verified). If it cannot, change `research_jobs.dive.model` and
+`research_jobs.dive.posture_model` to a model it can use, and add that model's price to
+`research_jobs.budget.prices` (a model without a price above zero is never called). Check
+the default prices against AWS's Bedrock price list either way: the budgets are only as good
+as those numbers. Settings change with `traider settings show` and `traider settings apply`
+(see [Restarting, changing settings, tearing down](#restarting-changing-settings-tearing-down)).
+
+**2. Deploy and store the Finnhub key, in one sitting.** Create a free account at
+finnhub.io and copy the API key from its dashboard. The secret that holds it is created by
+the same `pulumi up` that creates the schedule, so do both after 08:00 on a weekday or on a
+weekend: no run can fire before the key is in. From `infra/`:
+
+```sh
+pulumi config set traider:research true
+pulumi config set traider:researchJobs true
+pulumi up
+read -rs FINNHUB_KEY        # paste the key, press Enter; nothing is shown or saved
+aws secretsmanager put-secret-value --secret-id "$(pulumi stack output finnhubSecretArn)" \
+  --secret-string "{\"api_key\": \"$FINNHUB_KEY\"}"
+unset FINNHUB_KEY
+```
+
+The key goes in that command and nowhere else: not in a file, a Pulumi setting, a chat or a
+ticket. If it ever leaks (pasted anywhere else, even by accident), make a new one at Finnhub
+and store it the same way. A run with no key stored does not start; the stopped-with-an-error
+alert says so.
+
+**3. A dry run, before the next 08:00.** With the `localEnv` output loaded (README, step 5;
+reload it, it now carries the Finnhub secret) and AWS credentials that can read the secrets
+and tables and call Bedrock, from the repository root:
+
+```sh
+uv run --env-file .env traider research run --kind premarket --dry-run
+```
+
+It makes every real call, Bedrock included, so it costs about what a real run costs
+($1-2, an estimate). It writes nothing to the research table (no picks, posture, cost or
+lock) and sends no alert, but like the bot it may save a rotated Schwab sign-in. It prints
+the posture and the picks as JSON and leaves the trail in `./research-trail`
+(`--trail-dir` to change that). This is the first time the run meets the real Schwab,
+Finnhub and Bedrock. What the first dry run may show:
+
+- **Every pick refused as `halted`:** the run counts a missing or non-"Normal"
+  `securityStatus` as halted (fail closed), and what Schwab reports before the open is not
+  verified.
+- **Few or no candidates:** movers or quotes at 08:00 may not reflect pre-market trading,
+  or Finnhub's free tier may lack the earnings calendar (then the run is `partial`, with no
+  swing picks).
+- **Everything dropped as `stale_history`, or posture `stand_aside` with a note about SPY:**
+  daily bars whose last bar is more than 3 weekdays old are dropped, and stale SPY bars mean
+  `stand_aside`. Malformed bars are dropped too.
+- **A Bedrock error:** no model access, an id the region does not serve, or tool use the
+  endpoint does not support. Each failed attempt is counted against the budget; there are
+  no retries.
+
+**What the bot does with each outcome**
+
+| Run | Posture and picks |
+| --- | --- |
+| `ok` | used |
+| `partial` | ignored unless `research.accept_partial_runs` is on, posture included: the bot stands aside |
+| `failed` | none written: the bot stands aside |
+| skipped (`research_jobs.enabled` is false) | none written: the bot stands aside |
+| no session that day | nothing runs and nothing is written |
+
+**Time and money limits.** Past `research_jobs.max_run_s` (20 minutes) before the screen,
+the run writes the posture and no picks, as `partial`. Past it during the deep-dives, no
+new dive starts and unfinished ones are cut short, as `partial`. A run still going 9
+minutes after `research_jobs.max_run_s` fails. The cost meter stops all model calls once a call overruns
+its reservation or a budget would be exceeded, and estimates include a 1000-token allowance
+for tools.
+
+**Running it again.** If the scheduler cannot start the task it retries twice within 10
+minutes; a run that failed after starting is not repeated by the schedule (a late
+pre-market run is not wanted). A run is skipped if an `ok` or `partial` one already
+finished today, and only one runs at a time (a second exits with code 2). After fixing the
+cause, run it from your machine with the `localEnv` output loaded; without `--dry-run` it
+writes picks for the bot, and its trail stays on your machine.
+
+```sh
+uv run --env-file .env traider research run --kind premarket
+# after a partial run, to replace it:
+uv run --env-file .env traider research run --kind premarket --force
+```
+
+**A start that failed.** Read the dead-letter queue, then empty it. The queue is
+`<prefix>-research-schedule-dlq`, and the `researchCluster` output is `<prefix>-research`:
+
+```sh
+QUEUE="$(aws sqs get-queue-url --queue-name "$(pulumi stack output researchCluster)-schedule-dlq" \
+  --query QueueUrl --output text)"
+aws sqs receive-message --queue-url "$QUEUE" --max-number-of-messages 10 \
+  --attribute-names All --message-attribute-names All
+aws sqs purge-queue --queue-url "$QUEUE"
+```
+
+The message attributes should say why the scheduler gave up (not verified). Typical causes
+are a deleted image, a changed role or a full subnet. Purging is required: the alarm
+watches the queue's depth, so a message left in it keeps the alarm in ALARM and later
+failures send no alert.
+
+**Where to look.** Logs are in the `researchLogGroup` output's log group. The trail is in
+the `researchBucket` output's bucket, one folder per run, `runs/<date>/<run id>/`:
+`snapshot.json` (what it saw), `posture.json`, `screen.json` (every candidate, its
+features and why it was dropped), `dives/<symbol>.json` (each conversation with the model)
+and `result.json` (assessments, why each was refused, the picks).
+
+```sh
+aws logs tail "$(pulumi stack output researchLogGroup)" --since 2h
+aws s3 ls "s3://$(pulumi stack output researchBucket)/runs/$(date +%F)/" --recursive
+```
+
+Error and alert text is scrubbed of keys and tokens. **Never turn on
+botocore DEBUG logging** (for example `boto3.set_stream_logger`) where logs are kept: it
+prints secret values.
+
+**Good to know.** Earnings-date expiry counts weekdays, not market holidays, so a swing
+pick's expiry can land on a holiday.
+
+**Not verified yet:**
+- Bedrock Mantle tool use and forced `tool_choice`, the IAM action names, and model access.
+- Schwab pre-market movers and quotes, and the `securityStatus` values.
+- Whether Schwab hands out a second access token while the bot's is still valid (research
+  keeps its own and saves a rotated sign-in the way the bot does).
+- Finnhub free-tier coverage.
+- The token prices.
+- Scheduler, ECS and dead-letter-queue behaviour on real AWS.
+
+**Switching it off:** set `research_jobs.enabled` to false with `traider settings apply`
+(the next run exits without a posture, so the bot stands aside), or set
+`traider:researchJobs false` and `pulumi up` to remove the schedule. On a live stack,
+`pulumi destroy` cannot remove the trail bucket until you empty it:
+`aws s3 rm "s3://$(pulumi stack output researchBucket)" --recursive`.
+
 ## Seeding research by hand
 
-For paper testing before the research jobs exist. It needs a stack with
+For paper testing without the research run. It needs a stack with
 `traider:research: true`, which creates the research table and is off by default. The
 `localEnv` output carries `TRAIDER_RESEARCH_TABLE` **only when `traider:research` is
 true**; on a stack with research off the variable is missing and `traider research` prints
@@ -383,8 +534,9 @@ Before you switch:
       bot treats the whole position in each pinned symbol as its own, and will sell it
       when the strategy says to hold none.
 - [ ] Nothing else trades the pinned symbols in that account.
-- [ ] With research on: research jobs are writing a posture every morning (otherwise the
-      bot stands aside every day), and the account holds nothing the bot did not buy.
+- [ ] With research on: something writes a posture every morning (the research run with
+      `traider:researchJobs`, finishing `ok`; otherwise the bot stands aside every
+      day), and the account holds nothing the bot did not buy.
       A holding it did not open is left alone, but it is also a sign the account is not
       the bot's alone, and the bot cannot tell your shares from its own in a symbol it
       already holds. Check with `traider research show` before the open that the posture
