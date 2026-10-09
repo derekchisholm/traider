@@ -141,9 +141,10 @@ async def test_symbols_do_not_share_merged_fields(schwab, client, signed_in):
     async with running(schwab, client, signed_in) as (_, sink):
         await schwab.push_quote("SPY", 512.30, 512.34)
         await schwab.push_level_one("QQQ", f2=440.10)  # no bid known for QQQ yet
-        await schwab.push_heartbeat()
-        await until(lambda: len(sink.alive) >= 3)
-    assert [q.symbol for q in sink.quotes] == ["SPY"]
+        # Frames arrive in order, so once this one is in, the QQQ frame has been handled.
+        await schwab.push_quote("SPY", 512.31, 512.35)
+        await until(lambda: len(sink.quotes) >= 2)
+    assert [q.symbol for q in sink.quotes] == ["SPY", "SPY"]
 
 
 async def test_no_quote_is_emitted_until_both_sides_are_known(schwab, client, signed_in):
