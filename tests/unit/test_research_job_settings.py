@@ -56,6 +56,14 @@ def test_defaults_are_the_specs():
         ({"watchlist": ["NVDA", "NVDA"]}, "duplicate"),
         ({"watchlist": [f"A{i}" for i in range(51)]}, "50"),
         ({"surprise": 1}, "surprise"),
+        (
+            {"budget": {"prices": {DEFAULT_MODEL: {"in_per_mtok": 0, "out_per_mtok": 10}}}},
+            "in_per_mtok",
+        ),
+        (
+            {"budget": {"prices": {DEFAULT_MODEL: {"in_per_mtok": 2, "out_per_mtok": 0}}}},
+            "out_per_mtok",
+        ),
     ],
 )
 def test_inconsistent_settings_are_rejected(fields, message):

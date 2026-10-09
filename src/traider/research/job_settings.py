@@ -19,7 +19,8 @@ DEFAULT_MODEL = "anthropic.claude-sonnet-5-5"
 
 Weight = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 Usd = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
-Price = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
+# Positive: a zero price would make every call free and defeat the budgets.
+Price = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 
 
 class _Group(BaseModel):
