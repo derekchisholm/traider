@@ -90,6 +90,7 @@ class Engine:
     # Intervals, in seconds.
     CONTROL_REFRESH_S = 10.0
     SETTINGS_REFRESH_S = 10.0
+    SETTINGS_ALERT_AFTER_S = 300.0
     LEASE_TTL_S = 30.0
     LEASE_RENEW_S = 10.0
     LEASE_MARGIN_S = 5.0  # no order is sent this close to the lease running out
@@ -148,6 +149,8 @@ class Engine:
         )
         self._risk.limits = self._settings.risk
         self._settings_at: datetime | None = None
+        self._settings_unreadable_since: datetime | None = None
+        self._settings_unreadable_reported = False
 
         self._symbols: dict[str, _SymbolState] = {
             s: _SymbolState() for s in self._settings.pinned_symbols
@@ -197,6 +200,15 @@ class Engine:
         if self._live_settings is not None:
             for update in self._live_settings.start_updates:
                 await self._on_settings(update, now)
+            if not self._live_settings.loaded:
+                await self._event("entries_halted", {"reason": "settings not loaded"}, now)
+                await self._alerts.send(
+                    "settings_not_loaded",
+                    "Settings not loaded",
+                    "The bot could not read a valid settings version at start-up. No new "
+                    "positions open until the settings table can be read. Exits still work. "
+                    "Check the settings table and the task role.",
+                )
 
     async def _adopt_open_orders(self) -> None:
         """Take over the orders the previous holder of the lease left open. Only the
@@ -263,7 +275,11 @@ class Engine:
             self._settings_at, now, self.SETTINGS_REFRESH_S
         ):
             self._settings_at = now
-            for update in await self._live_settings.refresh(now):
+            updates = await self._live_settings.refresh(now)
+            if not any(update.kind == "unreadable" for update in updates):
+                self._settings_unreadable_since = None
+                self._settings_unreadable_reported = False
+            for update in updates:
                 await self._on_settings(update, now)
         if _due(self._control_at, now, self.CONTROL_REFRESH_S):
             self._control_at = now
@@ -345,6 +361,40 @@ class Engine:
             )
         else:
             self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
+            await self._settings_unreadable(update, now)
+
+    async def _settings_unreadable(self, update: SettingsUpdate, now: datetime) -> None:
+        """Say so, once, when the settings have stayed unreadable for a while."""
+        live = self._live_settings
+        assert live is not None
+        if self._settings_unreadable_since is None:
+            self._settings_unreadable_since = now
+        since = self._settings_unreadable_since
+        if (
+            self._settings_unreadable_reported
+            or (now - since).total_seconds() < self.SETTINGS_ALERT_AFTER_S
+        ):
+            return
+        self._settings_unreadable_reported = True
+        await self._event(
+            "settings_unreadable", {"since": since.isoformat(), "detail": update.detail}, now
+        )
+        if live.loaded:
+            in_force = (
+                f"The last good version, {live.version}, stays in force. Newer versions "
+                "(including tighter limits) will not apply until the table is readable."
+            )
+        else:
+            in_force = (
+                "No settings have loaded in this process, so no new positions open. "
+                "Exits still work."
+            )
+        await self._alerts.send(
+            "settings_unreadable",
+            "Settings table unreadable",
+            f"The settings table has been unreadable since {since.isoformat()} "
+            f"({update.detail}). {in_force} Check the settings table and the task role.",
+        )
 
     def _orphaned_by(self, stored: Settings) -> list[str]:
         """Held positions (by their own symbol) that the running bot manages through a pinned

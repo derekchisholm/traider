@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from tests.unit.engine_harness import Harness
+from traider.engine import Engine
 from traider.models import AccountSnapshot, Position
 from traider.settings import Settings
 from traider.settings_store import MemorySettingsStore
@@ -203,3 +204,85 @@ async def test_a_version_rejected_at_start_is_reported_and_blocks_entries(tmp_pa
     assert h.position("SPY") == 0
     blocked = await h.events("order_blocked")
     assert "settings not loaded" in blocked[-1]["data"]["detail"]
+
+
+def alerts_for(h: Harness, key: str) -> list[tuple[str, str, str]]:
+    return [alert for alert in h.alerts.sent if alert[0] == key]
+
+
+async def test_settings_that_are_not_loaded_at_start_are_halted_and_alerted(tmp_path):
+    store = FlakyStore()
+    store.error = RuntimeError("no network")
+    h = await Harness.create(tmp_path, settings_store=store)
+    halted = await h.events("entries_halted")
+    assert [e["data"] for e in halted] == [{"reason": "settings not loaded"}]
+    (_, subject, body) = alerts_for(h, "settings_not_loaded")[0]
+    assert subject == "Settings not loaded"
+    assert "No new positions open" in body
+    assert "Exits still work" in body
+    assert "settings table and the task role" in body
+
+
+async def test_settings_that_load_at_start_raise_no_not_loaded_alert(tmp_path):
+    h = await Harness.create(tmp_path, settings_store=MemorySettingsStore())
+    assert alerts_for(h, "settings_not_loaded") == []
+    assert await h.events("entries_halted") == []
+
+
+async def test_an_outage_past_five_minutes_is_reported_once_with_what_is_in_force(tmp_path):
+    store = FlakyStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    store.error = RuntimeError("throttled")
+    await h.run_for(420, step=5)
+    events = await h.events("settings_unreadable")
+    assert len(events) == 1
+    assert events[0]["data"]["detail"] == "RuntimeError: throttled"
+    assert events[0]["data"]["since"].startswith("2026-")
+    (alert,) = alerts_for(h, "settings_unreadable")
+    assert alert[1] == "Settings table unreadable"
+    assert "The last good version, 1, stays in force" in alert[2]
+    assert "tighter limits" in alert[2]
+
+
+async def test_an_outage_with_nothing_loaded_says_no_new_positions(tmp_path):
+    store = FlakyStore()
+    store.error = RuntimeError("denied")
+    h = await Harness.create(tmp_path, settings_store=store)
+    await h.run_for(420, step=5)
+    assert len(await h.events("settings_unreadable")) == 1
+    (alert,) = alerts_for(h, "settings_unreadable")
+    assert "No settings have loaded in this process, so no new positions open" in alert[2]
+
+
+async def test_a_short_outage_raises_nothing(tmp_path):
+    store = FlakyStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    store.error = RuntimeError("blip")
+    await h.run_for(240, step=5)
+    store.error = None
+    await h.run_for(60, step=5)
+    assert await h.events("settings_unreadable") == []
+    assert alerts_for(h, "settings_unreadable") == []
+
+
+async def test_a_good_read_restarts_the_outage_clock(tmp_path):
+    store = FlakyStore()
+    h = await Harness.create(tmp_path, settings_store=store)
+    for _ in range(2):  # two outages, each shorter than the limit but together longer
+        store.error = RuntimeError("blip")
+        await h.run_for(240, step=5)
+        store.error = None
+        await h.run_for(20, step=5)
+    assert alerts_for(h, "settings_unreadable") == []
+    store.error = RuntimeError("down")
+    await h.run_for(330, step=5)
+    store.error = None
+    await h.run_for(30, step=5)
+    store.error = RuntimeError("down again")
+    await h.run_for(330, step=5)
+    assert len(await h.events("settings_unreadable")) == 2  # one per outage
+    assert len(alerts_for(h, "settings_unreadable")) == 2
+
+
+def test_the_unreadable_alert_waits_five_minutes():
+    assert Engine.SETTINGS_ALERT_AFTER_S == 300.0

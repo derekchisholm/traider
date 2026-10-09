@@ -352,7 +352,12 @@ class LiveSettings:
             return [SettingsUpdate("rejected", exc.version, str(exc))]
         except Exception as exc:
             return [SettingsUpdate("unreadable", self.version, f"{type(exc).__name__}: {exc}")]
-        if latest is None or latest.version == self.version:
+        if latest is None:
+            if not self.loaded:
+                # Nothing readable and nothing to seed from: still no settings in force.
+                return [SettingsUpdate("unreadable", None, "no settings version after bootstrap")]
+            return []
+        if latest.version == self.version:
             return []
         # Restart-only fields keep the values the running objects were built from, even
         # when the process loaded late: start() may have built them from the fallback.

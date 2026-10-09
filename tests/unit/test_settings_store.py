@@ -433,6 +433,34 @@ class RacingStore:
         return [self._winner]
 
 
+class VanishingStore:
+    """Always empty, and every write loses to a rival that then cannot be read back."""
+
+    async def latest(self) -> SettingsVersion | None:
+        return None
+
+    async def write(
+        self, settings: Settings, *, expected_version: int, author: str, note: str, now: datetime
+    ) -> SettingsVersion:
+        raise SettingsConflict("another writer got there first")
+
+    async def history(self, limit: int = 20) -> list[SettingsVersion]:
+        return []
+
+
+async def test_an_empty_store_after_a_lost_bootstrap_race_is_unreadable_not_silent():
+    live = LiveSettings(VanishingStore(), settings())  # type: ignore[arg-type]
+    first = await live.start(T0)
+    assert [(u.kind, u.detail) for u in first] == [
+        ("unreadable", "no settings version after bootstrap")
+    ]
+    again = await live.refresh(T0)
+    assert [(u.kind, u.version, u.detail) for u in again] == [
+        ("unreadable", None, "no settings version after bootstrap")
+    ]
+    assert not live.loaded
+
+
 async def test_start_adopts_the_version_a_rival_wrote_during_bootstrap():
     rival = await MemorySettingsStore().write(
         settings(max_order_usd=Decimal(250)), expected_version=0, author="cli", note="", now=T0
