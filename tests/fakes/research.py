@@ -1,7 +1,6 @@
 """Stand-ins for what the research jobs talk to: Schwab market data, Finnhub and Bedrock.
 
-Each records what it was asked and can be told to fail. ``market_day`` builds one whole,
-fixed pre-market morning that the golden test replays.
+Each records what it was asked and can be told to fail.
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ def trading_days(before: date, n: int) -> list[date]:
 
 
 def flat_bars(
-    close: float, volume: int, *, last_volume: int | None = None, n: int = 260, before=TODAY
+    close: float, volume: int, *, last_volume: int | None = None, n: int = 260, before: date = TODAY
 ) -> list[DailyBar]:
     """Bars that close at ``close`` every day with a 2% range: ATR14 is 2% of ``close``."""
     bars = [
@@ -74,7 +73,7 @@ def flat_bars(
     return bars
 
 
-def rising_bars(start: float, step: float, *, n: int = 260, before=TODAY) -> list[DailyBar]:
+def rising_bars(start: float, step: float, *, n: int = 260, before: date = TODAY) -> list[DailyBar]:
     bars = []
     for i, day in enumerate(trading_days(before, n)):
         close = start + i * step

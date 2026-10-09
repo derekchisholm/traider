@@ -6,16 +6,18 @@ an entry that cannot be read is skipped and counted, never guessed at.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from traider.config import check_symbols
 from traider.schwab.client import SchwabClient
-from traider.schwab.parse import ParseError, parse_candles, parse_market_hours
+from traider.schwab.parse import ParseError, parse_market_hours
 from traider.session import Session
 from traider.timeutil import trading_date
 
@@ -25,6 +27,8 @@ PUT_MIN_DAYS = 7
 PUT_MAX_DAYS = 45
 PUT_STRIKE_BAND = 0.05  # within 5% of the price
 _ETF_SUB_TYPES = {"ETF", "ETN"}
+
+log = logging.getLogger(__name__)
 
 
 class MarketQuote(BaseModel):
@@ -37,7 +41,7 @@ class MarketQuote(BaseModel):
     last: float | None = None
     prev_close: float | None = None
     halted: bool = False
-    avg_volume: float | None = None  # fundamental.avg10DaysVolume
+    avg_volume: float | None = None  # fundamental.avg10DaysVolume, else avg1YearVolume
     high_52w: float | None = None
     low_52w: float | None = None
     pe: float | None = None
@@ -45,7 +49,9 @@ class MarketQuote(BaseModel):
 
     @property
     def gap_pct(self) -> float | None:
-        if self.last is None or not self.prev_close:
+        if self.last is None or self.prev_close is None:
+            return None
+        if self.last <= 0 or self.prev_close <= 0:
             return None
         return (self.last / self.prev_close - 1) * 100
 
@@ -154,8 +160,28 @@ def _float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _positive(value: Any) -> float | None:
+    """A price: finite and above zero, else unknown."""
+    number = _float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _non_negative(value: Any) -> float | None:
+    """A volume or a 52-week level: finite and at least zero, else unknown."""
+    number = _float(value)
+    return number if number is not None and number >= 0 else None
+
+
 def _text(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _valid_symbol(symbol: str) -> bool:
+    try:
+        check_symbols((symbol,))
+    except ValueError:
+        return False
+    return True
 
 
 def parse_movers(raw: Any) -> list[str]:
@@ -165,15 +191,17 @@ def parse_movers(raw: Any) -> list[str]:
     found: list[str] = []
     for item in screeners:
         symbol = _mapping(item).get("symbol")
-        if isinstance(symbol, str) and symbol and symbol not in found:
+        if isinstance(symbol, str) and symbol not in found and _valid_symbol(symbol):
             found.append(symbol)
     return found
 
 
 def parse_market_quotes(raw: Any) -> QuoteBatch:
+    if not isinstance(raw, Mapping):
+        raise ParseError("quotes response is not an object")
     quotes: dict[str, MarketQuote] = {}
     skipped = 0
-    for symbol, item in _mapping(raw).items():
+    for symbol, item in raw.items():
         if symbol == "errors":  # Schwab lists symbols it does not know here
             continue
         entry = _mapping(item)
@@ -184,39 +212,72 @@ def parse_market_quotes(raw: Any) -> QuoteBatch:
         fundamental = _mapping(entry.get("fundamental"))
         reference = _mapping(entry.get("reference"))
         status = fields.get("securityStatus")
-        avg_volume = _float(fundamental.get("avg10DaysVolume"))
+        avg_volume = _non_negative(fundamental.get("avg10DaysVolume"))
         if avg_volume is None:
-            avg_volume = _float(fundamental.get("avg1YearVolume"))
+            avg_volume = _non_negative(fundamental.get("avg1YearVolume"))
         quotes[symbol] = MarketQuote(
             symbol=symbol,
             asset_type=entry["assetMainType"],
             asset_sub_type=_text(entry.get("assetSubType")),
             exchange=_text(reference.get("exchangeName")),
-            last=_float(fields.get("lastPrice")),
-            prev_close=_float(fields.get("closePrice")),
-            halted=status is not None and status != "Normal",
+            last=_positive(fields.get("lastPrice")),
+            prev_close=_positive(fields.get("closePrice")),
+            # Fail closed: only an explicit "Normal" is tradable. A missing or odd status
+            # counts as halted. Schwab's real pre-market securityStatus values are not
+            # verified yet.
+            halted=status != "Normal",
             avg_volume=avg_volume,
-            high_52w=_float(fields.get("52WeekHigh")),
-            low_52w=_float(fields.get("52WeekLow")),
+            high_52w=_non_negative(fields.get("52WeekHigh")),
+            low_52w=_non_negative(fields.get("52WeekLow")),
             pe=_float(fundamental.get("peRatio")),
             div_yield=_float(fundamental.get("divYield")),
         )
     return QuoteBatch(quotes, skipped)
 
 
+def _volume(value: Any) -> int | None:
+    """A candle volume. Missing, non-numeric, boolean or negative is unreadable: never 0."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return int(value) if math.isfinite(value) and value >= 0 else None
+
+
+def _candle_time(value: Any) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _candle(item: Any) -> tuple[datetime, DailyBar] | None:
+    """One candle as a bar, or None when any part of it cannot be trusted."""
+    entry = _mapping(item)
+    when = _candle_time(entry.get("datetime"))
+    prices = [_positive(entry.get(name)) for name in ("open", "high", "low", "close")]
+    volume = _volume(entry.get("volume"))
+    if when is None or volume is None or any(price is None for price in prices):
+        return None
+    open_, high, low, close = (price for price in prices if price is not None)
+    if high < low or not low <= open_ <= high or not low <= close <= high:
+        return None
+    return when, DailyBar(
+        day=trading_date(when), open=open_, high=high, low=low, close=close, volume=volume
+    )
+
+
 def parse_daily_bars(raw: Any, symbol: str) -> list[DailyBar]:
-    """Daily candles as New York trading days. A day that appears twice keeps the last."""
-    by_day: dict[date, DailyBar] = {}
-    for bar in parse_candles(raw, symbol):
-        day = trading_date(bar.start)
-        by_day[day] = DailyBar(
-            day=day,
-            open=float(bar.open),
-            high=float(bar.high),
-            low=float(bar.low),
-            close=float(bar.close),
-            volume=bar.volume,
-        )
+    """Daily candles as New York trading days, oldest first. A candle that cannot be
+    trusted is dropped and counted in one warning. A day that appears twice keeps the
+    later candle."""
+    candles = _mapping(raw).get("candles")
+    if not isinstance(candles, list):
+        raise ParseError("price-history response has no candles list")
+    readable = [read for item in candles if (read := _candle(item)) is not None]
+    if dropped := len(candles) - len(readable):
+        log.warning("daily bars for %s: dropped %d unreadable candles", symbol, dropped)
+    by_day = {bar.day: bar for _, bar in sorted(readable, key=lambda pair: pair[0])}
     return [by_day[day] for day in sorted(by_day)]
 
 
@@ -236,11 +297,13 @@ def parse_puts(
             for item in entries if isinstance(entries, list) else []:
                 entry = _mapping(item)
                 symbol, days = entry.get("symbol"), entry.get("daysToExpiration")
-                strike, bid, ask = (
-                    _float(entry.get(name)) for name in ("strikePrice", "bid", "ask")
-                )
+                strike = _positive(entry.get("strikePrice"))
+                # A zero bid is real (no buyer), so it is kept and read as illiquid.
+                bid, ask = _non_negative(entry.get("bid")), _non_negative(entry.get("ask"))
                 oi = entry.get("openInterest")
                 if not isinstance(symbol, str) or not isinstance(days, int):
+                    continue
+                if isinstance(days, bool):
                     continue
                 if strike is None or bid is None or ask is None:
                     continue
@@ -283,7 +346,7 @@ class SchwabMarketData:
 
     async def daily_bars(self, symbol: str, before: date, days: int) -> list[DailyBar]:
         # Enough calendar days to cover ``days`` trading days, holidays included.
-        start = before - timedelta(days=days * 7 // 5 + 15)
+        start = before - timedelta(days=days * 7 // 5 + 30)
         raw = await self._client.daily_history(symbol, start, before - timedelta(days=1))
         bars = [bar for bar in parse_daily_bars(raw, symbol) if bar.day < before]
         return bars[-days:]
