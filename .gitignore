@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Local secrets and state. Never commit these.
+.env
+.env.*
+!.env.example
+*token*.json
+*.pem
+
+# Pulumi
+infra/.venv/
+infra/venv/
+# Stack config can hold encrypted secrets. Commit it only if you want to.
+# Pulumi.*.yaml
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
