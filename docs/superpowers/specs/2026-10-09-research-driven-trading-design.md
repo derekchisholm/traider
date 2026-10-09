@@ -442,6 +442,13 @@ Each of these must fail when its guard is removed on purpose:
 
 ## C. Research jobs (outline; full spec when it starts)
 
+C1 (the pre-market run) is specified in `2026-10-09-c1-research-premarket.md`. It changes
+three things in this outline:
+
+* Runs are ECS Fargate tasks from the bot image, not Step Functions with Lambdas.
+* Research refreshes Schwab access tokens itself and never signs in.
+* The events vendor is Finnhub's free tier, behind an adapter.
+
 * **Runtime:** EventBridge Scheduler triggers Step Functions, with Lambda per stage
   and a Map state for the deep-dives (bounded concurrency).
 * **Collect (code):**
