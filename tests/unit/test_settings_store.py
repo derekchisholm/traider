@@ -321,6 +321,58 @@ async def test_refresh_keeps_restart_fields_and_says_a_restart_is_needed():
     assert live.current.risk.max_order_usd == Decimal(250)
 
 
+class ForcedLatest(MemorySettingsStore):
+    """Serves a version that was built without validation, as a buggy reader might."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forced: SettingsVersion | None = None
+
+    async def latest(self) -> SettingsVersion | None:
+        return self.forced if self.forced is not None else await super().latest()
+
+
+def unchecked(version: int, **fields) -> SettingsVersion:
+    # model_copy does not validate, so this is a Settings that validation would refuse.
+    return SettingsVersion(version, settings().model_copy(update=fields), "test", T0)
+
+
+async def test_a_merged_result_that_does_not_validate_is_rejected_and_the_last_good_stays():
+    store = ForcedLatest()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    store.forced = unchecked(2, order_timeout_s=-5.0)
+    first = await live.refresh(T0)
+    assert [(u.kind, u.version) for u in first] == [("rejected", 2)]
+    assert "order_timeout_s" in first[0].detail
+    assert (live.version, live.loaded, live.current) == (1, True, settings())
+    assert live.pending is None
+    assert await live.refresh(T0) == []  # reported once, not on every refresh
+    # A later good version still applies.
+    store.forced = unchecked(3, order_timeout_s=30.0)
+    again = await live.refresh(T0)
+    assert [(u.kind, u.version) for u in again] == [("applied", 3)]
+    assert live.current.order_timeout_s == 30.0
+
+
+async def test_an_error_while_merging_is_a_rejection_not_a_crash(monkeypatch):
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    await store.write(
+        settings(max_order_usd=Decimal(250)), expected_version=1, author="cli", note="", now=T0
+    )
+
+    def boom(running, new):
+        raise KeyError("strategy_params")
+
+    monkeypatch.setattr("traider.settings_store.merge_live", boom)
+    updates = await live.refresh(T0)
+    assert [(u.kind, u.version) for u in updates] == [("rejected", 2)]
+    assert "KeyError" in updates[0].detail
+    assert (live.version, live.current) == (1, settings())
+
+
 async def test_pending_holds_the_stored_settings_while_a_restart_field_differs():
     store = MemorySettingsStore()
     live = LiveSettings(store, settings())

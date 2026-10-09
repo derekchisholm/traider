@@ -359,11 +359,21 @@ class LiveSettings:
             return []
         if latest.version == self.version:
             return []
+        if latest.version in self._rejected:
+            return []
         # Restart-only fields keep the values the running objects were built from, even
         # when the process loaded late: start() may have built them from the fallback.
-        merged = merge_live(self.current, latest.settings)
-        restart = restart_changes(self.current, latest.settings)
-        diff = settings_diff(self.current, merged)
+        # The merge is a mix of two validated bodies, so validate the mix too: whatever
+        # goes wrong, the version is rejected and the last good settings stay in force.
+        try:
+            merged = merge_live(self.current, latest.settings)
+            merged = Settings.model_validate(merged.model_dump(mode="json"))
+            restart = restart_changes(self.current, latest.settings)
+            diff = settings_diff(self.current, merged)
+        except Exception as exc:
+            self._rejected.add(latest.version)
+            detail = f"settings version {latest.version} cannot be applied: {_problem(exc)}"
+            return [SettingsUpdate("rejected", latest.version, detail)]
         self.current, self.version, self.loaded = merged, latest.version, True
         self.pending = latest.settings if restart else None
         out = [SettingsUpdate("applied", latest.version, latest.author, diff)]
