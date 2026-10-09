@@ -44,6 +44,20 @@ class RiskLimits(BaseModel):
     # accounts do not have that problem and can turn this off.
     settled_cash_only: bool = True
 
+    # Options. Off unless switched on. Only ever long calls and long puts, bought to
+    # open and sold to close, so the most a position can lose is what was paid for it.
+    # The dollar caps above apply to the premium (price x 100 x contracts).
+    allow_options: bool = False
+    max_contracts_per_order: PositiveInt = 5
+    min_option_price: PositiveDecimal = Decimal("0.05")
+    max_option_spread_bps: PositiveDecimal = Decimal(1000)
+    # Do not buy an option with fewer calendar days than this left. 1 means never on
+    # its last day.
+    min_days_to_expiry: Annotated[int, Field(ge=1)] = 1
+    # On an option's last day, sell it this many minutes before the close whatever the
+    # strategy says: one left to expire in the money is exercised into shares.
+    option_expiry_exit_min: Annotated[int, Field(ge=1)] = 60
+
     # Activity caps.
     max_orders_per_day: PositiveInt = 20
     order_cooldown_s: Annotated[float, Field(ge=0)] = 30.0
@@ -95,6 +109,10 @@ class Config(BaseModel):
     # Market data.
     feed: Literal["stream", "poll"] = "stream"
     poll_interval_s: Annotated[float, Field(ge=1)] = 5.0
+    # The option chain a strategy gets to choose from (only loaded when risk.allow_options
+    # is on): expiries up to this many days out, this many strikes around the money.
+    option_chain_days: Annotated[int, Field(ge=1, le=365)] = 45
+    option_chain_strikes: Annotated[int, Field(ge=1, le=100)] = 20
 
     # Paper trading.
     paper_starting_cash: PositiveDecimal = Decimal(10000)

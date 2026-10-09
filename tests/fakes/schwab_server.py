@@ -164,6 +164,7 @@ class FakeSchwab:
         self.cash = 10000.0
         self.positions: dict[str, tuple[float, float]] = {}  # symbol -> (quantity, avg price)
         self.omit_balance_fields: set[str] = set()
+        self.chains: dict[str, list[dict[str, Any]]] = {}
         # Orders
         self.orders: dict[int, FakeOrder] = {}
         self.next_order_id = 1001
@@ -206,6 +207,7 @@ class FakeSchwab:
         app.router.add_get("/trader/v1/userPreference", self._preferences)
         app.router.add_get("/marketdata/v1/quotes", self._quotes)
         app.router.add_get("/marketdata/v1/pricehistory", self._price_history)
+        app.router.add_get("/marketdata/v1/chains", self._chains)
         app.router.add_get("/marketdata/v1/markets", self._markets)
         app.router.add_get("/ws", self._stream)
         self._server = TestServer(app)
@@ -346,12 +348,13 @@ class FakeSchwab:
         order.fills.append((amount, at))
         order.filled += amount
         held, avg = self.positions.get(order.symbol, (0.0, 0.0))
-        if order.leg["instruction"] == "BUY":
-            self.cash -= amount * at
+        size = 100 if order.leg["instrument"]["assetType"] == "OPTION" else 1
+        if order.leg["instruction"].startswith("BUY"):
+            self.cash -= amount * at * size
             total = held + amount
             self.positions[order.symbol] = (total, (held * avg + amount * at) / total)
         else:
-            self.cash += amount * at
+            self.cash += amount * at * size
             remaining = held - amount
             if remaining == 0:
                 self.positions.pop(order.symbol, None)
@@ -363,7 +366,7 @@ class FakeSchwab:
 
     def _mark(self, symbol: str, instruction: str) -> float:
         quote = self.quotes.get(symbol, {}).get("quote", {})
-        return float(quote.get("askPrice" if instruction == "BUY" else "bidPrice", 100.0))
+        return float(quote.get("askPrice" if instruction.startswith("BUY") else "bidPrice", 100.0))
 
     # ------------------------------------------------------------------ plumbing
 
@@ -616,7 +619,9 @@ class FakeSchwab:
                     "settledShortQuantity": 0.0,
                     "instrument": {
                         # Schwab reports ETFs as COLLECTIVE_INVESTMENT, not EQUITY.
-                        "assetType": "COLLECTIVE_INVESTMENT"
+                        "assetType": "OPTION"
+                        if len(symbol) == 21
+                        else "COLLECTIVE_INVESTMENT"
                         if symbol in ("SPY", "QQQ")
                         else "EQUITY",
                         "cusip": "000000000",
@@ -715,6 +720,55 @@ class FakeSchwab:
             return self._unauthorized()
         symbols = [s for s in request.query.get("symbols", "").split(",") if s]
         return web.json_response({s: self.quotes[s] for s in symbols if s in self.quotes})
+
+    async def _chains(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        symbol = request.query.get("symbol", "")
+        calls: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        puts: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for option in self.chains.get(symbol, []):
+            side = calls if option["putCall"] == "CALL" else puts
+            expiry = f"{option['expirationDate'][:10]}:{option['daysToExpiration']}"
+            side.setdefault(expiry, {}).setdefault(str(option["strikePrice"]), []).append(option)
+        return web.json_response(
+            {
+                "symbol": symbol,
+                "status": "SUCCESS" if symbol in self.chains else "FAILED",
+                "callExpDateMap": calls,
+                "putExpDateMap": puts,
+            }
+        )
+
+    def add_option(
+        self,
+        symbol: str,
+        bid: float,
+        ask: float,
+        *,
+        delta: float = 0.5,
+        days: int = 7,
+        realtime: bool = True,
+    ) -> None:
+        """Put a contract in its underlying's chain and give it a quote."""
+        underlying = symbol[:6].strip()
+        year, month, day = symbol[6:8], symbol[8:10], symbol[10:12]
+        self.chains.setdefault(underlying, []).append(
+            {
+                "putCall": "CALL" if symbol[12] == "C" else "PUT",
+                "symbol": symbol,
+                "bid": bid,
+                "ask": ask,
+                "last": bid,
+                "delta": delta,
+                "strikePrice": int(symbol[13:]) / 1000,
+                "expirationDate": f"20{year}-{month}-{day}T20:00:00.000+00:00",
+                "daysToExpiration": days,
+                "multiplier": 100.0,
+            }
+        )
+        self.set_quote(symbol, bid, ask, realtime=realtime)
+        self.quotes[symbol]["assetMainType"] = "OPTION"
 
     async def _price_history(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
@@ -973,13 +1027,23 @@ def _validate_order(body: Any) -> str | None:
     if not isinstance(legs, list) or len(legs) != 1:
         return "exactly one leg is supported"
     leg = legs[0]
-    if leg.get("instruction") not in ("BUY", "SELL"):
-        return "instruction must be BUY or SELL"
     if not isinstance(leg.get("quantity"), int) or leg["quantity"] <= 0:
         return "quantity must be a positive whole number"
     instrument = leg.get("instrument", {})
-    if instrument.get("assetType") != "EQUITY" or not instrument.get("symbol"):
-        return "instrument must be an EQUITY with a symbol"
+    if not instrument.get("symbol"):
+        return "instrument must have a symbol"
+    if instrument.get("assetType") == "EQUITY":
+        allowed = ("BUY", "SELL")
+    elif instrument.get("assetType") == "OPTION":
+        allowed = ("BUY_TO_OPEN", "SELL_TO_CLOSE")
+        if len(instrument["symbol"]) != 21:
+            return "option symbol must be 21 characters"
+        if body["orderType"] != "LIMIT":
+            return "this fake only takes limit orders for options"
+    else:
+        return "instrument must be an EQUITY or an OPTION"
+    if leg.get("instruction") not in allowed:
+        return f"instruction must be one of {allowed}"
     return None
 
 

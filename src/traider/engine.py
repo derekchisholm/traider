@@ -45,6 +45,7 @@ from traider.models import (
     Side,
     Target,
 )
+from traider.options import contract_size, is_option_symbol, parse_option_symbol
 from traider.risk import Decision, RiskContext, RiskManager
 from traider.session import SessionTracker
 from traider.state.base import DayState, StateStore
@@ -107,6 +108,7 @@ class Engine:
     DAY_RETRY_S = 5.0
     HEARTBEAT_S = 2.0
     IDLE_TICK_S = 1.0
+    MAX_OPTION_SYMBOLS = 20  # contracts tracked at once; each one is polled for quotes
 
     def __init__(
         self,
@@ -179,6 +181,8 @@ class Engine:
         instance that holds the lease may touch them, so this runs on gaining it."""
         for record in await self._state.open_orders():
             st = self._symbols.setdefault(record.symbol, _SymbolState())
+            if is_option_symbol(record.symbol):
+                self._market.watch(record.symbol)
             if st.working is None:
                 self._seen_order_ids.add(record.order_id)
                 st.working = record
@@ -196,7 +200,7 @@ class Engine:
         await self._resolve_unconfirmed(now)
         await self._manage_working_orders(now)
         await self._run_strategy(now)
-        for symbol, st in self._symbols.items():
+        for symbol, st in list(self._symbols.items()):
             await self._reconcile(symbol, st, now)
         self._heartbeat(now)
 
@@ -300,6 +304,7 @@ class Engine:
             # ask again, on today's prices, before anything is bought or sold.
             for st in self._symbols.values():
                 st.target = None
+            self._forget_idle_options()
             self._unsaved_sold, self._unsaved_halt = Decimal(0), None
         try:
             loaded = await self._state.get_day(day)
@@ -336,11 +341,48 @@ class Engine:
         self._account = account
         self._account_at = now
         self._account_dirty = False
+        if self._risk.limits.allow_options:
+            for symbol, held in account.positions.items():
+                if held.quantity > 0:
+                    self._track_option(symbol)
         await self._settle_pending(account, now)
         await self._check_daily_loss(account, now)
 
+    def _track_option(self, symbol: str) -> _SymbolState | None:
+        """The state for an option contract on one of the bot's symbols, created on first
+        sight. None for anything else, or when too many contracts are in play already."""
+        st = self._symbols.get(symbol)
+        if st is not None:
+            return st if symbol not in self._config.symbols else None
+        if not is_option_symbol(symbol):
+            return None
+        if parse_option_symbol(symbol).underlying not in self._config.symbols:
+            return None
+        options = sum(1 for known in self._symbols if known not in self._config.symbols)
+        if options >= self.MAX_OPTION_SYMBOLS:
+            self._log_throttled(
+                "options-cap",
+                self._clock.now(),
+                "already tracking %d option contracts, ignoring %s",
+                options,
+                symbol,
+            )
+            return None
+        st = self._symbols[symbol] = _SymbolState()
+        self._market.watch(symbol)
+        return st
+
+    def _forget_idle_options(self) -> None:
+        """Stop tracking contracts that are not being traded. The ones still held are
+        picked up again from the next account snapshot."""
+        for symbol, st in list(self._symbols.items()):
+            if symbol in self._config.symbols or self._busy(st):
+                continue
+            del self._symbols[symbol]
+            self._market.unwatch(symbol)
+
     async def _settle_pending(self, account: AccountSnapshot, now: datetime) -> None:
-        for symbol, st in self._symbols.items():
+        for symbol, st in list(self._symbols.items()):
             pending = st.pending
             if pending is None:
                 continue
@@ -374,7 +416,7 @@ class Engine:
         manage it normally. Only when the broker has been asked, has no such order, and the
         position has not moved for a while is the order treated as never placed.
         """
-        for symbol, st in self._symbols.items():
+        for symbol, st in list(self._symbols.items()):
             pending = st.pending
             if pending is None or pending.confirmed or pending.order is None:
                 continue
@@ -492,7 +534,7 @@ class Engine:
                 now,
             )
             return
-        proceeds = (price * quantity).quantize(_CENT, rounding=ROUND_UP)
+        proceeds = (price * quantity * contract_size(symbol)).quantize(_CENT, rounding=ROUND_UP)
         # In memory first, so the rule holds even if the write below fails.
         self._day = replace(self._day, sold_usd=self._day.sold_usd + proceeds)
         try:
@@ -530,7 +572,7 @@ class Engine:
     async def _manage_working_orders(self, now: datetime) -> None:
         # Only the lease holder ever has working orders: they are adopted on winning
         # the lease and dropped on losing it.
-        for symbol, st in self._symbols.items():
+        for symbol, st in list(self._symbols.items()):
             record = st.working
             if record is None or not _due(st.last_poll_at, now, self.ORDER_POLL_S):
                 continue
@@ -626,7 +668,7 @@ class Engine:
     async def _run_strategy(self, now: datetime) -> None:
         account = self._account
         positions = {s: account.position(s) for s in self._symbols} if account else {}
-        ctx = StrategyContext(now=now, positions=positions)
+        ctx = StrategyContext(now=now, positions=positions, chains=self._market.chains())
         for bar, _warmup in self._market.drain_bars():
             await self._hear(lambda bar=bar: self._strategy.on_bar(bar, ctx), now)  # type: ignore[misc]
         for symbol in self._market.drain_dirty():
@@ -652,8 +694,11 @@ class Engine:
             await self._apply_target(target, now)
 
     async def _apply_target(self, target: Target, now: datetime) -> None:
-        st = self._symbols.get(target.symbol)
-        if st is None or target.symbol not in self._config.symbols:
+        if target.symbol in self._config.symbols:
+            st: _SymbolState | None = self._symbols[target.symbol]
+        else:
+            st = self._track_option(target.symbol)
+        if st is None:
             log.debug("ignoring target for unconfigured symbol %s", target.symbol)
             return
         quantity = max(0, target.quantity)  # long-only
@@ -672,11 +717,19 @@ class Engine:
             return
         if st.hold_until is not None and now < st.hold_until:
             return
-        target = self._effective_target(st, now)
+        target = self._effective_target(symbol, st, now)
         account = self._account
         if target is None or account is None:
             return
         position = account.position(symbol)
+        if position > 0 and self._expiring_now(symbol, now):
+            await self._alerts.send(
+                f"option_expiring:{symbol}",
+                f"Selling {symbol} before it expires",
+                f"{position} contract(s) of {symbol} expire today and the bot is selling them "
+                "before the close. If they are still in the account at the close, deal with "
+                "them yourself: an option left to expire in the money is exercised.",
+            )
         if position < 0:
             self._log_throttled(
                 f"short:{symbol}",
@@ -727,10 +780,28 @@ class Engine:
         """An order is working, its outcome is unsettled, or the symbol is frozen."""
         return bool(st.frozen) or st.working is not None or st.pending is not None
 
-    def _effective_target(self, st: _SymbolState, now: datetime) -> int | None:
+    def _effective_target(self, symbol: str, st: _SymbolState, now: datetime) -> int | None:
+        if self._expiring_now(symbol, now):
+            return 0  # whatever the strategy says: see _expiring_now
         if st.target is None:
             return None  # the strategy has said nothing: hands off
         return 0 if self._flatten_now(now) else st.target.quantity
+
+    def _expiring_now(self, symbol: str, now: datetime) -> bool:
+        """True for an option on its last day once the close is near. It is sold then,
+        because one left to expire in the money is exercised into a hundred shares per
+        contract, which no limit here was sized for."""
+        limits = self._risk.limits
+        if not limits.allow_options or symbol in self._config.symbols:
+            return False
+        if parse_option_symbol(symbol).days_to_expiry(trading_date(now)) > 0:
+            return False
+        view = self._session.view(now)
+        return (
+            view.is_open
+            and view.minutes_to_close is not None
+            and view.minutes_to_close <= limits.option_expiry_exit_min
+        )
 
     def _flatten_now(self, now: datetime) -> bool:
         minutes = self._config.flatten_before_close_min
@@ -748,14 +819,21 @@ class Engine:
         side = Side.BUY if delta > 0 else Side.SELL
         quantity = delta if delta > 0 else min(-delta, position)
         reason = st.target.reason if st.target is not None else ""
-        if self._flatten_now(self._clock.now()) and side is Side.SELL:
+        now = self._clock.now()
+        if self._flatten_now(now) and side is Side.SELL:
             reason = "flatten before close"
-        if self._config.order_type == "MARKET":
+        option = symbol not in self._config.symbols
+        if option and self._expiring_now(symbol, now) and side is Side.SELL:
+            reason = "option expires today"
+        if self._config.order_type == "MARKET" and not option:
             return OrderRequest(symbol, side, quantity, OrderType.MARKET, None, reason)
         quote = self._market.quote(symbol)
         price: Decimal | None = None
         if quote is not None and quote.bid > 0 and quote.ask > 0:
-            offset = self._config.limit_offset_bps / BPS
+            # Options: a limit at the quoted price itself. Their spreads are wide enough
+            # that a market order, or a limit pushed through the quote, gives too much away,
+            # and the quoted price is always on a valid price increment.
+            offset = Decimal(0) if option else self._config.limit_offset_bps / BPS
             if side is Side.BUY:
                 price = (quote.ask * (1 + offset)).quantize(_CENT, rounding=ROUND_DOWN)
             else:
@@ -803,7 +881,7 @@ class Engine:
         full errs on the side of not trading.
         """
         total = Decimal(0)
-        for symbol, st in self._symbols.items():
+        for symbol, st in list(self._symbols.items()):
             quote = self._market.quote(symbol)
             shares, price = 0, None
             record, pending = st.working, st.pending
@@ -821,7 +899,7 @@ class Engine:
             if price is None:
                 held = account.positions.get(symbol)
                 price = held.avg_price if held is not None else Decimal(0)
-            total += price * shares
+            total += price * shares * contract_size(symbol)
         return total
 
     def _entries_halted(self, now: datetime) -> str | None:
@@ -838,14 +916,15 @@ class Engine:
     def _exposure(self, account: AccountSnapshot) -> Decimal:
         """Value of what the bot holds, plus buys that are on their way."""
         total = Decimal(0)
-        for symbol, st in self._symbols.items():
+        for symbol, st in list(self._symbols.items()):
             held = account.positions.get(symbol)
+            size = contract_size(symbol)
             quote = self._market.quote(symbol)
             bid = quote.bid if quote is not None and quote.bid > 0 else None
             ask = quote.ask if quote is not None and quote.ask > 0 else None
             position = held.quantity if held is not None else 0
             if held is not None and position > 0:
-                total += (bid if bid is not None else held.avg_price) * position
+                total += (bid if bid is not None else held.avg_price) * position * size
             incoming = 0
             record = st.working
             if record is not None and record.side is Side.BUY:
@@ -856,7 +935,7 @@ class Engine:
                 price = ask or (record.limit_price if record is not None else None)
                 if price is None and held is not None:
                     price = held.avg_price
-                total += (price or Decimal(0)) * incoming
+                total += (price or Decimal(0)) * incoming * size
         return total
 
     async def _note_blocked(

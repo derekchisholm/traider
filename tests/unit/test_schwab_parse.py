@@ -6,12 +6,13 @@ from decimal import Decimal
 import pytest
 
 from traider.models import OrderRequest, OrderStatus, OrderType, Side
-from traider.schwab.orders import build_equity_order
+from traider.schwab.orders import build_equity_order, build_order
 from traider.schwab.parse import (
     ParseError,
     parse_account,
     parse_candles,
     parse_market_hours,
+    parse_option_chain,
     parse_order,
     parse_order_tree,
     parse_quotes,
@@ -135,14 +136,14 @@ def test_fractional_shares_are_rounded_towards_zero():
     assert parse_account(raw, NOW).position("SPY") == 15
 
 
-def test_option_positions_are_left_out():
+def test_positions_that_are_neither_shares_nor_options_are_left_out():
     raw = margin_account()
     raw["securitiesAccount"]["positions"].append(
         {
+            "longQuantity": 1000.0,
             "shortQuantity": 0.0,
-            "averagePrice": 2.5,
-            "longQuantity": 1.0,
-            "instrument": {"assetType": "OPTION", "symbol": "SPY   261016C00500000"},
+            "averagePrice": 1.0,
+            "instrument": {"assetType": "MUTUAL_FUND", "symbol": "SWVXX"},
         }
     )
     assert set(parse_account(raw, NOW).positions) == {"SPY", "AAPL"}
@@ -563,3 +564,118 @@ def test_limit_price_is_never_sent_with_more_than_two_decimals():
 def test_nonsense_orders_are_refused_before_they_reach_schwab(request_):
     with pytest.raises(ValueError):
         build_equity_order(request_)
+
+
+# --- options ---------------------------------------------------------------------------------
+
+CALL = "SPY   261016C00500000"
+
+
+def test_option_positions_are_kept_under_their_option_symbol():
+    raw = margin_account()
+    raw["securitiesAccount"]["positions"].append(
+        {
+            "longQuantity": 2.0,
+            "shortQuantity": 0.0,
+            "averagePrice": 4.1,
+            "instrument": {"assetType": "OPTION", "symbol": CALL, "putCall": "CALL"},
+        }
+    )
+    account = parse_account(raw, NOW)
+    assert account.position(CALL) == 2
+    assert account.position("SPY") == 15  # the shares are a separate position
+
+
+def chain_payload() -> dict:
+    def option(symbol, put_call, strike, bid, ask, delta):
+        return {
+            "putCall": put_call,
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "delta": delta,
+            "strikePrice": strike,
+            "daysToExpiration": 7,
+            "expirationDate": "2026-10-16T20:00:00.000+00:00",
+        }
+
+    return {
+        "symbol": "SPY",
+        "status": "SUCCESS",
+        "callExpDateMap": {
+            "2026-10-16:7": {
+                "500.0": [option(CALL, "CALL", 500.0, 4.1, 4.2, 0.45)],
+                "505.0": [option("SPY   261016C00505000", "CALL", 505.0, 2.0, 2.1, "NaN")],
+            }
+        },
+        "putExpDateMap": {
+            "2026-10-16:7": {
+                "500.0": [option("SPY   261016P00500000", "PUT", 500.0, 3.9, 4.0, -0.55)],
+                "495.0": [{"putCall": "PUT", "symbol": "garbage"}],
+            }
+        },
+    }
+
+
+def test_option_chain_is_flattened_into_quotes_sorted_by_symbol():
+    chain = parse_option_chain(chain_payload())
+    assert [q.symbol for q in chain] == [
+        CALL,
+        "SPY   261016C00505000",
+        "SPY   261016P00500000",
+    ]
+    first = chain[0]
+    assert (first.bid, first.ask, first.delta, first.days_to_expiry) == (
+        Decimal("4.1"),
+        Decimal("4.2"),
+        Decimal("0.45"),
+        7,
+    )
+
+
+def test_option_chain_entries_that_cannot_be_read_are_left_out():
+    chain = parse_option_chain(chain_payload())
+    assert "garbage" not in [q.symbol for q in chain]
+    assert chain[1].delta is None  # Schwab sends NaN for a delta it has not computed
+
+
+@pytest.mark.parametrize("raw", [None, {}, {"status": "FAILED"}, {"callExpDateMap": []}])
+def test_an_empty_or_failed_chain_is_no_contracts(raw):
+    assert parse_option_chain(raw) == []
+
+
+def option_request(side=Side.BUY, order_type=OrderType.LIMIT, price="4.20") -> OrderRequest:
+    limit = None if price is None else Decimal(price)
+    return OrderRequest(CALL, side, 2, order_type, limit)
+
+
+def test_option_buy_opens_and_names_the_contract():
+    assert build_order(option_request()) == {
+        "orderType": "LIMIT",
+        "session": "NORMAL",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "price": "4.20",
+        "orderLegCollection": [
+            {
+                "instruction": "BUY_TO_OPEN",
+                "quantity": 2,
+                "instrument": {"symbol": CALL, "assetType": "OPTION"},
+            }
+        ],
+    }
+
+
+def test_option_sell_closes():
+    leg = build_order(option_request(Side.SELL))["orderLegCollection"][0]
+    assert leg["instruction"] == "SELL_TO_CLOSE"
+
+
+def test_option_market_orders_are_never_built():
+    with pytest.raises(ValueError, match="limit"):
+        build_order(option_request(order_type=OrderType.MARKET, price=None))
+
+
+def test_share_orders_are_built_as_before():
+    request = OrderRequest("SPY", Side.BUY, 3, OrderType.LIMIT, Decimal("512.34"))
+    assert build_order(request) == build_equity_order(request)

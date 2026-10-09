@@ -14,10 +14,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from traider.models import AccountSnapshot, Bar, BrokerOrder, OrderStatus, Position, Quote, Side
+from traider.options import OptionQuote, is_option_symbol
 from traider.session import Session
 
 # Asset types that are plain shares. Schwab reports ETFs as COLLECTIVE_INVESTMENT.
 _SHARE_TYPES = {"EQUITY", "COLLECTIVE_INVESTMENT", "ETF"}
+_HELD_TYPES = _SHARE_TYPES | {"OPTION"}  # options are kept under their own symbol
 
 _TERMINAL = {
     "FILLED": OrderStatus.FILLED,
@@ -97,7 +99,7 @@ def parse_account(raw: Any, as_of: datetime) -> AccountSnapshot:
         entry = _mapping(item)
         instrument = _mapping(entry.get("instrument"))
         symbol = instrument.get("symbol")
-        if not isinstance(symbol, str) or instrument.get("assetType") not in _SHARE_TYPES:
+        if not isinstance(symbol, str) or instrument.get("assetType") not in _HELD_TYPES:
             continue
         held = (_decimal(entry.get("longQuantity")) or Decimal(0)) - (
             _decimal(entry.get("shortQuantity")) or Decimal(0)
@@ -215,6 +217,26 @@ def parse_quotes(raw: Any, received_at: datetime) -> dict[str, Quote]:
             halted=status is not None and status != "Normal",
         )
     return quotes
+
+
+def parse_option_chain(raw: Any) -> list[OptionQuote]:
+    """Every readable contract in a chain response, sorted by symbol."""
+    found: dict[str, OptionQuote] = {}
+    for side in ("callExpDateMap", "putExpDateMap"):
+        for strikes in _mapping(_mapping(raw).get(side)).values():
+            for entries in _mapping(strikes).values():
+                for item in entries if isinstance(entries, list) else []:
+                    entry = _mapping(item)
+                    symbol, days = entry.get("symbol"), entry.get("daysToExpiration")
+                    bid, ask = _decimal(entry.get("bid")), _decimal(entry.get("ask"))
+                    if not isinstance(symbol, str) or not is_option_symbol(symbol):
+                        continue
+                    if bid is None or ask is None or not isinstance(days, int):
+                        continue
+                    found[symbol] = OptionQuote(
+                        symbol, bid, ask, _decimal(entry.get("delta")), days
+                    )
+    return [found[symbol] for symbol in sorted(found)]
 
 
 # -------------------------------------------------------------------- market hours

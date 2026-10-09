@@ -15,7 +15,7 @@ import secrets
 import sys
 import time
 from collections.abc import Callable, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import TextIO
 
@@ -37,7 +37,7 @@ from traider.schwab.oauth import (
     code_from_redirect,
     exchange_code,
 )
-from traider.schwab.parse import ParseError, parse_candles, parse_quotes
+from traider.schwab.parse import ParseError, parse_candles, parse_option_chain, parse_quotes
 from traider.schwab.tokens import (
     AuthUnavailable,
     CredentialsError,
@@ -236,6 +236,51 @@ async def _check_market(
     else:
         last = f", last close {bars[-1].close}" if bars else ""
         report.ok("price history", f"{len(bars)} one-minute bars for {symbol}{last}")
+    if config.risk.allow_options:
+        await _check_options(config, client, now, report)
+
+
+async def _check_options(
+    config: Config, client: SchwabClient, now: datetime, report: _Report
+) -> None:
+    """Options are on: can the bot see a chain, and a real-time quote for a contract?"""
+    symbol = config.symbols[0]
+    today = trading_date(now)
+    try:
+        raw = await client.option_chain(
+            symbol,
+            today,
+            today + timedelta(days=config.option_chain_days),
+            strikes=config.option_chain_strikes,
+        )
+    except SchwabError as exc:
+        report.fail("option chain", str(exc))
+        return
+    chain = parse_option_chain(raw)
+    if not chain:
+        report.fail(
+            "option chain",
+            f"Schwab returned no option contracts for {symbol} in the next "
+            f"{config.option_chain_days} days",
+        )
+        return
+    report.ok("option chain", f"{len(chain)} contracts for {symbol}")
+    contract = chain[len(chain) // 2].symbol
+    try:
+        quote = parse_quotes(await client.quotes([contract]), now).get(contract)
+    except SchwabError as exc:
+        report.fail("option quote", str(exc))
+        return
+    if quote is None:
+        report.fail("option quote", f"Schwab returned no quote for {contract}")
+    elif quote.delayed:
+        report.fail(
+            "option quote",
+            f"{contract}: {quote.bid:.2f} x {quote.ask:.2f} but delayed; "
+            "the bot only trades on real-time quotes",
+        )
+    else:
+        report.ok("option quote", f"{contract}: {quote.bid:.2f} x {quote.ask:.2f}")
 
 
 # ---------------------------------------------------------------------------- login

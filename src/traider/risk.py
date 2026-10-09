@@ -20,6 +20,8 @@ from decimal import Decimal
 from traider.config import RiskLimits
 from traider.control import Permissions
 from traider.models import BPS, AccountSnapshot, OrderRequest, OrderType, Quote, Side
+from traider.options import contract_size, is_option_symbol, parse_option_symbol
+from traider.timeutil import trading_date
 
 _Reject = Callable[[str, str], None]
 
@@ -89,6 +91,8 @@ class RiskManager:
             out.append(Rejection(code, detail))
 
         self._check_control(ctx, is_entry, reject)
+        if is_entry and is_option_symbol(order.symbol):
+            self._check_option_entry(ctx, reject)
         self._check_shape(ctx, reject)
         self._check_session(ctx, is_entry, reject)
         reference = self._check_market_data(ctx, is_entry, reject)
@@ -106,6 +110,19 @@ class RiskManager:
         allowed = ctx.permissions.allow_entries if is_entry else ctx.permissions.allow_exits
         if not allowed:
             reject("control", ctx.permissions.reason)
+
+    def _check_option_entry(self, ctx: RiskContext, reject: _Reject) -> None:
+        limits, order = self.limits, ctx.order
+        if not limits.allow_options:
+            reject("options_off", "options trading is not switched on (risk.allow_options)")
+        if order.order_type is not OrderType.LIMIT:
+            reject("order_type", "options are only bought with limit orders")
+        left = parse_option_symbol(order.symbol).days_to_expiry(trading_date(ctx.now))
+        if left < limits.min_days_to_expiry:
+            reject(
+                "expiry",
+                f"{left} days to expiry, under the {limits.min_days_to_expiry} minimum for buying",
+            )
 
     @staticmethod
     def _check_shape(ctx: RiskContext, reject: _Reject) -> None:
@@ -175,11 +192,14 @@ class RiskManager:
             return None
 
         if is_entry:
+            option = is_option_symbol(order.symbol)
+            widest = limits.max_option_spread_bps if option else limits.max_spread_bps
+            floor = limits.min_option_price if option else limits.min_price
             spread = quote.spread_bps
-            if spread is not None and spread > limits.max_spread_bps:
-                reject("spread", f"spread {spread:.1f} bps over the {limits.max_spread_bps} limit")
-            if quote.ask < limits.min_price:
-                reject("min_price", f"price {quote.ask} under the {limits.min_price} minimum")
+            if spread is not None and spread > widest:
+                reject("spread", f"spread {spread:.1f} bps over the {widest} limit")
+            if quote.ask < floor:
+                reject("min_price", f"price {quote.ask} under the {floor} minimum")
 
         if order.order_type is OrderType.LIMIT and order.limit_price and order.limit_price > 0:
             tolerance = limits.max_limit_deviation_bps / BPS
@@ -196,18 +216,25 @@ class RiskManager:
         self, ctx: RiskContext, reference: Decimal | None, reject: _Reject
     ) -> None:
         limits, order = self.limits, ctx.order
-        if order.quantity > limits.max_shares_per_order:
+        size = contract_size(order.symbol)  # 100 shares for an option contract
+        if size > 1:
+            if order.quantity > limits.max_contracts_per_order:
+                reject(
+                    "max_contracts",
+                    f"{order.quantity} contracts over the {limits.max_contracts_per_order} cap",
+                )
+        elif order.quantity > limits.max_shares_per_order:
             reject(
                 "max_shares", f"{order.quantity} shares over the {limits.max_shares_per_order} cap"
             )
         if reference is None or order.quantity <= 0:
             return  # already rejected for the missing price or bad quantity
-        notional = reference * order.quantity
+        notional = reference * order.quantity * size
         if notional > limits.max_order_usd:
             reject(
                 "max_order_usd", f"order value {notional:.2f} over the {limits.max_order_usd} cap"
             )
-        position_value = reference * (ctx.position + order.quantity)
+        position_value = reference * (ctx.position + order.quantity) * size
         if position_value > limits.max_position_usd:
             reject(
                 "max_position_usd",

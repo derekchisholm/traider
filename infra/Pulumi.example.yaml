@@ -63,6 +63,14 @@ config:
   #   entry_delay_min_after_open: 1
   #   entry_cutoff_min_before_close: 5
   #   min_token_hours_for_entry: 2   # no new buys when the Schwab sign-in is about to lapse
+  #   allow_options: false           # options: long calls and puts only, bought to open and
+  #                                  # sold to close. The dollar caps above then apply to the
+  #                                  # premium (price x 100 x contracts). See the README.
+  #   max_contracts_per_order: 5
+  #   min_option_price: 0.05
+  #   max_option_spread_bps: 1000    # option spreads are far wider than share spreads
+  #   min_days_to_expiry: 1          # never buy an option with fewer days left; 1 = not on its last day
+  #   option_expiry_exit_min: 60     # on its last day an option is sold this long before the close
 
   # --- Orders -------------------------------------------------------------------
   # traider:orderType: LIMIT          # LIMIT or MARKET
@@ -76,6 +84,9 @@ config:
   # --- Market data --------------------------------------------------------------
   # traider:feed: stream              # stream (with polling as fallback) or poll
   # traider:pollIntervalS: 5
+  # The option chain a strategy chooses from, loaded only when risk.allow_options is on:
+  # traider:optionChainDays: 45       # expiries up to this many days out
+  # traider:optionChainStrikes: 20    # strikes around the current price
 
   # --- Alerts -------------------------------------------------------------------
   # AWS emails a confirmation link to this address; alerts start after you click it.

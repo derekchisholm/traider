@@ -4,6 +4,9 @@
   has gone quiet, quotes are polled over REST every few seconds instead.
 * One-minute bars come from the stream's chart service, or from price history
   when polling. ``MarketData`` drops duplicates, so both may deliver a minute.
+* Option contracts are not on the stream. The ones the engine is watching are
+  always quoted by polling, and with options switched on each symbol's option
+  chain is reloaded once a minute for the strategy to choose from.
 * Only regular-session bars reach the strategy, which matches the history it
   is warmed up and backtested on.
 """
@@ -21,11 +24,11 @@ from traider.config import Config
 from traider.marketdata import MarketData
 from traider.models import Bar, Quote
 from traider.schwab.client import SchwabClient, SchwabError
-from traider.schwab.parse import parse_candles, parse_quotes
+from traider.schwab.parse import parse_candles, parse_option_chain, parse_quotes
 from traider.schwab.stream import SchwabStream
 from traider.schwab.tokens import TokenManager
 from traider.session import SessionTracker
-from traider.timeutil import Clock
+from traider.timeutil import Clock, trading_date
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +40,7 @@ class Feed:
     BAR_DELAY_S = 5.0  # give Schwab a moment to publish a minute after it closes
     BAR_LOOKBACK = timedelta(minutes=5)
     WARMUP_LOOKBACK = timedelta(days=5)  # reaches the previous session across a weekend
+    CHAIN_REFRESH_S = 60.0
 
     def __init__(
         self,
@@ -64,6 +68,10 @@ class Feed:
             if config.feed == "stream"
             else None
         )
+        self._chains_wanted = config.risk.allow_options
+        self._chain_span = timedelta(days=config.option_chain_days)
+        self._chain_strikes = config.option_chain_strikes
+        self._chains_at: datetime | None = None
         self._bars_fetched_for: datetime | None = None
         self._complained_at: datetime | None = None
 
@@ -139,9 +147,13 @@ class Feed:
         return True
 
     async def poll_once(self) -> None:
-        """One REST refresh of quotes and bars, unless the stream is doing the job."""
+        """One REST refresh: options always, share quotes and bars unless the stream is
+        doing that job."""
         now = self._clock.now()
-        if self.stream_healthy() or not self._session.view(now).is_open:
+        if not self._session.view(now).is_open:
+            return
+        await self._poll_options(now)
+        if self.stream_healthy():
             return
         try:
             for quote in parse_quotes(await self._client.quotes(self._symbols), now).values():
@@ -163,6 +175,34 @@ class Feed:
             self._complain(now, "bar poll failed: %s", exc)
             return
         self._bars_fetched_for = minute
+
+    async def _poll_options(self, now: datetime) -> None:
+        watched = self._market.watched()
+        if watched:
+            try:
+                for quote in parse_quotes(await self._client.quotes(watched), now).values():
+                    self._market.on_quote(quote)
+            except SchwabError as exc:
+                self._complain(now, "option quote poll failed: %s", exc)
+        if not self._chains_wanted:
+            return
+        last = self._chains_at
+        if last is not None and (now - last).total_seconds() < self.CHAIN_REFRESH_S:
+            return
+        today = trading_date(now)
+        complete = True
+        for symbol in self._symbols:
+            try:
+                raw = await self._client.option_chain(
+                    symbol, today, today + self._chain_span, strikes=self._chain_strikes
+                )
+                self._market.set_chain(symbol, parse_option_chain(raw))
+            except SchwabError as exc:
+                # A strategy must not choose from prices that are no longer being updated.
+                self._market.set_chain(symbol, ())
+                complete = False
+                self._complain(now, "option chain not available: %s", exc)
+        self._chains_at = now if complete else None
 
     def _complain(self, now: datetime, message: str, *args: object) -> None:
         if self._complained_at is None or (now - self._complained_at).total_seconds() >= 60:

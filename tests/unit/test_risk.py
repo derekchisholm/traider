@@ -458,3 +458,91 @@ def test_rejections_carry_a_human_readable_detail():
     (rejection,) = decision.rejections
     assert rejection.code == "max_order_usd"
     assert "600.30" in rejection.detail and "500" in rejection.detail
+
+
+# --- options ---------------------------------------------------------------------
+#
+# Long calls and puts only. One contract is 100 shares, so a 2.00 option costs 200.
+# NOW is Thursday 8 October 2026; the test contract expires on Friday the 16th.
+
+CALL = "SPY   261016C00500000"
+OPTIONS = RiskLimits(allow_options=True)
+
+
+def option_quote(bid="2.00", ask="2.05") -> Quote:
+    seen = NOW - timedelta(seconds=1)
+    return Quote(CALL, Decimal(bid), Decimal(ask), Decimal(bid), ts=seen, received_at=seen)
+
+
+def option_buy(contracts=1, price="2.05", symbol=CALL) -> OrderRequest:
+    return OrderRequest(symbol, Side.BUY, contracts, OrderType.LIMIT, Decimal(price))
+
+
+def option_ctx(**overrides) -> RiskContext:
+    return ctx(**{"order": option_buy(), "quote": option_quote(), **overrides})
+
+
+def test_options_are_refused_unless_switched_on():
+    assert "options_off" in check(option_ctx()).codes
+
+
+def test_a_small_option_buy_is_allowed_once_options_are_on():
+    assert check(option_ctx(), OPTIONS).allowed
+
+
+def test_an_option_is_valued_at_a_hundred_shares_a_contract():
+    # 3 contracts at 2.05 is 615.00, over the 500 order cap.
+    assert check(option_ctx(order=option_buy(3)), OPTIONS).codes == {"max_order_usd"}
+
+
+def test_option_premium_counts_against_cash():
+    context = option_ctx(account=account(cash="150"))  # one contract costs 205
+    assert check(context, OPTIONS).codes == {"cash"}
+
+
+def test_option_premium_counts_against_the_position_and_exposure_caps():
+    held = account(positions={CALL: Position(CALL, 4, Decimal("2.00"))})
+    context = option_ctx(position=4, account=held, exposure_usd=Decimal(1900))
+    assert check(context, OPTIONS).codes == {"max_position_usd", "max_total_exposure_usd"}
+
+
+def test_contracts_per_order_are_capped_separately_from_shares():
+    limits = RiskLimits(allow_options=True, max_contracts_per_order=2)
+    context = option_ctx(order=option_buy(3, price="0.50"), quote=option_quote("0.49", "0.50"))
+    assert check(context, limits).codes == {"max_contracts"}
+
+
+def test_the_share_price_floor_does_not_apply_to_options_but_their_own_does():
+    assert check(option_ctx(), OPTIONS).allowed  # 2.05 is under the 5.00 floor for shares
+    cheap = option_ctx(order=option_buy(1, "0.03"), quote=option_quote("0.02", "0.03"))
+    assert "min_price" in check(cheap, OPTIONS).codes
+
+
+def test_options_get_a_wider_spread_allowance_with_its_own_limit():
+    assert check(option_ctx(), OPTIONS).allowed  # 2.00 x 2.05 is about 250 bps
+    wide = option_ctx(order=option_buy(1, "2.60"), quote=option_quote("2.00", "2.60"))
+    assert "spread" in check(wide, OPTIONS).codes
+
+
+def test_no_option_is_bought_on_its_last_day():
+    last_day = "SPY   261008C00500000"
+    context = option_ctx(order=option_buy(symbol=last_day))
+    assert "expiry" in check(context, OPTIONS).codes
+
+
+def test_an_expired_option_is_refused():
+    gone = option_ctx(order=option_buy(symbol="SPY   261001C00500000"))
+    assert "expiry" in check(gone, OPTIONS).codes
+
+
+def test_an_option_can_be_sold_on_its_last_day_and_when_options_are_switched_off():
+    last_day = "SPY   261008C00500000"
+    order = OrderRequest(last_day, Side.SELL, 2, OrderType.LIMIT, Decimal("2.00"))
+    held = account(positions={last_day: Position(last_day, 2, Decimal("2.00"))})
+    context = ctx(order=order, position=2, account=held, quote=option_quote())
+    assert check(context).allowed
+
+
+def test_options_are_never_bought_at_market():
+    order = OrderRequest(CALL, Side.BUY, 1, OrderType.MARKET, None)
+    assert "order_type" in check(option_ctx(order=order), OPTIONS).codes

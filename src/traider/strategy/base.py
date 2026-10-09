@@ -13,20 +13,27 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar
 
 from traider.models import Bar, Quote, Target
+from traider.options import OptionQuote
 
 
 @dataclass(frozen=True, slots=True)
 class StrategyContext:
     now: datetime
-    positions: Mapping[str, int]  # shares currently held, by symbol
+    positions: Mapping[str, int]  # shares (or option contracts) currently held, by symbol
+    chains: Mapping[str, Sequence[OptionQuote]] = field(default_factory=dict)
 
     def position(self, symbol: str) -> int:
         return self.positions.get(symbol, 0)
+
+    def chain(self, underlying: str) -> Sequence[OptionQuote]:
+        """The option contracts on ``underlying`` to choose from, at most a minute old.
+        Empty when options are off or the chain could not be loaded."""
+        return self.chains.get(underlying, ())
 
 
 class Strategy(ABC):

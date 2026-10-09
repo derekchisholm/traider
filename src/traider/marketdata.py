@@ -7,10 +7,11 @@ cannot interleave with the engine's reads.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 
 from traider.models import Bar, Quote
+from traider.options import OptionQuote
 
 
 class MarketData:
@@ -21,6 +22,8 @@ class MarketData:
         self._last_bar_start: dict[str, datetime] = {}
         self._alive_at: datetime | None = None
         self._waker: Callable[[], None] | None = None
+        self._watched: dict[str, None] = {}  # option contracts the engine wants quotes for
+        self._chains: dict[str, tuple[OptionQuote, ...]] = {}
 
     def set_waker(self, waker: Callable[[], None]) -> None:
         """Called whenever something new arrives, so the engine can wake immediately."""
@@ -52,6 +55,29 @@ class MarketData:
 
     def quote(self, symbol: str) -> Quote | None:
         return self._quotes.get(symbol)
+
+    # -- options: the engine says which contracts it cares about, the feed polls them
+
+    def watch(self, symbol: str) -> None:
+        self._watched[symbol] = None
+
+    def unwatch(self, symbol: str) -> None:
+        self._watched.pop(symbol, None)
+        self._quotes.pop(symbol, None)
+        self._dirty.pop(symbol, None)
+
+    def watched(self) -> tuple[str, ...]:
+        return tuple(self._watched)
+
+    def set_chain(self, underlying: str, quotes: Sequence[OptionQuote]) -> None:
+        """Replace the option chain for ``underlying``. An empty one means "not known"."""
+        self._chains[underlying] = tuple(quotes)
+
+    def chain(self, underlying: str) -> tuple[OptionQuote, ...]:
+        return self._chains.get(underlying, ())
+
+    def chains(self) -> Mapping[str, tuple[OptionQuote, ...]]:
+        return dict(self._chains)
 
     def drain_bars(self) -> list[tuple[Bar, bool]]:
         bars, self._bars = self._bars, []

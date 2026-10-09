@@ -1,7 +1,8 @@
 """Order payloads for Schwab's ``POST /accounts/{hash}/orders``.
 
-Only what the bot uses: single-leg equity orders, regular session, good for the
-day. The shape matches schwab-py's equity order builders.
+Only what the bot uses: single-leg orders, regular session, good for the day.
+Shares are bought and sold; options are bought to open and sold to close, never
+the other way round. The shapes match schwab-py's builders and schwabdev's samples.
 """
 
 from __future__ import annotations
@@ -9,7 +10,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from traider.models import OrderRequest, OrderType
+from traider.models import OrderRequest, OrderType, Side
+from traider.options import is_option_symbol
 
 _CENT = Decimal("0.01")
 
@@ -37,4 +39,17 @@ def build_equity_order(request: OrderRequest) -> dict[str, Any]:
         if price != price.quantize(_CENT):
             raise ValueError(f"limit price {price} is not a whole number of cents")
         payload["price"] = f"{price:.2f}"  # Schwab takes prices as strings
+    return payload
+
+
+def build_order(request: OrderRequest) -> dict[str, Any]:
+    """The payload for a share order or a long-option order, by the symbol's form."""
+    if not is_option_symbol(request.symbol):
+        return build_equity_order(request)
+    if request.order_type is not OrderType.LIMIT:
+        raise ValueError("option orders must be limit orders")
+    payload = build_equity_order(request)
+    leg = payload["orderLegCollection"][0]
+    leg["instruction"] = "BUY_TO_OPEN" if request.side is Side.BUY else "SELL_TO_CLOSE"
+    leg["instrument"] = {"symbol": request.symbol, "assetType": "OPTION"}
     return payload

@@ -816,6 +816,24 @@ def test_the_bot_stops_after_it_starts():
         deploy({"startTime": "16:30", "stopTime": "09:00"})
 
 
+def test_option_settings_reach_the_bot():
+    deployed = deploy(
+        {"risk": {"allow_options": True}, "optionChainDays": 30, "optionChainStrikes": 12}
+    )
+    checked = Config.from_env(environment(deployed))
+    assert checked.risk.allow_options is True
+    assert (checked.option_chain_days, checked.option_chain_strikes) == (30, 12)
+
+
+def test_options_are_off_unless_asked_for(paper):
+    assert Config.from_env(environment(paper)).risk.allow_options is False
+
+
+def test_a_bad_option_setting_fails_the_preview():
+    with pytest.raises(Exception, match="option_chain_days"):
+        deploy({"optionChainDays": 0})
+
+
 # --- the example configuration ----------------------------------------------------------
 
 # Settings the example shows with a value that is not the default.
