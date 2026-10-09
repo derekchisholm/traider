@@ -404,3 +404,12 @@ async def test_an_invalid_version_is_reported_once_across_start_and_refresh():
     assert [(u.kind, u.version) for u in await live.start(T0)] == [("rejected", 1)]
     assert await live.refresh(T0) == []
     assert not live.loaded
+
+
+async def test_start_keeps_what_it_returned_in_start_updates():
+    store = BrokenStore()
+    store.error = RuntimeError("no network")
+    live = LiveSettings(store, settings())
+    assert live.start_updates == []
+    updates = await live.start(T0)
+    assert updates and live.start_updates == updates

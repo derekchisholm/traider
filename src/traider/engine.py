@@ -192,7 +192,11 @@ class Engine:
 
     async def start(self) -> None:
         """Load today's counters. Open orders are picked up when the lease is won."""
-        await self._roll_day(self._clock.now())
+        now = self._clock.now()
+        await self._roll_day(now)
+        if self._live_settings is not None:
+            for update in self._live_settings.start_updates:
+                await self._on_settings(update, now)
 
     async def _adopt_open_orders(self) -> None:
         """Take over the orders the previous holder of the lease left open. Only the

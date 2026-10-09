@@ -106,3 +106,31 @@ async def test_exits_still_work_while_settings_are_unreadable(tmp_path):
     await h.target("SPY", 0)
     await h.settle()
     assert h.position("SPY") == 0
+
+
+async def test_exits_work_when_settings_never_loaded(tmp_path):
+    first = await Harness.create(tmp_path)
+    await first.target("SPY", 2)
+    await first.settle()
+    assert first.position("SPY") == 2
+    store = FlakyStore()
+    store.error = RuntimeError("no network")
+    h = await Harness.create(tmp_path, restart_of=first, settings_store=store)
+    assert not h.live_settings.loaded
+    await h.target("SPY", 0)
+    await h.settle()
+    assert h.position("SPY") == 0
+
+
+async def test_a_version_rejected_at_start_is_reported_and_blocks_entries(tmp_path):
+    store = MemorySettingsStore()
+    base = await Harness.create(tmp_path, begin=False)
+    store.put_raw(1, base.engine.settings.model_dump(mode="json") | {"strategy": "nope"})
+    h = await Harness.create(tmp_path, settings_store=store)
+    assert (await h.events("settings_rejected"))[-1]["data"]["version"] == 1
+    assert "settings_rejected:1" in h.alert_keys()
+    await h.target("SPY", 2)
+    await h.settle()
+    assert h.position("SPY") == 0
+    blocked = await h.events("order_blocked")
+    assert "settings not loaded" in blocked[-1]["data"]["detail"]

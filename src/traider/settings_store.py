@@ -285,6 +285,7 @@ class LiveSettings:
         self.version: int | None = None
         self.loaded = False
         self._rejected: set[int] = set()
+        self.start_updates: list[SettingsUpdate] = []
 
     async def _bootstrap(self, now: datetime) -> SettingsVersion | None:
         """Write the fallback as version 1 of an empty store. Losing the race to another
@@ -301,6 +302,12 @@ class LiveSettings:
             return await self._store.latest()
 
     async def start(self, now: datetime) -> list[SettingsUpdate]:
+        """Load the settings once. What it returns is also kept in ``start_updates``, so
+        the engine can report problems found before it existed."""
+        self.start_updates = await self._start(now)
+        return self.start_updates
+
+    async def _start(self, now: datetime) -> list[SettingsUpdate]:
         try:
             latest = await self._store.latest()
             if latest is None:
