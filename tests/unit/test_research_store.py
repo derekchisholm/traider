@@ -121,6 +121,15 @@ async def test_unparseable_items_are_counted_and_left_out(store):
     assert day.invalid == 2
 
 
+async def test_unreadable_postures_are_counted_apart_from_other_bad_items(store):
+    await store.write_run(meta(), [pick()], posture())
+    put_raw(store, f"DAY#{DAY}", "POSTURE#x", "not json")
+    put_raw(store, f"DAY#{DAY}", "PICK#r1#002", '{"symbol": "AMD"}')
+    day = await store.day(DAY)
+    assert day.invalid_postures == 1
+    assert day.invalid == 2
+
+
 async def test_a_run_with_unreadable_meta_is_absent(store):
     await store.write_run(meta(), [pick()], None)
     put_raw(store, "RUN#r1", "META", '{"run_id": "r1"}')

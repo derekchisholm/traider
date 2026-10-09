@@ -65,10 +65,10 @@ class ResearchSource:
         self._first_try: datetime | None = None
         self._stale_reported = False
 
-    def _days(self, now: datetime) -> list[date]:
+    def _days(self, now: datetime, settings: ResearchSettings) -> list[date]:
         today = trading_date(now)
         days = [today]
-        for _ in range(self._settings().swing_lookback_days):
+        for _ in range(settings.swing_lookback_days):
             days.append(previous_weekday(days[-1]))
         return days
 
@@ -77,7 +77,7 @@ class ResearchSource:
         if self._first_try is None:
             self._first_try = now
         try:
-            results = [await self._store.day(d.isoformat()) for d in self._days(now)]
+            results = [await self._store.day(d.isoformat()) for d in self._days(now, settings)]
         except Exception as exc:
             return self._failed(now, settings, f"{type(exc).__name__}: {exc}")
         updates: list[ResearchUpdate] = []
@@ -91,6 +91,9 @@ class ResearchSource:
     def _failed(
         self, now: datetime, settings: ResearchSettings, detail: str
     ) -> list[ResearchUpdate]:
+        if self.view.as_of is not None and trading_date(self.view.as_of) != trading_date(now):
+            # Yesterday's posture and intraday picks must not carry into a new trading day.
+            self.view = ResearchView()
         since = self._last_ok or self._first_try or now
         if (now - since).total_seconds() <= settings.max_stale_s:
             log.warning("research read failed, keeping the last view: %s", detail)
@@ -121,10 +124,17 @@ class ResearchSource:
                 key = (p.score, p.run_id, -p.rank)
                 if current is None or key > (current.score, current.run_id, -current.rank):
                     best[p.symbol] = p
-        postures = (
-            [p for p in results[0].postures if _usable(runs.get(p.run_id), settings)]
-            if results and results[0].day == today
-            else []
-        )
+        todays = next((r for r in results if r.day == today), None)
+        postures: list[Posture] = []
+        if todays is not None:
+            if todays.invalid_postures:
+                # A posture we cannot read may be the newest one. Refuse the day's posture.
+                log.warning(
+                    "research posture for %s has %d unreadable item(s), standing aside",
+                    today,
+                    todays.invalid_postures,
+                )
+            else:
+                postures = [p for p in todays.postures if _usable(runs.get(p.run_id), settings)]
         posture = max(postures, key=lambda p: p.at) if postures else None
         return ResearchView(picks=best, posture=posture, as_of=now, stale=False)
