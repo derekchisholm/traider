@@ -416,7 +416,9 @@ What the bot does with it:
   up to `research.max_symbols` (25 at most). The set changes during the day; a symbol only
   leaves once it is flat with nothing working, so an exit always has quotes. Each change is
   a `universe_changed` event. New symbols get warm-up bars from price history before the
-  strategy hears them.
+  strategy hears them. A symbol whose history cannot be loaded, at start-up or later, is
+  retried on every poll and holds up no other symbol; until it loads, its live bars reach
+  the strategy without the warm-up.
 - **A live pick** comes from a run that finished `ok` (a `partial` run only with
   `research.accept_partial_runs`), has not expired, and scores at least `research.min_score`.
   When a symbol has several, the highest score counts. A swing pick stays live on later days

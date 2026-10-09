@@ -767,3 +767,91 @@ async def test_a_symbol_dropped_during_its_history_call_is_not_replayed(schwab, 
         await feed._warm_pending(feed.clock.now())
         assert feed.market.drain_bars() == []
         assert feed._pending_warmup == {}
+
+
+# --- one failing symbol does not stall the rest -------------------------------------------
+
+
+def failing_for(client, bad: str):
+    """Make price history fail for ``bad`` every time, and count every history call."""
+    original = client.price_history
+    asked: list[str] = []
+
+    async def history(symbol, start, end):
+        asked.append(symbol)
+        if symbol == bad:
+            raise SchwabError("no history for this one")
+        return await original(symbol, start, end)
+
+    client.price_history = history
+    return asked
+
+
+async def test_warmup_queues_a_failing_symbol_and_warms_the_rest(schwab, client, signed_in):
+    for symbol in ("SPY", "QQQ"):
+        schwab.candles[symbol] = [candle(MINUTE - timedelta(minutes=1), 500)]
+    symbols = ("SPY", "BAD", "QQQ")
+    async with make_feed(schwab, client, signed_in, symbols=symbols) as feed:
+        failing_for(client, "BAD")
+        assert await feed.warmup(5) is True
+        assert list(feed._pending_warmup) == ["BAD"]
+        bars = feed.market.drain_bars()
+    assert {bar.symbol for bar, _ in bars} == {"SPY", "QQQ"}
+    assert all(warm for _, warm in bars)
+
+
+async def test_warmup_still_asks_again_when_nothing_could_be_fetched(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in, symbols=("SPY", "QQQ")) as feed:
+        schwab.fail("GET", "/pricehistory", 503, times=99)
+        assert await feed.warmup(5) is False
+        assert feed._pending_warmup == {}  # the whole warm-up is tried again instead
+
+
+async def test_with_no_symbols_warmup_is_done(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed.set_symbols(())
+        assert await feed.warmup(5) is True
+
+
+async def test_a_failing_symbols_bars_do_not_hold_back_the_others(schwab, client, signed_in):
+    for symbol in ("SPY", "QQQ"):
+        schwab.candles[symbol] = [candle(MINUTE - timedelta(minutes=1), 500)]
+    symbols = ("SPY", "BAD", "QQQ")
+    async with make_feed(schwab, client, signed_in, symbols=symbols) as feed:
+        asked = failing_for(client, "BAD")
+        await feed.poll_once()
+        assert {bar.symbol for bar, _ in feed.market.drain_bars()} == {"SPY", "QQQ"}
+        assert asked == ["SPY", "BAD", "QQQ"]
+        feed.clock.advance(5)  # same minute: only the failed symbol is asked again
+        await feed.poll_once()
+        assert asked == ["SPY", "BAD", "QQQ", "BAD"]
+        feed.clock.advance(60)  # a new minute: everyone again
+        await feed.poll_once()
+        assert asked[4:] == ["SPY", "BAD", "QQQ"]
+
+
+async def test_run_starts_the_stream_with_one_symbols_history_failing(schwab, client, signed_in):
+    for symbol in ("SPY", "QQQ"):
+        schwab.candles[symbol] = [candle(MINUTE - timedelta(minutes=1), 500)]
+    symbols = ("SPY", "BAD", "QQQ")
+    async with make_feed(schwab, client, signed_in, feed="stream", symbols=symbols) as feed:
+        asked = failing_for(client, "BAD")
+        task = asyncio.create_task(
+            feed.run(warmup_bars=5, poll_interval_s=0.01, warmup_retry_s=0.01)
+        )
+        try:
+            await schwab_connected(schwab)
+            seen: list = []
+            await until(
+                lambda: (
+                    seen.extend(feed.market.drain_bars())
+                    or {b.symbol for b, warm in seen if warm} == {"SPY", "QQQ"}
+                )
+            )
+            await until(lambda: asked.count("BAD") >= 3)  # still being retried
+            assert "BAD" in feed._pending_warmup
+            assert schwab.subscriptions["CHART_EQUITY"] == {"SPY", "BAD", "QQQ"}
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
