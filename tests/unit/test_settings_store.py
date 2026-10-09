@@ -325,20 +325,17 @@ async def test_a_later_refresh_loads_settings_that_could_not_be_read_at_start():
     assert updates[0].kind == "applied"
 
 
-async def test_a_refresh_after_an_unreadable_start_takes_the_stored_version_in_full():
-    # Nothing is running yet, so no restart-only field is in force: the stored values apply.
+async def test_a_refresh_after_an_unreadable_start_keeps_the_running_restart_fields():
+    # start() may have built the strategy and feed from the fallback, so they stay.
     store = BrokenStore()
     store.error = RuntimeError("no network")
     live = LiveSettings(store, settings())
     await live.start(T0)
-    await store.write(
-        settings().model_copy(update={"pinned_symbols": ("QQQ",)}),
-        expected_version=0,
-        author="cli",
-        note="",
-        now=T0,
-    )
+    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    await store.write(changed, expected_version=0, author="cli", note="", now=T0)
     store.error = None
     updates = await live.refresh(T0)
-    assert [u.kind for u in updates] == ["applied"]
-    assert live.current.pinned_symbols == ("QQQ",)
+    assert live.loaded
+    assert live.current.pinned_symbols == ("SPY",)
+    assert live.current.risk.max_order_usd == Decimal(250)
+    assert [u.kind for u in updates] == ["applied", "pending_restart"]

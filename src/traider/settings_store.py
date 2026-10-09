@@ -326,12 +326,10 @@ class LiveSettings:
             return [SettingsUpdate("unreadable", self.version, f"{type(exc).__name__}: {exc}")]
         if latest is None or latest.version == self.version:
             return []
-        if self.loaded:
-            merged = merge_live(self.current, latest.settings)
-            restart = restart_changes(self.current, latest.settings)
-        else:
-            # Nothing is running yet, so no restart-only field is in force: take it in full.
-            merged, restart = latest.settings, []
+        # Restart-only fields keep the values the running objects were built from, even
+        # when the process loaded late: start() may have built them from the fallback.
+        merged = merge_live(self.current, latest.settings)
+        restart = restart_changes(self.current, latest.settings)
         diff = settings_diff(self.current, merged)
         self.current, self.version, self.loaded = merged, latest.version, True
         out = [SettingsUpdate("applied", latest.version, latest.author, diff)]
