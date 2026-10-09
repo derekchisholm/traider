@@ -10,6 +10,7 @@ from tests.unit.helpers import make_bar
 from traider.config import Config, RiskLimits
 from traider.feed import Feed
 from traider.marketdata import MarketData
+from traider.schwab.client import SchwabError
 from traider.session import SessionTracker, StaticSessionProvider
 from traider.timeutil import ManualClock
 
@@ -676,3 +677,93 @@ async def test_the_stream_resubscribes_when_the_symbols_change(schwab, client, s
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_the_same_symbols_in_another_order_change_nothing(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in, feed="stream", symbols=("SPY", "QQQ")) as feed:
+        feed._warmup_bars = 2
+        calls = []
+        feed._stream.set_symbols = calls.append
+        feed.set_symbols(("QQQ", "SPY"))
+        assert (calls, feed._pending_warmup) == ([], {})
+        assert feed._symbols == ("QQQ", "SPY")
+
+
+async def test_warm_up_runs_after_the_quotes_and_even_when_the_market_is_closed(
+    schwab, client, signed_in
+):
+    schwab.set_quote("SPY", 100, 100.02)
+    order = []
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+
+        async def quotes_poll(now):
+            order.append("quotes")
+
+        async def warm(now):
+            order.append("warm")
+
+        feed._poll_quotes = quotes_poll
+        feed._warm_pending = warm
+        await feed.poll_once()
+    assert order == ["quotes", "warm"]
+
+
+async def test_a_failing_history_call_does_not_delay_the_quotes(schwab, client, signed_in):
+    schwab.set_quote("SPY", 100, 100.02)
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        quoted_before_history = []
+
+        async def history_fails(symbol, start, end):
+            quoted_before_history.append(feed.market.quote("SPY") is not None)
+            raise SchwabError("down")
+
+        client.price_history = history_fails
+        await feed.poll_once()
+        assert quoted_before_history[0] is True
+
+
+async def test_warm_up_still_runs_while_the_market_is_closed(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    evening = datetime(2026, 10, 8, 23, 0, 20, tzinfo=UTC)
+    async with make_feed(schwab, client, signed_in, now=evening) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        await feed.poll_once()
+        assert "NVDA" not in feed._pending_warmup
+
+
+async def test_warm_up_still_runs_while_the_stream_is_healthy(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    symbols = ("SPY", "NVDA")
+    async with make_feed(schwab, client, signed_in, feed="stream", symbols=symbols) as feed:
+        async with running(feed):
+            await schwab_connected(schwab)
+            await schwab.push_quote("SPY", 512.30, 512.34)
+            await schwab.push_quote("NVDA", 120.00, 120.02)
+            await until(feed.stream_healthy)
+            feed._warmup_bars = 2
+            feed._pending_warmup["NVDA"] = None
+            await feed.poll_once()
+            assert feed._pending_warmup == {}
+        assert schwab.calls("GET", "/marketdata/v1/quotes") == []  # the stream did the quotes
+
+
+async def test_a_symbol_dropped_during_its_history_call_is_not_replayed(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        original = client.price_history
+
+        async def drops_while_waiting(symbol, start, end):
+            raw = await original(symbol, start, end)
+            feed.set_symbols(("SPY",))
+            return raw
+
+        client.price_history = drops_while_waiting
+        await feed._warm_pending(feed.clock.now())
+        assert feed.market.drain_bars() == []
+        assert feed._pending_warmup == {}

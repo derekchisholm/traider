@@ -399,3 +399,23 @@ async def test_the_closer_task_does_not_outlive_its_connection(schwab, client, s
         await until(lambda: schwab.stream_logins == 2 and stream.connected)
         assert len(closers()) == 1  # the first connection's closer is gone
     await until(lambda: closers() == [])
+
+
+async def test_the_same_symbols_in_another_order_do_not_reconnect(schwab, client, signed_in):
+    async with running(schwab, client, signed_in) as (stream, _):
+        stream.set_symbols(("QQQ", "SPY"))
+        await asyncio.sleep(0.1)
+        assert stream.connected is True
+    assert schwab.stream_logins == 1
+
+
+async def test_a_failure_to_close_the_socket_is_logged(caplog):
+    class BrokenSocket:
+        async def close(self):
+            raise RuntimeError("socket is gone")
+
+    stream = SchwabStream(None, None, None, sink=Recorder(), clock=SystemClock(), symbols=("SPY",))
+    stream.set_symbols(("QQQ",))
+    with caplog.at_level("WARNING", logger="traider.schwab.stream"):
+        await stream._close_on_change(BrokenSocket())
+    assert "socket is gone" in caplog.text

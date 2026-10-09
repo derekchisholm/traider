@@ -107,6 +107,9 @@ class Feed:
         """Follow the engine's universe. New symbols are warmed up from history on the
         next poll; the stream resubscribes."""
         new = tuple(symbols)
+        if set(new) == set(self._symbols):
+            self._symbols = new  # only the order differs: nothing to warm up or resubscribe
+            return
         for symbol in new:
             if symbol not in self._symbols:
                 self._pending_warmup[symbol] = None
@@ -126,6 +129,11 @@ class Feed:
                 raw = await self._client.price_history(symbol, now - self.WARMUP_LOOKBACK, now)
             except SchwabError as exc:
                 self._complain(now, "warm-up history for %s not available yet: %s", symbol, exc)
+                raw = None
+            if symbol not in self._symbols:
+                self._pending_warmup.pop(symbol, None)  # dropped while we were waiting
+                continue
+            if raw is None:
                 continue  # stays queued for the next poll
             closed = [bar for bar in parse_candles(raw, symbol) if bar.start + _MINUTE <= now]
             for bar in closed[-self._warmup_bars :]:
@@ -193,21 +201,31 @@ class Feed:
 
     async def poll_once(self) -> None:
         """One REST refresh: options always, share quotes and bars unless the stream is
-        doing that job."""
+        doing that job. Warm-up of new symbols comes after the quotes, so a failing history
+        call cannot delay them, and before the bar poll, so its replayed bars arrive as
+        warm-up bars. It also runs when the market is closed or the stream is healthy."""
         now = self._clock.now()
-        await self._warm_pending(now)
         if not self._session.view(now).is_open:
+            await self._warm_pending(now)
             return
         await self._poll_options(now)
-        if self.stream_healthy():
-            return
-        if self._symbols:
-            try:
-                for quote in parse_quotes(await self._client.quotes(self._symbols), now).values():
-                    self._market.on_quote(quote)
-            except SchwabError as exc:
-                self._complain(now, "quote poll failed: %s", exc)
+        polling = not self.stream_healthy()
+        if polling:
+            await self._poll_quotes(now)
+        await self._warm_pending(now)
+        if polling:
+            await self._poll_bars(now)
 
+    async def _poll_quotes(self, now: datetime) -> None:
+        if not self._symbols:
+            return
+        try:
+            for quote in parse_quotes(await self._client.quotes(self._symbols), now).values():
+                self._market.on_quote(quote)
+        except SchwabError as exc:
+            self._complain(now, "quote poll failed: %s", exc)
+
+    async def _poll_bars(self, now: datetime) -> None:
         minute = now.replace(second=0, microsecond=0)
         due = (now - minute).total_seconds() >= self.BAR_DELAY_S
         if not due or self._bars_fetched_for == minute:

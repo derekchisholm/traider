@@ -101,9 +101,10 @@ class SchwabStream:
 
     def set_symbols(self, symbols: Sequence[str]) -> None:
         """Watch these symbols instead. A live connection is closed and reopened at once
-        with the new subscription; the feed polls while that happens."""
+        with the new subscription; the feed polls while that happens. The same symbols in
+        another order are not a change."""
         new = tuple(symbols)
-        if new == self._symbols:
+        if set(new) == set(self._symbols):
             return
         self._symbols = new
         self._changed.set()
@@ -197,7 +198,10 @@ class SchwabStream:
         ``_changed`` is cleared at the top of the next loop, not here, so a change made
         during the handshake still closes the connection that was being set up."""
         await self._changed.wait()
-        await ws.close()
+        try:
+            await ws.close()
+        except Exception as exc:
+            log.warning("stream: closing the socket after a symbol change failed: %s", exc)
 
     async def _command(
         self,
