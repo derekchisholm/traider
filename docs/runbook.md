@@ -276,18 +276,31 @@ table first.
 
 **Change the code:** edit, then `pulumi up`. Same stop-then-start.
 
+**Switch research off** (`traider:research` from `true` to `false`, then `pulumi up`): the
+bot restarts on the old rules, with no ledger, and manages only holdings in pinned
+symbols. A position it opened from a pick is not pinned, so after the restart it gets
+*X is held but not managed* (`unmanaged_holding`) and the bot leaves it alone, sells
+included. **Sell or pin those positions first.** With research off the stack needs pinned
+symbols, and a settings version with none is rejected. On a paper stack `pulumi up` also
+deletes the research table, with every pick and posture in it (deletion protection is
+live-only). On a live stack the table is protected against deletion, so lift that first
+as under *Remove everything* below, with `pulumi stack output researchTable`.
+
 **Stop for a while:** set the switch to `halt`. Scaling the service to zero by hand
 does not last with the default schedule, which starts it again at 09:00 New York
 time on the next weekday.
 
 **Remove everything:** `pulumi destroy`. The two secrets enter AWS's 30-day recovery
-window. A live stack's state and settings tables are protected against deletion; lift
-that first:
+window. A live stack's state and settings tables (and research table, with research on)
+are protected against deletion; lift that first:
 
 ```sh
 aws dynamodb update-table --table-name "$(pulumi stack output stateTable)" \
   --no-deletion-protection-enabled
 aws dynamodb update-table --table-name "$(pulumi stack output settingsTable)" \
+  --no-deletion-protection-enabled
+# With research on:
+aws dynamodb update-table --table-name "$(pulumi stack output researchTable)" \
   --no-deletion-protection-enabled
 ```
 

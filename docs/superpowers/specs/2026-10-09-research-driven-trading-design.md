@@ -230,7 +230,10 @@ When the universe changes:
 
 * **Added:** warm-up bars come from price history for that symbol alone, then the
   stream subscription is updated (`SUBS` with the full key list) and polling covers
-  it until the stream delivers. The strategy sees warm-up bars marked as such.
+  it until the stream delivers. Warm-up bars reach the strategy as ordinary bars, as
+  the start-up warm-up always has. A symbol whose history fails (at start-up or later)
+  is retried on the next poll without holding up the others; its bar polls are retried
+  the same way.
 * **Dropped:** only once it is flat with nothing working or pending. Until then it
   stays, so exits keep running.
 * A `universe_changed` event lists what was added and dropped.
@@ -372,8 +375,8 @@ still flattens everything when set.
   `traider:researchSettings` sets the `research` block (A.7) and is validated always, used
   only when research is on.
 * Task role: read and conditional-write on the settings table, read on the research
-  table and its index, and the existing state-table permissions (which cover the
-  ledger).
+  table by key only (`GetItem` and `Query` on the table; no access to its index, which is
+  for reports), and the existing state-table permissions (which cover the ledger).
 * Environment: `TRAIDER_SETTINGS_TABLE`; `TRAIDER_RESEARCH_TABLE` only when research is
   on; `TRAIDER_RESEARCH` carries `researchSettings` as JSON.
 * `localEnv` output gains the settings table name, and the research table name when
