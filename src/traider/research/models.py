@@ -113,6 +113,11 @@ class RunMeta(BaseModel):
     cost_usd: Decimal = Field(default=Decimal(0), ge=0)
     s3_prefix: str = ""
     error: str = Field(default="", max_length=2000)
+    # Added for the research jobs (C1). Defaulted, so items written before still parse.
+    tokens_in: int = Field(default=0, ge=0)
+    tokens_out: int = Field(default=0, ge=0)
+    notes: tuple[Annotated[str, Field(max_length=300)], ...] = ()
+    counts: dict[str, Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
 
     @field_validator("started_at")
     @classmethod

@@ -158,3 +158,49 @@ def test_posture_and_run_meta_parse():
     assert meta.status is RunStatus.OK
     with pytest.raises(ValidationError):
         RunMeta.model_validate(meta.model_dump(mode="json") | {"kind": "hourly"})
+
+
+def test_run_meta_carries_tokens_notes_and_counts():
+    meta = RunMeta.model_validate(
+        {
+            "run_id": "premarket-20261009T120000Z-ab12",
+            "kind": "premarket",
+            "status": "partial",
+            "started_at": T0.isoformat(),
+            "trading_day": "2026-10-09",
+            "tokens_in": 7000,
+            "tokens_out": 1400,
+            "notes": ["deadline passed: 2 deep-dives not started"],
+            "counts": {"candidates": 8, "picks": 3},
+        }
+    )
+    assert (meta.tokens_in, meta.tokens_out) == (7000, 1400)
+    assert meta.notes == ("deadline passed: 2 deep-dives not started",)
+    assert meta.counts == {"candidates": 8, "picks": 3}
+
+
+def test_run_meta_written_before_c1_still_parses_with_defaults():
+    old = {
+        "run_id": "r1",
+        "kind": "manual",
+        "status": "ok",
+        "started_at": T0.isoformat(),
+        "trading_day": "2026-10-09",
+    }
+    meta = RunMeta.model_validate(old)
+    assert (meta.tokens_in, meta.tokens_out, meta.notes, meta.counts) == (0, 0, (), {})
+
+
+@pytest.mark.parametrize(
+    "bad", [{"tokens_in": -1}, {"notes": ["x" * 301]}, {"counts": {"picks": -1}}]
+)
+def test_bad_run_accounting_is_rejected(bad):
+    base = {
+        "run_id": "r1",
+        "kind": "premarket",
+        "status": "ok",
+        "started_at": T0.isoformat(),
+        "trading_day": "2026-10-09",
+    }
+    with pytest.raises(ValidationError):
+        RunMeta.model_validate(base | bad)

@@ -166,14 +166,20 @@ class Config(BaseModel):
     state_table: str | None = None
     settings_table: str | None = None
     research_table: str | None = None
+    # The research jobs' audit trail (S3) and where their Finnhub key is stored.
+    research_bucket: str | None = None
+    finnhub_secret_id: str | None = None
     alert_topic_arn: str | None = None
     reauth_url: str | None = None
 
     # Local-development alternatives to Secrets Manager.
     schwab_app_key: str | None = None
-    schwab_app_secret: str | None = None
+    # Kept out of repr, so a logged or printed Config never shows it.
+    schwab_app_secret: str | None = Field(default=None, repr=False)
     schwab_token_file: str | None = None
     schwab_callback_url: str | None = None
+    # For local research runs only; deployed runs read finnhub_secret_id.
+    finnhub_api_key: str | None = Field(default=None, repr=False)
 
     heartbeat_file: str = "/tmp/traider-heartbeat"  # noqa: S108
     log_level: str = "INFO"
