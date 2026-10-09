@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 
 # LEVELONE_EQUITIES field numbers (schwab-py LevelOneEquityFields).
 _BID, _ASK, _LAST, _QUOTE_TIME, _TRADE_TIME = "1", "2", "3", "34", "35"
+_EARLIEST = datetime(2020, 1, 1, tzinfo=UTC)
 LEVEL_ONE_FIELDS = "0,1,2,3,4,5,8,34,35"
 # CHART_EQUITY: 0 key, 1 sequence, 2 open, 3 high, 4 low, 5 close, 6 volume, 7 time, 8 day.
 CHART_FIELDS = "0,1,2,3,4,5,6,7,8"
@@ -248,12 +249,10 @@ class SchwabStream:
         if bid is None or ask is None:
             return
         last = _decimal(known.get(_LAST))
-        when = (
-            _from_ms(known.get(_QUOTE_TIME))
-            or _from_ms(known.get(_TRADE_TIME))
-            or _from_ms(stamp)
-            or now
-        )
+        times = [
+            t for t in map(_market_time, (known.get(_QUOTE_TIME), known.get(_TRADE_TIME))) if t
+        ]
+        when = max(times) if times else (_market_time(stamp) or now)
         self._sink.on_quote(
             Quote(
                 symbol=symbol,
@@ -292,6 +291,12 @@ def _decimal(value: Any) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return number if number.is_finite() else None
+
+
+def _market_time(value: Any) -> datetime | None:
+    """A millisecond timestamp, or None if the value cannot be one (a price, say)."""
+    when = _from_ms(value)
+    return when if when is not None and when >= _EARLIEST else None
 
 
 def _from_ms(value: Any) -> datetime | None:

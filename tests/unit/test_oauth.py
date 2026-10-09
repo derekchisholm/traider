@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import http.client
 
 import pytest
 
 from tests.fakes.schwab_server import APP_KEY, APP_SECRET, query_of, redirect_url
+from traider.schwab import oauth
 from traider.schwab.oauth import (
     AppCredentials,
     OAuthError,
@@ -192,3 +194,13 @@ async def test_errors_never_contain_the_secret_or_the_token(schwab):
 def test_tokens_are_only_ever_sent_over_https(url):
     with pytest.raises(ValueError, match="https"):
         refresh_access_token(CREDS, "r", token_url=url)
+
+
+async def test_a_reply_cut_off_half_way_is_an_ordinary_failure(monkeypatch):
+    def cut_off(*_args, **_kwargs):
+        raise http.client.IncompleteRead(b"{")
+
+    monkeypatch.setattr(oauth._OPENER, "open", cut_off)
+    with pytest.raises(OAuthError) as caught:
+        await in_thread(refresh_access_token, CREDS, "r", token_url="https://x.test/token")
+    assert caught.value.rejected is False

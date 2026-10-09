@@ -229,11 +229,21 @@ async def test_code_schwab_does_not_accept_stores_nothing(cloud, schwab):
     assert alerts(cloud) == []
 
 
-async def test_error_from_schwab_is_shown_safely(cloud, schwab):
+async def test_error_text_from_a_stranger_is_not_shown_at_all(cloud, schwab):
     app = make_app(cloud, schwab)
     response = await call(
+        app, get("/callback", error="access_denied", error_description="Call 555-0100", state="s")
+    )
+    assert response["statusCode"] == 400
+    assert "555-0100" not in response["body"] and "access_denied" not in response["body"]
+
+
+async def test_error_from_schwab_is_shown_safely(cloud, schwab):
+    app = make_app(cloud, schwab)
+    state = await start_state(app)
+    response = await call(
         app,
-        get("/callback", error="<script>alert(1)</script>", error_description="x<b>y", state="s"),
+        get("/callback", error="<script>alert(1)</script>", error_description="x<b>y", state=state),
     )
     assert response["statusCode"] == 400
     assert "<script>" not in response["body"]

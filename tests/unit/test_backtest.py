@@ -130,6 +130,20 @@ async def test_symbols_are_replayed_together_in_time_order():
     assert [t.time for t in result.trades] == sorted(t.time for t in result.trades)
 
 
+async def test_a_symbol_with_no_bar_this_minute_is_not_traded_on_its_old_price():
+    opening = datetime(2026, 10, 8, 13, 30, tzinfo=UTC)  # 09:30 New York
+    spy = bars([100] * 10, start=opening)  # flat: never a signal
+    qqq = bars([100, 101], symbol="QQQ", start=opening)  # a buy signal, then silence
+    both = config(symbols=("SPY", "QQQ"), risk={"entry_delay_min_after_open": 5})
+    result = await run_backtest(
+        sorted(spy + qqq, key=lambda bar: bar.start), both, spread_bps=Decimal(0)
+    )
+    # The signal came inside the opening delay. By the time buying is allowed, QQQ's
+    # last price is minutes old, and the bot must not trade on it.
+    assert result.trades == ()
+    assert result.blocked["no_quote"] + result.blocked["quote_stale"] > 0
+
+
 async def test_bars_for_symbols_not_in_the_config_are_an_error():
     with pytest.raises(BacktestError, match="IWM"):
         await run_backtest(bars([100, 101], symbol="IWM"), config(), spread_bps=Decimal(0))

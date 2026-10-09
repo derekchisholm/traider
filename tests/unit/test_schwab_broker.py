@@ -208,10 +208,33 @@ async def test_open_orders_exclude_finished_ones(broker, schwab):
     assert [o.order_id for o in await broker.get_open_orders()] == [resting]
 
 
-async def test_open_orders_cover_the_last_few_days(broker, schwab):
+async def test_open_orders_include_the_working_legs_of_a_bracket(broker, schwab, monkeypatch):
+    def leg(order_id, status):
+        return {
+            "orderId": order_id,
+            "status": status,
+            "quantity": 3.0,
+            "filledQuantity": 0.0,
+            "enteredTime": "2026-10-08T14:59:58+0000",
+            "orderLegCollection": [
+                {"instruction": "SELL", "quantity": 3.0, "instrument": {"symbol": "SPY"}}
+            ],
+        }
+
+    async def listing(*_args, **_kwargs):
+        parent = leg(700, "FILLED")
+        parent["childOrderStrategies"] = [leg(701, "WORKING"), leg(702, "CANCELED")]
+        return [parent]
+
+    await broker.get_account()  # resolves the account first
+    monkeypatch.setattr(broker._client, "orders", listing)
+    assert [(o.order_id, o.symbol) for o in await broker.get_open_orders()] == [("701", "SPY")]
+
+
+async def test_open_orders_include_a_good_till_cancelled_order_from_months_ago(broker, schwab):
     schwab.fill_on_place = False
     order_id = await broker.place(BUY3)
-    schwab.orders[int(order_id)].entered = datetime.now(UTC) - timedelta(days=2)
+    schwab.orders[int(order_id)].entered = datetime.now(UTC) - timedelta(days=170)
     assert [o.order_id for o in await broker.get_open_orders()] == [order_id]
 
 

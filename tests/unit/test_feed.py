@@ -59,6 +59,11 @@ async def make_feed(schwab, client, signed_in, *, feed="poll", now=NOW, symbols=
         yield built
 
 
+async def schwab_connected(schwab) -> None:
+    await until(lambda: sum(r["command"] == "SUBS" for r in schwab.stream_requests) >= 2)
+    await asyncio.sleep(0.02)
+
+
 # --- polling ------------------------------------------------------------------------
 
 
@@ -235,7 +240,7 @@ async def running(feed):
 
 async def test_stream_quotes_flow_into_the_market(schwab, client, signed_in):
     async with make_feed(schwab, client, signed_in, feed="stream") as feed, running(feed):
-        await until(lambda: len(schwab.sockets) == 1 and feed.stream_healthy())
+        await schwab_connected(schwab)
         await schwab.push_quote("SPY", 512.30, 512.34)
         await until(lambda: feed.market.quote("SPY") is not None)
     assert schwab.calls("GET", "/marketdata/v1/quotes") == []
@@ -243,6 +248,8 @@ async def test_stream_quotes_flow_into_the_market(schwab, client, signed_in):
 
 async def test_no_polling_while_the_stream_is_healthy(schwab, client, signed_in):
     async with make_feed(schwab, client, signed_in, feed="stream") as feed, running(feed):
+        await schwab_connected(schwab)
+        await schwab.push_quote("SPY", 512.30, 512.34)
         await until(feed.stream_healthy)
         await feed.poll_once()
     assert schwab.calls("GET", "/marketdata/v1/quotes") == []
@@ -260,11 +267,45 @@ async def test_polling_takes_over_when_the_stream_is_down(schwab, client, signed
 async def test_polling_takes_over_when_the_stream_goes_silent(schwab, client, signed_in):
     schwab.set_quote("SPY", 512.30, 512.34)
     async with make_feed(schwab, client, signed_in, feed="stream") as feed, running(feed):
+        await schwab_connected(schwab)
+        await schwab.push_quote("SPY", 512.10, 512.14)
         await until(feed.stream_healthy)
         feed.clock.advance(40)  # connected, but nothing has arrived for 40 seconds
         assert feed.stream_healthy() is False
         await feed.poll_once()
         assert feed.market.quote("SPY") is not None
+
+
+async def test_heartbeats_alone_do_not_count_as_a_working_stream(schwab, client, signed_in):
+    schwab.now = NOW.timestamp
+    schwab.set_quote("SPY", 512.30, 512.34)
+    async with make_feed(schwab, client, signed_in, feed="stream") as feed, running(feed):
+        await schwab_connected(schwab)
+        await schwab.push_quote("SPY", 512.10, 512.14)
+        await until(feed.stream_healthy)
+        feed.clock.advance(40)
+        await schwab.push_heartbeat()  # the socket is alive, but no prices are coming
+        await asyncio.sleep(0.05)
+        assert feed.stream_healthy() is False
+        await feed.poll_once()
+        assert feed.market.quote("SPY").bid == Decimal("512.3")
+
+
+async def test_polling_covers_a_symbol_the_stream_is_not_delivering(schwab, client, signed_in):
+    schwab.now = NOW.timestamp
+    schwab.set_quote("SPY", 512.30, 512.34)
+    schwab.set_quote("QQQ", 440.10, 440.15)
+    symbols = ("SPY", "QQQ")
+    async with (
+        make_feed(schwab, client, signed_in, feed="stream", symbols=symbols) as feed,
+        running(feed),
+    ):
+        await schwab_connected(schwab)
+        await schwab.push_quote("SPY", 512.10, 512.14)
+        await until(lambda: feed.market.quote("SPY") is not None)
+        assert feed.stream_healthy() is False  # nothing for QQQ yet
+        await feed.poll_once()
+        assert feed.market.quote("QQQ").bid == Decimal("440.1")
 
 
 async def test_run_warms_up_before_any_live_data(schwab, client, signed_in):

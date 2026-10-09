@@ -33,7 +33,7 @@ _MINUTE = timedelta(minutes=1)
 
 
 class Feed:
-    STREAM_SILENCE_S = 30.0  # connected but nothing received for this long: not healthy
+    STREAM_SILENCE_S = 5.0  # a symbol with no stream price for this long is polled instead
     BAR_DELAY_S = 5.0  # give Schwab a moment to publish a minute after it closes
     BAR_LOOKBACK = timedelta(minutes=5)
     WARMUP_LOOKBACK = timedelta(days=5)  # reaches the previous session across a weekend
@@ -85,11 +85,18 @@ class Feed:
     # --------------------------------------------------------------- status
 
     def stream_healthy(self) -> bool:
+        """True while the stream is delivering prices for every symbol. A socket that is
+        connected, or that only sends heartbeats, is not enough: polling must cover
+        whatever the stream is not."""
         stream = self._stream
-        if stream is None or not stream.connected or stream.last_message_at is None:
+        if stream is None or not stream.connected:
             return False
-        silence = (self._clock.now() - stream.last_message_at).total_seconds()
-        return silence <= self.STREAM_SILENCE_S
+        now = self._clock.now()
+        for symbol in self._symbols:
+            quote = self._market.quote(symbol)
+            if quote is None or (now - quote.received_at).total_seconds() > self.STREAM_SILENCE_S:
+                return False
+        return True
 
     # -------------------------------------------------------------- running
 

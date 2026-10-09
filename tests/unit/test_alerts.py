@@ -101,3 +101,22 @@ async def test_log_alerter_remembers_what_it_was_asked_to_send():
     alerter = LogAlerter()
     await alerter.send("k", "subject", "message")
     assert alerter.sent == [("k", "subject", "message")]
+
+
+LINK = "https://abc.execute-api.us-east-1.amazonaws.com/start?k=SECRETKEY123"
+
+
+async def test_the_sign_in_key_is_published_but_never_written_to_the_log(sns, caplog):
+    client, arn = sns
+    caplog.set_level("WARNING")
+    await SnsAlerter(arn, client, ManualClock(T0)).send("auth", "Sign in", f"Go to:\n{LINK}")
+    assert LINK in sent(arn)[0][1]  # the person needs the whole link
+    assert "SECRETKEY123" not in caplog.text
+    assert "https://abc.execute-api.us-east-1.amazonaws.com/start?[redacted]" in caplog.text
+
+
+async def test_log_alerter_keeps_the_sign_in_key_out_of_the_log_too(caplog):
+    caplog.set_level("WARNING")
+    await LogAlerter().send("auth", "Sign in", f"Go to {LINK} now")
+    assert "SECRETKEY123" not in caplog.text
+    assert "Go to" in caplog.text and "now" in caplog.text

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -25,6 +26,15 @@ class Alerter(Protocol):
     async def send(self, key: str, subject: str, message: str) -> None:
         """Send an alert. ``key`` identifies the condition, for rate limiting."""
         ...
+
+
+_URL_QUERY = re.compile(r"(https?://[^\s?#]+)[?#]\S*")
+
+
+def _for_log(message: str) -> str:
+    """Alert text as it may appear in logs: links lose their query string, because the
+    sign-in link carries a key and logs are read by more people than alerts are."""
+    return _URL_QUERY.sub(r"\1?[redacted]", message)
 
 
 def publish(client: Any, topic_arn: str, subject: str, message: str) -> None:
@@ -45,7 +55,7 @@ class LogAlerter:
 
     async def send(self, key: str, subject: str, message: str) -> None:
         self.sent.append((key, subject, message))
-        log.warning("ALERT %s: %s | %s", key, subject, message)
+        log.warning("ALERT %s: %s | %s", key, subject, _for_log(message))
 
 
 class SnsAlerter:
@@ -68,7 +78,7 @@ class SnsAlerter:
         last = self._last_sent.get(key)
         if last is not None and (now - last).total_seconds() < self._min_interval_s:
             return
-        log.warning("ALERT %s: %s | %s", key, subject, message)
+        log.warning("ALERT %s: %s | %s", key, subject, _for_log(message))
         try:
             await asyncio.to_thread(publish, self._client, self._topic_arn, subject, message)
         except Exception:

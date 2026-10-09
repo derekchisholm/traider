@@ -110,6 +110,25 @@ async def test_a_quote_update_reaches_the_sink(schwab, client, signed_in):
     assert quote.delayed is False
 
 
+async def test_quote_time_is_the_newer_of_the_quote_and_trade_times(schwab, client, signed_in):
+    async with running(schwab, client, signed_in) as (_, sink):
+        await schwab.push_level_one(
+            "SPY", f1=512.30, f2=512.34, f34=1760972400000, f35=1760972460000
+        )
+        await until(lambda: sink.quotes)
+    assert sink.quotes[0].ts == datetime.fromtimestamp(1760972460, UTC)
+
+
+async def test_a_time_field_that_is_not_a_timestamp_is_not_believed(schwab, client, signed_in):
+    # If Schwab numbers its fields differently from the libraries this follows, the
+    # "time" slots would hold prices. Those must not turn into dates in 1970.
+    async with running(schwab, client, signed_in) as (_, sink):
+        await schwab.push_level_one("SPY", f1=512.30, f2=512.34, f34=512.31, f35=1200)
+        await until(lambda: sink.quotes)
+    quote = sink.quotes[0]
+    assert abs((quote.ts - quote.received_at).total_seconds()) < 5
+
+
 async def test_partial_updates_are_merged_with_what_is_already_known(schwab, client, signed_in):
     async with running(schwab, client, signed_in) as (_, sink):
         await schwab.push_quote("SPY", 512.30, 512.34)

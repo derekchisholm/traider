@@ -441,6 +441,27 @@ async def test_invalidating_an_old_token_does_not_discard_the_current_one(linked
     assert await tokens.access_token() == second
 
 
+async def test_repeated_rejections_do_not_hammer_the_token_endpoint(linked, clock):
+    # Some 401s have nothing to do with the token (an app missing an API product, say).
+    tokens = manager(linked, clock, signed_in_store(linked, clock))
+    token = await tokens.access_token()
+    for _ in range(10):
+        await tokens.invalidate(token)
+        token = await tokens.access_token()
+        clock.advance(1)
+    assert token_requests(linked) == 2  # the first one, and one replacement
+
+
+async def test_a_rejected_token_can_be_replaced_again_after_a_pause(linked, clock):
+    tokens = manager(linked, clock, signed_in_store(linked, clock))
+    first = await tokens.access_token()
+    await tokens.invalidate(first)
+    second = await tokens.access_token()
+    clock.advance(31)
+    await tokens.invalidate(second)
+    assert await tokens.access_token() not in (first, second)
+
+
 async def test_bot_does_not_write_the_store_when_the_refresh_token_is_unchanged(linked, clock):
     store = signed_in_store(linked, clock)
     tokens = manager(linked, clock, store)
