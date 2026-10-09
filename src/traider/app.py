@@ -186,23 +186,18 @@ class Bot:
         summary = describe(self.config, self.settings)
         log.info("starting: %s", summary)
         if self.config.trading_mode == "live":
-            await self.alerts.send(
-                "startup",
-                "traider started in LIVE mode",
+            body = (
                 "Real orders go out once the control switch is set to live.\n"
                 f"Symbols: {', '.join(self.settings.pinned_symbols)}\n"
                 f"Strategy: {self.settings.strategy} {self.settings.strategy_params}\n"
-                f"Limits: {summary['risk']}",
+                f"Limits: {summary['risk']}"
             )
-        if self.settings_drift:
-            await self.alerts.send(
-                "settings_drift",
-                "Stack settings differ from the settings table",
-                "The stack's settings (the TRAIDER_* values from Pulumi) differ from the "
-                f"settings table in: {', '.join(self.settings_drift)}.\n"
-                "The table wins: the bot runs on the table's values, and `pulumi up` does not "
-                "change it. Change it with `traider settings apply`.",
-            )
+            if self.settings_drift:
+                body += (
+                    "\nSettings table differs from the stack's settings in: "
+                    f"{', '.join(self.settings_drift)} (the table is in force)"
+                )
+            await self.alerts.send("startup", "traider started in LIVE mode", body)
 
     async def _watch_auth(self) -> None:
         """Keep the access token warm and report changes in the sign-in state."""

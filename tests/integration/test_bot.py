@@ -514,14 +514,9 @@ async def test_bot_builds_and_starts_on_the_environment_when_the_settings_table_
     assert world.bot.settings_drift == []  # nothing loaded, so nothing to compare
 
 
-async def test_a_stored_version_that_differs_from_the_stack_is_reported_as_drift(
-    world, aws, caplog
-):
+async def write_differing_version(config) -> None:
     from traider.settings import Settings
 
-    create_settings_table()
-    world.sign_in()
-    config = world.config(settings_table=SETTINGS_TABLE)
     stored = Settings.from_config(config)
     stored = stored.model_copy(
         update={
@@ -530,6 +525,13 @@ async def test_a_stored_version_that_differs_from_the_stack_is_reported_as_drift
         }
     )
     await settings_store().write(stored, expected_version=0, author="test", note="", now=START)
+
+
+async def test_drift_is_logged_and_added_to_the_live_start_alert(world, aws, caplog):
+    create_settings_table()
+    world.sign_in()
+    config = live_config(world, settings_table=SETTINGS_TABLE)
+    await write_differing_version(config)
     with caplog.at_level("WARNING", logger="traider.app"):
         await world.start(config)
     assert world.bot.settings_drift == ["order_timeout_s", "risk.max_order_usd"]
@@ -537,21 +539,34 @@ async def test_a_stored_version_that_differs_from_the_stack_is_reported_as_drift
     assert "order_timeout_s, risk.max_order_usd" in warning
     assert "250" not in warning and "45" not in warning  # keys only, no values
 
-    await until(lambda: any(key == "settings_drift" for key, _, _ in world.bot.alerts.sent))
-    (_, subject, body) = next(a for a in world.bot.alerts.sent if a[0] == "settings_drift")
-    assert subject == "Stack settings differ from the settings table"
-    assert "order_timeout_s, risk.max_order_usd" in body
-    assert "The table wins" in body and "`pulumi up` does not change it" in body
-    assert "250" not in body and "45" not in body
+    await until(lambda: any(key == "startup" for key, _, _ in world.bot.alerts.sent))
+    (_, _, body) = next(a for a in world.bot.alerts.sent if a[0] == "startup")
+    assert (
+        "Settings table differs from the stack's settings in: order_timeout_s, "
+        "risk.max_order_usd (the table is in force)"
+    ) in body
+    assert "250" not in body.split("differs", 1)[1] and "45" not in body.split("differs", 1)[1]
+    assert all(key != "settings_drift" for key, _, _ in world.bot.alerts.sent)
 
 
-async def test_a_table_that_matches_the_stack_raises_no_drift(world, aws):
+async def test_paper_mode_gets_the_drift_in_the_log_only(world, aws, caplog):
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    await write_differing_version(config)
+    with caplog.at_level("WARNING", logger="traider.app"):
+        await world.start(config)
+    assert world.bot.settings_drift == ["order_timeout_s", "risk.max_order_usd"]
+    assert any("differ" in r.getMessage() for r in caplog.records)
+    await asyncio.sleep(0.1)
+    assert all(key not in ("startup", "settings_drift") for key, _, _ in world.bot.alerts.sent)
+
+
+async def test_a_table_that_matches_the_stack_has_no_drift(world, aws):
     create_settings_table()
     world.sign_in()
     await world.start(world.config(settings_table=SETTINGS_TABLE))  # seeds from the stack
     assert world.bot.settings_drift == []
-    await asyncio.sleep(0.1)
-    assert all(key != "settings_drift" for key, _, _ in world.bot.alerts.sent)
 
 
 async def test_no_settings_table_means_no_drift_to_report(world, aws):

@@ -175,8 +175,8 @@ async def test_apply_says_which_version_won_when_it_was_superseded_at_once(tmp_p
     )
     assert code == 1
     assert out.getvalue() == (
-        "written as version 2, but version 3 was written at the same time and is the one "
-        "in force; run `traider settings show`\n"
+        "written as version 2, but version 3 was written at the same time and is now the "
+        "newest version; run `traider settings show`\n"
     )
     assert "superseded at once" not in out.getvalue()
 

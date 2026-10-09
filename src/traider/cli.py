@@ -518,7 +518,7 @@ async def settings_apply(
     except SettingsSuperseded as exc:
         out.write(
             f"written as version {exc.written}, but version {exc.newest} was written at the "
-            "same time and is the one in force; run `traider settings show`\n"
+            "same time and is now the newest version; run `traider settings show`\n"
         )
         return 1
     except SettingsConflict as exc:
