@@ -1,6 +1,7 @@
 """One contract, two implementations: in-memory and DynamoDB (through moto)."""
 
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import boto3
 import pytest
@@ -265,3 +266,101 @@ async def test_picks_are_indexed_by_symbol_for_reports(store):
         ExpressionAttributeValues={":p": "SYM#NVDA"},
     )
     assert [item["gsi1sk"] for item in response["Items"]] == [f"{DAY}#r1"]
+
+
+# --- the research jobs' side of the table (C1) ----------------------------------------------
+
+LATER = datetime(2026, 10, 9, 12, 30, tzinfo=UTC)
+
+
+def job_meta(run_id, kind="premarket", status="ok", day=DAY) -> RunMeta:
+    return meta(run_id, status, day).model_copy(update={"kind": kind})
+
+
+async def test_a_running_meta_is_written_alone_and_found_by_day_and_kind(store):
+    await store.put_meta(job_meta("premarket-a", status="running"))
+    (found,) = await store.runs_for_day(DAY, "premarket")
+    assert (found.run_id, found.status.value) == ("premarket-a", "running")
+    assert await store.runs_for_day(DAY, "intraday") == []
+    assert await store.runs_for_day("2026-10-08", "premarket") == []
+
+
+async def test_the_final_meta_replaces_the_running_one(store):
+    await store.put_meta(job_meta("premarket-a", status="running"))
+    await store.write_run(job_meta("premarket-a", status="partial"), [], None)
+    (found,) = await store.runs_for_day(DAY, "premarket")
+    assert found.status.value == "partial"
+
+
+async def test_runs_for_day_lists_every_run_of_that_kind(store):
+    await store.write_run(job_meta("premarket-a"), [], None)
+    await store.write_run(job_meta("premarket-b", status="failed"), [], None)
+    await store.write_run(job_meta("manual-c", kind="manual"), [], None)
+    found = await store.runs_for_day(DAY, "premarket")
+    assert [m.run_id for m in found] == ["premarket-a", "premarket-b"]
+
+
+async def test_an_unreadable_meta_is_skipped_by_runs_for_day(store):
+    await store.write_run(job_meta("premarket-a"), [], None)
+    if isinstance(store, MemoryResearchStore):
+        store.raw("RUN#premarket-a", "META")["body"] = "{not json"
+    else:
+        store._table.update_item(
+            Key={"pk": "RUN#premarket-a", "sk": "META"},
+            UpdateExpression="SET body = :b",
+            ExpressionAttributeValues={":b": "{not json"},
+        )
+    assert await store.runs_for_day(DAY, "premarket") == []
+
+
+async def test_day_cost_adds_up_and_starts_at_zero(store):
+    assert await store.day_cost(DAY) == Decimal(0)
+    assert await store.add_day_cost(DAY, Decimal("1.1200")) == Decimal("1.12")
+    assert await store.add_day_cost(DAY, Decimal("0.0350")) == Decimal("1.155")
+    assert await store.day_cost(DAY) == Decimal("1.155")
+    assert await store.day_cost("2026-10-08") == Decimal(0)
+
+
+async def test_a_cost_cannot_be_taken_back(store):
+    with pytest.raises(ValueError, match="only grow"):
+        await store.add_day_cost(DAY, Decimal("-1"))
+
+
+async def test_only_one_holder_of_a_lock_until_it_expires(store):
+    assert await store.acquire_lock("premarket", "run-a", 3600, T0)
+    assert not await store.acquire_lock("premarket", "run-b", 3600, T0)
+    assert not await store.acquire_lock("premarket", "run-b", 3600, LATER)  # 30 of 60 minutes
+    assert await store.acquire_lock("other-kind", "run-b", 3600, T0)
+
+
+async def test_an_expired_lock_can_be_taken_over(store):
+    assert await store.acquire_lock("premarket", "run-a", 60, T0)
+    assert await store.acquire_lock("premarket", "run-b", 60, LATER)
+
+
+async def test_a_released_lock_is_free_and_only_its_owner_can_release_it(store):
+    assert await store.acquire_lock("premarket", "run-a", 3600, T0)
+    await store.release_lock("premarket", "run-b")  # not the owner: nothing happens
+    assert not await store.acquire_lock("premarket", "run-b", 3600, T0)
+    await store.release_lock("premarket", "run-a")
+    assert await store.acquire_lock("premarket", "run-b", 3600, T0)
+
+
+async def test_releasing_a_lock_nobody_holds_is_harmless(store):
+    await store.release_lock("premarket", "run-a")
+
+
+async def test_the_bots_day_read_ignores_the_jobs_own_items(store):
+    await store.add_day_cost(DAY, Decimal(1))
+    await store.acquire_lock("premarket", "run-a", 600, T0)
+    await store.put_meta(job_meta("premarket-a", status="running"))
+    day = await store.day(DAY)
+    assert (day.picks, day.postures, dict(day.runs), day.invalid) == ((), (), {}, 0)
+
+
+async def test_meta_items_are_indexed_by_day_and_kind_for_the_jobs(store):
+    if isinstance(store, MemoryResearchStore):
+        pytest.skip("the index is a DynamoDB feature")
+    await store.write_run(job_meta("premarket-a"), [pick(run_id="premarket-a")], None)
+    item = store._table.get_item(Key={"pk": "RUN#premarket-a", "sk": "META"})["Item"]
+    assert (item["gsi1pk"], item["gsi1sk"]) == (f"RUNDAY#{DAY}", "premarket#premarket-a")
