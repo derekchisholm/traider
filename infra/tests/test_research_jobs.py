@@ -18,6 +18,10 @@ BUCKET = "aws:s3/bucket:Bucket"
 SCHEDULE = "aws:scheduler/schedule:Schedule"
 RULE = "aws:cloudwatch/eventRule:EventRule"
 CLUSTER = "aws:ecs/cluster:Cluster"
+QUEUE = "aws:sqs/queue:Queue"
+ALARM = "aws:cloudwatch/metricAlarm:MetricAlarm"
+TOPIC_POLICY = "aws:sns/topicPolicy:TopicPolicy"
+LOG_GROUP = "aws:cloudwatch/logGroup:LogGroup"
 
 
 @pytest.fixture(scope="module")
@@ -51,6 +55,15 @@ def test_research_jobs_are_off_by_default(paper):
 
 def test_research_on_alone_creates_no_jobs():
     assert deploy({"research": True}).of(SCHEDULE) == []
+
+
+@pytest.mark.parametrize("config", [{}, {"research": True}], ids=["default", "research-only"])
+def test_without_the_jobs_there_is_no_dead_letter_queue_or_new_alarm(config):
+    deployment = deploy({**config, "alertEmail": "ops@example.test"})
+    assert deployment.of(QUEUE) == []
+    assert deployment.of(ALARM) == []
+    policy = json.loads(deployment.one(TOPIC_POLICY).inputs["policy"])
+    assert [s["Sid"] for s in policy["Statement"]] == ["TaskStoppedAlarm"]
 
 
 def test_research_jobs_without_research_are_refused():
@@ -88,6 +101,26 @@ def test_the_trail_bucket_is_private_encrypted_tls_only_and_expiring(jobs):
     assert (deny["Effect"], deny["Principal"], deny["Action"]) == ("Deny", "*", "s3:*")
     assert deny["Condition"] == {"Bool": {"aws:SecureTransport": "false"}}
     assert deny["Resource"] == [bucket.arn, f"{bucket.arn}/*"]
+
+
+@pytest.mark.parametrize(
+    "stack",
+    ["Dev", "dev_1", "a-stack-name-long-enough-to-overflow-63"],
+    ids=["uppercase", "underscore", "too-long"],
+)
+def test_a_stack_name_s3_would_refuse_fails_at_load(stack):
+    with pytest.raises(Exception, match="research trail bucket would be named"):
+        deploy({"research": True, "researchJobs": True}, stack=stack)
+
+
+def test_the_longest_allowed_stack_name_still_deploys():
+    stack = "s" * (35 - len("traider-"))  # the bucket name is then exactly 63 characters
+    deployment = deploy({"research": True, "researchJobs": True}, stack=stack)
+    assert len(deployment.one(BUCKET).inputs["bucket"]) == 63
+
+
+def test_a_bad_stack_name_is_fine_without_the_jobs():
+    assert deploy({"research": True}, stack="Dev").of(BUCKET) == []
 
 
 def test_a_live_stack_keeps_its_trail_on_destroy(jobs):
@@ -134,6 +167,7 @@ def test_the_task_is_told_where_everything_is_and_nothing_secret(jobs):
     assert env["TRAIDER_ALERT_TOPIC_ARN"] == jobs.one(TOPIC).arn
     assert "TRAIDER_TRADING_MODE" not in env  # research never trades
     assert "TRAIDER_FINNHUB_API_KEY" not in env
+    assert env["AWS_REGION"] == REGION  # Bedrock needs it; not left to Fargate
     config = Config.from_env(env)
     assert (config.trading_mode, config.finnhub_api_key) == ("paper", None)
 
@@ -206,23 +240,35 @@ def test_the_research_role_has_exactly_these_actions(jobs):
     }
 
 
-def test_only_bedrock_uses_a_wildcard_resource(jobs):
+def _listed(value) -> list[str]:
+    return value if isinstance(value, list) else [value]
+
+
+def test_wildcards_appear_only_where_they_must(jobs):
+    """A resource with a "*" is allowed only as one of these, and no action has one."""
+    allowed = {
+        # every revision of the research task family, for the scheduler
+        f"arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/traider-dev-research:*",
+        # the objects in the trail bucket
+        f"{jobs.one(BUCKET).arn}/*",
+        # a log group's streams
+        *(f"{group.arn}:*" for group in jobs.of(LOG_GROUP)),
+    }
     for policy in jobs.of(ROLE_POLICY):
         for statement in json.loads(policy.inputs["policy"])["Statement"]:
-            if statement["Sid"] == "BedrockMantle":
-                continue
-            values = (
-                statement["Resource"]
-                if isinstance(statement["Resource"], list)
-                else [statement["Resource"]]
-            )
-            actions = (
-                statement["Action"]
-                if isinstance(statement["Action"], list)
-                else [statement["Action"]]
-            )
-            for value in values + actions:
-                assert "*" not in value.replace(":*", "").replace("/*", ""), value
+            actions = _listed(statement["Action"])
+            for action in actions:
+                assert "*" not in action, (policy.name, statement["Sid"], action)
+            for resource in _listed(statement["Resource"]):
+                if "*" not in resource:
+                    continue
+                if resource == "*":
+                    assert all(a.startswith("bedrock-mantle:") for a in actions), (
+                        policy.name,
+                        statement["Sid"],
+                    )
+                    continue
+                assert resource in allowed, (policy.name, statement["Sid"], resource)
 
 
 def test_the_bot_still_only_reads_research(jobs):
@@ -239,6 +285,12 @@ def test_roles_are_assumed_only_by_their_service(jobs):
     assert principal("research-scheduler") == "scheduler.amazonaws.com"
 
 
+def test_only_this_accounts_scheduler_may_assume_its_role(jobs):
+    trust = json.loads(jobs.one(ROLE, "research-scheduler").inputs["assumeRolePolicy"])
+    (statement,) = trust["Statement"]
+    assert statement["Condition"] == {"StringEquals": {"aws:SourceAccount": ACCOUNT}}
+
+
 def test_the_scheduler_may_start_only_this_task_and_pass_only_its_roles(jobs):
     found = statements(jobs, "research-scheduler")
     run = found["StartResearchTask"]
@@ -253,18 +305,27 @@ def test_the_scheduler_may_start_only_this_task_and_pass_only_its_roles(jobs):
         jobs.one(ROLE, "research-task").arn,
         jobs.one(ROLE, "bot-execution").arn,
     ]
+    assert passing["Condition"] == {
+        "StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}
+    }
+    dead = found["DeadLetters"]
+    assert (dead["Action"], dead["Resource"]) == (
+        "sqs:SendMessage",
+        jobs.one(QUEUE, "research-schedule-dlq").arn,
+    )
+    assert set(found) == {"StartResearchTask", "PassResearchRoles", "DeadLetters"}
 
 
 # --- the schedule ---------------------------------------------------------------------------
 
 
-def test_it_runs_weekdays_at_8_new_york_time_on_time_and_never_retried(jobs):
+def test_it_runs_weekdays_at_8_new_york_time_on_time_and_retries_a_failed_start_briefly(jobs):
     schedule = jobs.one(SCHEDULE).inputs
     assert schedule["scheduleExpression"] == "cron(0 8 ? * MON-FRI *)"
     assert schedule["scheduleExpressionTimezone"] == "America/New_York"
     assert schedule["flexibleTimeWindow"] == {"mode": "OFF"}
     target = schedule["target"]
-    assert target["retryPolicy"]["maximumRetryAttempts"] == 0
+    assert target["retryPolicy"] == {"maximumRetryAttempts": 2, "maximumEventAgeInSeconds": 600}
     assert target["arn"] == jobs.one(CLUSTER, "research").arn
     assert target["roleArn"] == jobs.one(ROLE, "research-scheduler").arn
     ecs = target["ecsParameters"]
@@ -305,13 +366,44 @@ def test_a_research_task_that_fails_raises_an_alert(jobs):
     assert "[traider] The research run" in target["inputTransformer"]["inputTemplate"]
 
 
-def test_both_alarms_may_publish_to_the_topic(jobs):
-    policy = json.loads(jobs.one("aws:sns/topicPolicy:TopicPolicy").inputs["policy"])
-    sources = {s["Sid"]: s["Condition"]["ArnEquals"]["aws:SourceArn"] for s in policy["Statement"]}
-    assert sources == {
-        "TaskStoppedAlarm": jobs.one(RULE, "bot-stopped").arn,
-        "ResearchFailedAlarm": jobs.one(RULE, "research-failed").arn,
+def test_a_start_the_scheduler_gives_up_on_lands_in_a_dead_letter_queue(jobs):
+    queue = jobs.one(QUEUE, "research-schedule-dlq")
+    assert queue.inputs["name"] == "traider-dev-research-schedule-dlq"
+    assert queue.inputs["sqsManagedSseEnabled"] is True
+    assert queue.inputs["messageRetentionSeconds"] == 14 * 24 * 3600
+    target = jobs.one(SCHEDULE).inputs["target"]
+    assert target["deadLetterConfig"] == {"arn": queue.arn}
+
+
+def test_a_dead_letter_raises_an_alert(jobs):
+    alarm = jobs.one(ALARM, "research-schedule-dlq").inputs
+    assert (alarm["namespace"], alarm["metricName"]) == (
+        "AWS/SQS",
+        "ApproximateNumberOfMessagesVisible",
+    )
+    assert alarm["dimensions"] == {"QueueName": "traider-dev-research-schedule-dlq"}
+    assert (alarm["comparisonOperator"], alarm["threshold"]) == ("GreaterThanThreshold", 0)
+    assert (alarm["period"], alarm["evaluationPeriods"]) == (300, 1)
+    assert alarm["treatMissingData"] == "notBreaching"
+    assert alarm["alarmActions"] == [jobs.one(TOPIC).arn]
+
+
+def test_each_alarm_may_publish_to_the_topic_and_nothing_else_may(jobs):
+    policy = json.loads(jobs.one(TOPIC_POLICY).inputs["policy"])
+    found = {
+        s["Sid"]: (s["Principal"]["Service"], s["Condition"]["ArnEquals"]["aws:SourceArn"])
+        for s in policy["Statement"]
     }
+    assert found == {
+        "TaskStoppedAlarm": ("events.amazonaws.com", jobs.one(RULE, "bot-stopped").arn),
+        "ResearchFailedAlarm": ("events.amazonaws.com", jobs.one(RULE, "research-failed").arn),
+        "ResearchNotStartedAlarm": (
+            "cloudwatch.amazonaws.com",
+            jobs.one(ALARM, "research-schedule-dlq").arn,
+        ),
+    }
+    for statement in policy["Statement"]:
+        assert (statement["Action"], statement["Resource"]) == ("sns:Publish", jobs.one(TOPIC).arn)
 
 
 # --- outputs and local use ------------------------------------------------------------------

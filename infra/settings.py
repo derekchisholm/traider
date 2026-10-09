@@ -68,6 +68,27 @@ def _time(config: pulumi.Config, key: str, default: str) -> tuple[int, int]:
     return int(match[1]), int(match[2])
 
 
+def trail_bucket_name(prefix: str, account: str) -> str:
+    """The research trail bucket. It carries the account id because bucket names are global."""
+    return f"{prefix}-research-trail-{account}"
+
+
+def _check_trail_bucket_name(prefix: str) -> None:
+    """Fail at load, not halfway through a deploy, when the stack's prefix cannot make a
+    valid bucket name: 3 to 63 lowercase letters, digits, dots and hyphens, starting and
+    ending with a letter or digit. The account id is always 12 digits."""
+    name = trail_bucket_name(prefix, "0" * 12)
+    valid = re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]", name) and ".." not in name
+    if not (3 <= len(name) <= 63) or not valid:
+        raise ValueError(
+            "traider:researchJobs: the research trail bucket would be named "
+            f"{trail_bucket_name(prefix, '<account id>')!r}, which S3 does not allow. "
+            "Bucket names are 3 to 63 lowercase letters, digits, dots and hyphens, so the "
+            f"project and stack name ({prefix!r}) must be lowercase and at most "
+            f"{63 - len(trail_bucket_name('', '0' * 12))} characters"
+        )
+
+
 def _symbols(config: pulumi.Config, *, research: bool) -> tuple[str, ...]:
     """The pinned symbols. ``symbols`` is the older name for ``pinnedSymbols``."""
     pinned: Any = config.get_object("pinnedSymbols")
@@ -100,6 +121,8 @@ def load() -> Settings:
             "traider:researchJobs needs traider:research: true: the research jobs write to "
             "the research table, which only exists with research on"
         )
+    if research_jobs:
+        _check_trail_bucket_name(prefix)
     symbols = _symbols(config, research=research)
     mode = config.get("tradingMode") or "paper"
 

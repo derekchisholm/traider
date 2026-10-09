@@ -38,11 +38,12 @@ def build() -> Stack:
         tags=settings.tags,
     )
     deployed = bot.build(settings, net, store, reauth_param)
-    alarms = {"TaskStoppedAlarm": deployed.stopped_rule}
+    alarms: dict[str, bot.Alarm] = {"TaskStoppedAlarm": deployed.stopped_rule}
     jobs = None
     if settings.research_jobs:
         jobs = research.build(settings, net, store, deployed)
         alarms["ResearchFailedAlarm"] = jobs.failed_rule
+        alarms["ResearchNotStartedAlarm"] = jobs.dead_letter_alarm
     bot.alert_topic_policy(store, alarms)
 
     # What the command line needs on your own machine: the bot's settings and where its

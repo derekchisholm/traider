@@ -142,9 +142,19 @@ def _alert_when_the_task_dies(
     return rule
 
 
-def alert_topic_policy(data: Data, alarms: dict[str, aws.cloudwatch.EventRule]) -> None:
-    """Let EventBridge publish to the alert topic, for these rules only. A topic has one
-    policy, so every alarm that publishes to it is listed here (Sid -> rule)."""
+Alarm = aws.cloudwatch.EventRule | aws.cloudwatch.MetricAlarm
+
+
+def _publisher(alarm: Alarm) -> str:
+    if isinstance(alarm, aws.cloudwatch.MetricAlarm):
+        return "cloudwatch.amazonaws.com"
+    return "events.amazonaws.com"
+
+
+def alert_topic_policy(data: Data, alarms: dict[str, Alarm]) -> None:
+    """Let EventBridge rules and CloudWatch alarms publish to the alert topic, these ones
+    only. A topic has one policy, so every alarm that publishes to it is listed here
+    (Sid -> rule or alarm)."""
     aws.sns.TopicPolicy(
         "alerts",
         arn=data.topic.arn,
@@ -155,12 +165,12 @@ def alert_topic_policy(data: Data, alarms: dict[str, aws.cloudwatch.EventRule]) 
                     {
                         "Sid": sid,
                         "Effect": "Allow",
-                        "Principal": {"Service": "events.amazonaws.com"},
+                        "Principal": {"Service": _publisher(alarm)},
                         "Action": "sns:Publish",
                         "Resource": data.topic.arn,
-                        "Condition": {"ArnEquals": {"aws:SourceArn": rule.arn}},
+                        "Condition": {"ArnEquals": {"aws:SourceArn": alarm.arn}},
                     }
-                    for sid, rule in alarms.items()
+                    for sid, alarm in alarms.items()
                 ],
             }
         ),

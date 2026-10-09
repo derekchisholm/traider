@@ -4,7 +4,8 @@ Every weekday at 08:00 New York time EventBridge Scheduler starts one Fargate ta
 the bot's image: ``traider research run --kind premarket``. It reads the market, sets the
 day's posture, has Claude on Bedrock study the best candidates and writes ranked picks to
 the research table. Its trail goes to a private S3 bucket. A task that exits non-zero
-raises an alert.
+raises an alert, and so does a run that cannot even be started: what the scheduler
+fails to deliver lands in a dead-letter queue, which alarms.
 
 It runs in its own ECS cluster, so the bot's crash alarm (which watches the bot's
 cluster) never fires for it, on the bot's subnets and security group.
@@ -21,21 +22,14 @@ import pulumi_aws as aws
 from bot import ECS_TRUST, Bot
 from data import Data
 from network import Network
-from settings import Settings
+from settings import Settings, trail_bucket_name
 
 SCHEDULE = "cron(0 8 ? * MON-FRI *)"
 TIMEZONE = "America/New_York"
 TRAIL_EXPIRY_DAYS = 400
-_SCHEDULER_TRUST = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Principal": {"Service": "scheduler.amazonaws.com"},
-            "Action": "sts:AssumeRole",
-        }
-    ],
-}
+START_RETRIES = 2  # a failed start is retried this often, within START_MAX_AGE_S
+START_MAX_AGE_S = 600
+DLQ_RETENTION_S = 14 * 24 * 3600  # the most SQS keeps a message
 
 
 @dataclass(frozen=True)
@@ -46,6 +40,8 @@ class ResearchJobs:
     task: aws.ecs.TaskDefinition
     log_group: aws.cloudwatch.LogGroup
     failed_rule: aws.cloudwatch.EventRule
+    dead_letters: aws.sqs.Queue
+    dead_letter_alarm: aws.cloudwatch.MetricAlarm
 
 
 def _trail_bucket(settings: Settings, account: pulumi.Output[str]) -> aws.s3.Bucket:
@@ -53,12 +49,12 @@ def _trail_bucket(settings: Settings, account: pulumi.Output[str]) -> aws.s3.Buc
     Named with the account id because bucket names are global."""
     bucket = aws.s3.Bucket(
         "research-trail",
-        bucket=pulumi.Output.concat(settings.prefix, "-research-trail-", account),
+        bucket=account.apply(lambda account_id: trail_bucket_name(settings.prefix, account_id)),
         # A paper stack can be destroyed with its trail; a live stack's trail is kept.
         force_destroy=settings.trading_mode != "live",
         tags=settings.tags,
     )
-    aws.s3.BucketPublicAccessBlock(
+    public_access_block = aws.s3.BucketPublicAccessBlock(
         "research-trail",
         bucket=bucket.id,
         block_public_acls=True,
@@ -109,6 +105,8 @@ def _trail_bucket(settings: Settings, account: pulumi.Output[str]) -> aws.s3.Buc
                 ],
             }
         ),
+        # S3 rejects a bucket policy while the account default may still block it.
+        opts=pulumi.ResourceOptions(depends_on=[public_access_block]),
     )
     return bucket
 
@@ -216,6 +214,8 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
         "TRAIDER_ALERT_TOPIC_ARN": data.topic.arn,
         "TRAIDER_RESEARCH_BUCKET": bucket.bucket,
         "TRAIDER_FINNHUB_SECRET_ID": finnhub_secret.arn,
+        # Bedrock needs a region; set it rather than rely on Fargate providing one.
+        "AWS_REGION": region,
     }
     container = {
         "name": "research",
@@ -254,11 +254,35 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
     )
     cluster = aws.ecs.Cluster("research", name=family, tags=tags)
 
-    # The scheduler may start this task family in this cluster and hand it its two roles.
-    scheduler_role = aws.iam.Role(
-        "research-scheduler", assume_role_policy=pulumi.Output.json_dumps(_SCHEDULER_TRUST),
+    # A start the scheduler gives up on (RunTask refused, after the retries) lands here,
+    # and the alarm below says so: no ECS task exists, so the research-failed rule
+    # cannot see it.
+    dead_letters = aws.sqs.Queue(
+        "research-schedule-dlq",
+        name=f"{prefix}-research-schedule-dlq",
+        sqs_managed_sse_enabled=True,
+        message_retention_seconds=DLQ_RETENTION_S,
         tags=tags,
-    )  # fmt: skip
+    )
+
+    # The scheduler may start this task family in this cluster and hand it its two roles.
+    # Only this account's scheduler may assume the role.
+    scheduler_trust = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "scheduler.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"aws:SourceAccount": account}},
+            }
+        ],
+    }
+    scheduler_role = aws.iam.Role(
+        "research-scheduler",
+        assume_role_policy=pulumi.Output.json_dumps(scheduler_trust),
+        tags=tags,
+    )
     family_arn = pulumi.Output.concat(
         "arn:aws:ecs:", region, ":", account, ":task-definition/", family, ":*"
     )
@@ -285,6 +309,12 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
                             "StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}
                         },
                     },
+                    {
+                        "Sid": "DeadLetters",
+                        "Effect": "Allow",
+                        "Action": "sqs:SendMessage",
+                        "Resource": dead_letters.arn,
+                    },
                 ],
             }
         ),
@@ -295,8 +325,9 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
         description="traider: the pre-market research run",
         schedule_expression=SCHEDULE,
         schedule_expression_timezone=TIMEZONE,
-        # Exactly on time, never retried: a late pre-market run is not wanted, and the
-        # lock and skip-if-done make a duplicate delivery harmless.
+        # Exactly on time. A start that fails is retried briefly (the lock and
+        # skip-if-done make a duplicate harmless); one that still fails goes to the
+        # dead-letter queue.
         flexible_time_window=aws.scheduler.ScheduleFlexibleTimeWindowArgs(mode="OFF"),
         target=aws.scheduler.ScheduleTargetArgs(
             arn=cluster.arn,
@@ -312,7 +343,11 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
                 ),
             ),
             retry_policy=aws.scheduler.ScheduleTargetRetryPolicyArgs(
-                maximum_retry_attempts=0, maximum_event_age_in_seconds=600
+                maximum_retry_attempts=START_RETRIES,
+                maximum_event_age_in_seconds=START_MAX_AGE_S,
+            ),
+            dead_letter_config=aws.scheduler.ScheduleTargetDeadLetterConfigArgs(
+                arn=dead_letters.arn
             ),
         ),
         opts=pulumi.ResourceOptions(depends_on=[scheduler_policy]),
@@ -352,4 +387,28 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
             ),
         ),
     )
-    return ResearchJobs(bucket, finnhub_secret, cluster, task, logs, failed_rule)
+    # Fires once, when the first undelivered start arrives. It stays in alarm until the
+    # queue is emptied (docs/runbook.md), so purge it after reading the message.
+    dead_letter_alarm = aws.cloudwatch.MetricAlarm(
+        "research-schedule-dlq",
+        name=f"{prefix}-research-schedule-failed",
+        alarm_description=(
+            "traider: the scheduler could not start the research run. Without a successful "
+            "run today the bot stands aside. Read the message in the dead-letter queue, then "
+            "purge it; docs/runbook.md says what to do."
+        ),
+        namespace="AWS/SQS",
+        metric_name="ApproximateNumberOfMessagesVisible",
+        dimensions={"QueueName": dead_letters.name},
+        statistic="Maximum",
+        period=300,
+        evaluation_periods=1,
+        comparison_operator="GreaterThanThreshold",
+        threshold=0,
+        treat_missing_data="notBreaching",
+        alarm_actions=[data.topic.arn],
+        tags=tags,
+    )
+    return ResearchJobs(
+        bucket, finnhub_secret, cluster, task, logs, failed_rule, dead_letters, dead_letter_alarm
+    )
