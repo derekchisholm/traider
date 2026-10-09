@@ -1,0 +1,296 @@
+"""Rank and validate: each rule in order, expiry and the earnings clamp, score, caps."""
+
+from datetime import UTC, date, datetime
+from decimal import Decimal
+
+import pytest
+
+from tests.fakes.research import TODAY, FakeMarketData, quote
+from traider.research.dive import Assessment
+from traider.research.events import EarningsEvent
+from traider.research.job_settings import RankSettings
+from traider.research.market import PutContract
+from traider.research.rank import (
+    RankInput,
+    blended_score,
+    close_of,
+    rank_and_validate,
+    swing_expiry_day,
+    validate_and_rank,
+)
+
+CLOSE = datetime(2026, 10, 9, 20, 0, tzinfo=UTC)
+RUN = "premarket-20261009T120000Z-ab12"
+SETTINGS = RankSettings()
+LIQUID = [PutContract(symbol="P", strike=48, days=14, bid=1.0, ask=1.05, open_interest=500)]
+
+
+def assessment(**overrides) -> Assessment:
+    fields = {
+        "side": "long",
+        "horizon": "intraday",
+        "score": 80,
+        "thesis": "t",
+        "invalidation": 101.0,
+        "risks": [],
+    }
+    return Assessment.model_validate(fields | overrides)
+
+
+def item(symbol="NVDA", *, pre=70, atr=2.0, sector="Semis", earnings=(), **a) -> RankInput:
+    return RankInput(
+        symbol=symbol,
+        assessment=assessment(**a),
+        pre_score=pre,
+        features={"gap_pct": 4.0},
+        atr=atr,
+        sector=sector,
+        earnings=tuple(earnings),
+    )
+
+
+def rank(inputs, *, fresh=None, puts=None, earnings_ok=True, settings=SETTINGS):
+    fresh = (
+        fresh if fresh is not None else {i.symbol: quote(i.symbol, 104.0, 100.0) for i in inputs}
+    )
+    return validate_and_rank(
+        inputs,
+        fresh=fresh,
+        puts=puts or {},
+        run_id=RUN,
+        today=TODAY,
+        close=CLOSE,
+        earnings_ok=earnings_ok,
+        settings=settings,
+    )
+
+
+def reasons(result) -> dict[str, str]:
+    return {r.symbol: r.reason for r in result.rejected}
+
+
+def test_a_good_long_intraday_assessment_becomes_a_pick():
+    result = rank([item(score=80, pre=70, thesis="gap and go", risks=["fade"])])
+    (pick,) = result.picks
+    assert (pick.rank, pick.symbol, pick.side.value, pick.horizon.value) == (
+        1,
+        "NVDA",
+        "long",
+        "intraday",
+    )
+    assert (pick.score, pick.pre_score) == (77, 70)  # .7 x 80 + .3 x 70 = 77
+    assert pick.expires_at == CLOSE
+    assert pick.invalidation == Decimal("101.0")
+    assert pick.thesis == "gap and go\nRisks: fade"
+    assert pick.features == {"gap_pct": 4.0, "llm_score": 80.0, "atr": 2.0, "price_at_pick": 104.0}
+    assert pick.run_id == RUN and pick.earnings_date is None
+
+
+def test_rule_1_a_pass_is_recorded_as_passed():
+    assert reasons(rank([item(side="pass")])) == {"NVDA": "passed"}
+
+
+def test_rule_2_needs_a_fresh_quote_that_is_trading():
+    assert reasons(rank([item()], fresh={})) == {"NVDA": "no_quote"}
+    assert reasons(rank([item()], fresh={"NVDA": quote("NVDA", None, 100)})) == {"NVDA": "no_quote"}
+    halted = {"NVDA": quote("NVDA", 104, 100, halted=True)}
+    assert reasons(rank([item()], fresh=halted)) == {"NVDA": "halted"}
+
+
+@pytest.mark.parametrize(
+    ("side", "invalidation", "ok"),
+    [
+        ("long", 103.4, True),  # 0.3 ATR below 104
+        ("long", 103.5, False),  # 0.25 ATR: too tight
+        ("long", 98.0, True),  # 3.0 ATR
+        ("long", 97.9, False),  # 3.05 ATR: too wide
+        ("long", 105.0, False),  # on the wrong side
+        ("bearish", 106.0, True),  # 1 ATR above
+        ("bearish", 103.0, False),  # below the price: wrong side for a put
+    ],
+)
+def test_rule_3_invalidation_must_be_0_3_to_3_atr_away_on_the_right_side(side, invalidation, ok):
+    result = rank([item(side=side, invalidation=invalidation)], puts={"NVDA": LIQUID})
+    assert (reasons(result) == {}) is ok
+    if not ok:
+        assert reasons(result) == {"NVDA": "bad_invalidation"}
+
+
+@pytest.mark.parametrize("atr", [0.0, -1.0, float("nan"), float("inf")])
+def test_rule_3_an_unknown_atr_drops_the_name(atr):
+    assert reasons(rank([item(atr=atr)])) == {"NVDA": "bad_invalidation"}
+
+
+def test_rule_4_bearish_needs_a_liquid_put():
+    bearish = item(side="bearish", invalidation=106.0)
+    assert reasons(rank([bearish], puts={"NVDA": LIQUID})) == {}
+    for chain in (
+        None,  # the chain could not be read
+        [],
+        [LIQUID[0].model_copy(update={"bid": 0.0})],
+        [LIQUID[0].model_copy(update={"ask": 1.2})],  # 18% spread
+        [LIQUID[0].model_copy(update={"open_interest": 99})],
+    ):
+        assert reasons(rank([bearish], puts={"NVDA": chain})) == {"NVDA": "illiquid_puts"}
+    # No entry at all for the name is unknown liquidity too.
+    assert reasons(rank([bearish], puts={})) == {"NVDA": "illiquid_puts"}
+
+
+def test_rule_5_swing_expires_at_the_close_n_weekdays_out():
+    (pick,) = rank([item(horizon="swing", swing_days=5)]).picks
+    assert pick.expires_at == datetime(2026, 10, 16, 20, 0, tzinfo=UTC)
+    assert pick.horizon.value == "swing"
+
+
+def test_rule_5_swing_needs_the_earnings_calendar():
+    result = rank([item(horizon="swing", swing_days=5)], earnings_ok=False)
+    assert reasons(result) == {"NVDA": "earnings_unknown"}
+    # Intraday picks do not depend on it.
+    assert rank([item()], earnings_ok=False).picks
+
+
+def test_rule_5_swing_expiry_is_clamped_before_earnings():
+    wednesday = EarningsEvent(symbol="NVDA", day=date(2026, 10, 14), hour="amc")
+    (pick,) = rank([item(horizon="swing", swing_days=5, earnings=[wednesday])]).picks
+    assert pick.expires_at == datetime(2026, 10, 13, 20, 0, tzinfo=UTC)  # Tuesday's close
+    assert pick.earnings_date == date(2026, 10, 14)
+
+
+@pytest.mark.parametrize(
+    ("day", "hour", "expiry"),
+    [
+        (date(2026, 10, 12), "bmo", None),  # Monday: the last weekday before is today
+        (TODAY, "amc", None),
+        (TODAY, "unknown", None),
+        (TODAY, "bmo", date(2026, 10, 16)),  # already out before the open
+        (date(2026, 10, 19), "bmo", date(2026, 10, 16)),  # after the expiry: no clamp
+        (date(2026, 10, 8), "amc", date(2026, 10, 16)),  # in the past
+    ],
+)
+def test_swing_expiry_day(day, hour, expiry):
+    event = EarningsEvent(symbol="X", day=day, hour=hour)
+    assert swing_expiry_day(TODAY, 5, [event]) == expiry
+
+
+def test_rule_5_a_swing_pick_with_earnings_next_trading_day_is_too_close():
+    monday = EarningsEvent(symbol="NVDA", day=date(2026, 10, 12), hour="bmo")
+    result = rank([item(horizon="swing", swing_days=5, earnings=[monday])])
+    assert reasons(result) == {"NVDA": "earnings_too_close"}
+
+
+def test_rule_5_intraday_is_refused_only_for_earnings_today_at_an_unknown_hour():
+    unknown = EarningsEvent(symbol="NVDA", day=TODAY, hour="unknown")
+    tonight = EarningsEvent(symbol="NVDA", day=TODAY, hour="amc")
+    assert reasons(rank([item(earnings=[unknown])])) == {"NVDA": "earnings_too_close"}
+    assert rank([item(earnings=[tonight])]).picks
+
+
+def test_rule_6_blended_score():
+    assert blended_score(82, 89, 0.7) == 84  # 57.4 + 26.7 = 84.1
+    assert blended_score(65, 35, 0.7) == 56
+    assert blended_score(50, 51, 0.5) == 51  # 50.5 rounds up
+    assert blended_score(100, 100, 1.0) == 100
+
+
+def test_rule_7_ranked_by_score_with_a_sector_cap_and_a_cut():
+    settings = RankSettings(max_per_sector=2, max_picks=4)
+    inputs = [
+        item("A", score=90, sector="Semis"),
+        item("B", score=80, sector="Semis"),
+        item("C", score=70, sector="Semis"),  # third in its sector
+        item("D", score=60, sector=None),
+        item("E", score=50, sector="Banks"),
+        item("F", score=40, sector="Banks"),  # fifth that passes
+    ]
+    result = rank(inputs, settings=settings)
+    assert [(p.rank, p.symbol) for p in result.picks] == [(1, "A"), (2, "B"), (3, "D"), (4, "E")]
+    assert reasons(result) == {"C": "sector_cap", "F": "below_cut"}
+
+
+def test_an_unknown_sector_is_one_bucket():
+    settings = RankSettings(max_per_sector=1)
+    result = rank(
+        [item("A", score=90, sector=None), item("B", score=80, sector=None)], settings=settings
+    )
+    assert [p.symbol for p in result.picks] == ["A"]
+    assert reasons(result) == {"B": "sector_cap"}
+
+
+def test_ties_go_to_the_higher_pre_score_then_the_symbol():
+    inputs = [item("B", score=80, pre=80), item("A", score=80, pre=80), item("C", score=80, pre=90)]
+    assert [p.symbol for p in rank(inputs).picks] == ["C", "A", "B"]
+
+
+def test_the_close_of_a_day_is_four_pm_new_york():
+    assert close_of(date(2026, 12, 1)) == datetime(2026, 12, 1, 21, 0, tzinfo=UTC)
+
+
+async def test_ranking_fetches_one_quote_batch_and_puts_for_bearish_names_only():
+    market = FakeMarketData()
+    market.quote_map = {"NVDA": quote("NVDA", 104, 100), "AMD": quote("AMD", 48, 50)}
+    market.put_chains["AMD"] = LIQUID
+    inputs = [
+        item("NVDA"),
+        item("AMD", side="bearish", invalidation=49.0, atr=1.0, score=70),
+        item("MSFT", side="pass"),
+    ]
+    result = await rank_and_validate(
+        inputs,
+        market=market,
+        run_id=RUN,
+        today=TODAY,
+        close=CLOSE,
+        earnings_ok=True,
+        settings=SETTINGS,
+    )
+    assert [p.symbol for p in result.picks] == ["NVDA", "AMD"]
+    assert market.called("quotes") == [("NVDA", "AMD")]
+    assert market.called("puts") == ["AMD"]
+
+
+async def test_a_chain_that_cannot_be_read_means_illiquid():
+    market = FakeMarketData()
+    market.quote_map = {"AMD": quote("AMD", 48, 50)}
+    market.failures["puts"] = RuntimeError("chain down")
+    result = await rank_and_validate(
+        [item("AMD", side="bearish", invalidation=49.0, atr=1.0)],
+        market=market,
+        run_id=RUN,
+        today=TODAY,
+        close=CLOSE,
+        earnings_ok=True,
+        settings=SETTINGS,
+    )
+    assert reasons(result) == {"AMD": "illiquid_puts"}
+
+
+async def test_a_halted_name_is_dropped_and_its_chain_is_not_read():
+    market = FakeMarketData()
+    market.quote_map = {"AMD": quote("AMD", 48, 50, halted=True)}
+    market.put_chains["AMD"] = LIQUID
+    result = await rank_and_validate(
+        [item("AMD", side="bearish", invalidation=49.0, atr=1.0)],
+        market=market,
+        run_id=RUN,
+        today=TODAY,
+        close=CLOSE,
+        earnings_ok=True,
+        settings=SETTINGS,
+    )
+    assert reasons(result) == {"AMD": "halted"}
+    assert market.called("puts") == []
+
+
+async def test_a_failed_quote_batch_raises():
+    market = FakeMarketData()
+    market.failures["quotes"] = RuntimeError("quotes down")
+    with pytest.raises(RuntimeError):
+        await rank_and_validate(
+            [item("NVDA")],
+            market=market,
+            run_id=RUN,
+            today=TODAY,
+            close=CLOSE,
+            earnings_ok=True,
+            settings=SETTINGS,
+        )
