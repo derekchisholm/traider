@@ -525,3 +525,31 @@ async def test_feed_takes_its_symbols_from_the_settings_it_is_given(schwab, clie
     )
     async with make_feed(schwab, client, signed_in, settings=settings) as feed:
         assert feed._symbols == ("QQQ",)
+
+
+async def test_feed_takes_its_option_chain_settings_from_the_settings_it_is_given(
+    schwab, client, signed_in
+):
+    from traider.settings import Settings
+
+    base = Settings.from_config(Config(symbols=("SPY",)))
+    settings = base.model_copy(
+        update={
+            "risk": base.risk.model_copy(update={"allow_options": True}),
+            "option_chain_days": 10,
+            "option_chain_strikes": 5,
+        }
+    )
+    # The config says the opposite on all three.
+    async with make_feed(
+        schwab,
+        client,
+        signed_in,
+        options=False,
+        option_chain_days=60,
+        option_chain_strikes=30,
+        settings=settings,
+    ) as feed:
+        assert feed._chains_wanted is True
+        assert feed._chain_span == timedelta(days=10)
+        assert feed._chain_strikes == 5

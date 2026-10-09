@@ -426,11 +426,12 @@ def test_configuration_never_appears_in_the_startup_summary_with_secrets(world):
     assert APP_KEY not in summary
 
 
-async def test_bot_seeds_the_settings_table_and_starts_on_its_values(world, aws):
-    from traider.settings_store import DynamoSettingsStore
+SETTINGS_TABLE = "traider-test-settings"
 
+
+def create_settings_table() -> None:
     boto3.client("dynamodb").create_table(
-        TableName="traider-test-settings",
+        TableName=SETTINGS_TABLE,
         BillingMode="PAY_PER_REQUEST",
         AttributeDefinitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
@@ -441,42 +442,72 @@ async def test_bot_seeds_the_settings_table_and_starts_on_its_values(world, aws)
             {"AttributeName": "sk", "KeyType": "RANGE"},
         ],
     )
+
+
+def settings_store():
+    from traider.settings_store import DynamoSettingsStore
+
+    return DynamoSettingsStore(boto3.resource("dynamodb").Table(SETTINGS_TABLE))
+
+
+async def test_bot_seeds_the_settings_table_and_starts_on_its_values(world, aws):
+    create_settings_table()
     world.sign_in()
-    config = world.config(settings_table="traider-test-settings")
+    config = world.config(settings_table=SETTINGS_TABLE)
     await world.start(config)
-    store = DynamoSettingsStore(boto3.resource("dynamodb").Table("traider-test-settings"))
-    latest = await store.latest()
+    latest = await settings_store().latest()
     assert latest is not None and latest.author == "bootstrap"
     assert world.bot.settings == latest.settings
-    assert app.describe(config, world.bot.settings)["settings"] == "traider-test-settings"
+    assert app.describe(config, world.bot.settings)["settings"] == SETTINGS_TABLE
 
 
 async def test_bot_starts_on_the_stored_settings_and_gives_the_same_ones_to_the_engine(world, aws):
     from traider.settings import Settings
-    from traider.settings_store import DynamoSettingsStore
 
-    boto3.client("dynamodb").create_table(
-        TableName="traider-test-settings",
-        BillingMode="PAY_PER_REQUEST",
-        AttributeDefinitions=[
-            {"AttributeName": "pk", "AttributeType": "S"},
-            {"AttributeName": "sk", "AttributeType": "S"},
-        ],
-        KeySchema=[
-            {"AttributeName": "pk", "KeyType": "HASH"},
-            {"AttributeName": "sk", "KeyType": "RANGE"},
-        ],
-    )
+    create_settings_table()
     world.sign_in()
-    config = world.config(settings_table="traider-test-settings")
+    config = world.config(settings_table=SETTINGS_TABLE)
     stored = Settings.from_config(config)
     stored = stored.model_copy(
         update={"risk": stored.risk.model_copy(update={"max_order_usd": Decimal(250)})}
     )
-    store = DynamoSettingsStore(boto3.resource("dynamodb").Table("traider-test-settings"))
-    await store.write(stored, expected_version=0, author="test", note="", now=START)
+    await settings_store().write(stored, expected_version=0, author="test", note="", now=START)
     await world.start(config)
     assert world.bot.settings == stored
     assert world.bot.settings.risk.max_order_usd == Decimal(250)
     # The engine is on the same stored values, not the environment's 500.
     assert world.bot.engine.settings == stored
+
+
+async def test_strategy_feed_and_engine_are_built_from_the_stored_settings(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)  # the environment says SPY, fast 1/slow 2
+    stored = Settings.from_config(config).model_copy(
+        update={
+            "pinned_symbols": ("QQQ",),
+            "strategy_params": {"fast": 2, "slow": 3, "position_usd": 300},
+        }
+    )
+    await settings_store().write(stored, expected_version=0, author="test", note="", now=START)
+    await world.start(config)
+    bot = world.bot
+    assert bot.feed._symbols == ("QQQ",)
+    assert bot.strategy.symbols == ("QQQ",)
+    assert (bot.strategy.fast, bot.strategy.slow) == (2, 3)
+    assert bot.engine.settings.pinned_symbols == ("QQQ",)
+    assert bot.settings == stored
+
+
+async def test_bot_builds_and_starts_on_the_environment_when_the_settings_table_is_missing(
+    world, aws
+):
+    world.sign_in()
+    config = world.config(settings_table="no-such-table")
+    await world.start(config)
+    assert world.bot.settings.pinned_symbols == ("SPY",)
+    assert world.bot.engine.settings == world.bot.settings
+    assert world.bot.engine._live_settings is not None
+    assert world.bot.engine._live_settings.loaded is False
