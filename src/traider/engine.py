@@ -48,6 +48,8 @@ from traider.models import (
 from traider.options import contract_size, is_option_symbol, parse_option_symbol
 from traider.risk import Decision, RiskContext, RiskManager
 from traider.session import SessionTracker
+from traider.settings import Settings
+from traider.settings_store import LiveSettings, SettingsUpdate
 from traider.state.base import DayState, StateStore
 from traider.strategy.base import Strategy, StrategyContext
 from traider.timeutil import Clock, previous_weekday, trades_without_settling, trading_date
@@ -87,6 +89,7 @@ class _SymbolState:
 class Engine:
     # Intervals, in seconds.
     CONTROL_REFRESH_S = 10.0
+    SETTINGS_REFRESH_S = 10.0
     LEASE_TTL_S = 30.0
     LEASE_RENEW_S = 10.0
     LEASE_MARGIN_S = 5.0  # no order is sent this close to the lease running out
@@ -125,6 +128,7 @@ class Engine:
         alerts: Alerter,
         instance_id: str,
         auth_seconds_left: Callable[[], float | None] | None = None,
+        settings: LiveSettings | None = None,
     ) -> None:
         self._config = config
         self._clock = clock
@@ -138,8 +142,16 @@ class Engine:
         self._alerts = alerts
         self._instance = instance_id
         self._auth_seconds_left = auth_seconds_left or (lambda: None)
+        self._live_settings = settings
+        self._settings: Settings = (
+            settings.current if settings is not None else Settings.from_config(config)
+        )
+        self._risk.limits = self._settings.risk
+        self._settings_at: datetime | None = None
 
-        self._symbols: dict[str, _SymbolState] = {s: _SymbolState() for s in config.symbols}
+        self._symbols: dict[str, _SymbolState] = {
+            s: _SymbolState() for s in self._settings.pinned_symbols
+        }
         self._perms = _HALTED
         self._leader = False
         self._day = DayState(trading_date(clock.now()).isoformat(), halted_reason="not loaded yet")
@@ -169,6 +181,10 @@ class Engine:
     @property
     def is_leader(self) -> bool:
         return self._leader
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
 
     def target(self, symbol: str) -> Target | None:
         st = self._symbols.get(symbol)
@@ -239,6 +255,12 @@ class Engine:
     # ------------------------------------------------------------ housekeeping
 
     async def _housekeeping(self, now: datetime) -> None:
+        if self._live_settings is not None and _due(
+            self._settings_at, now, self.SETTINGS_REFRESH_S
+        ):
+            self._settings_at = now
+            for update in await self._live_settings.refresh(now):
+                await self._on_settings(update, now)
         if _due(self._control_at, now, self.CONTROL_REFRESH_S):
             self._control_at = now
             await self._control.refresh(now)
@@ -269,6 +291,46 @@ class Engine:
             await self._alerts.send(
                 "control_mismatch", "Control does not match deploy", perms.reason
             )
+
+    async def _on_settings(self, update: SettingsUpdate, now: datetime) -> None:
+        live = self._live_settings
+        assert live is not None
+        version = update.version
+        if update.kind == "applied":
+            self._settings = live.current
+            self._risk.limits = self._settings.risk
+            await self._event(
+                "settings_applied",
+                {"version": version, "author": update.detail, "diff": update.diff},
+                now,
+            )
+            changes = "\n".join(f"{k}: {old} -> {new}" for k, (old, new) in update.diff.items())
+            await self._alerts.send(
+                f"settings_applied:{version}",
+                f"Settings version {version} applied",
+                changes or "No change to the settings in force.",
+            )
+        elif update.kind == "pending_restart":
+            await self._event(
+                "settings_pending_restart", {"version": version, "fields": update.detail}, now
+            )
+            await self._alerts.send(
+                f"settings_restart:{version}",
+                f"Settings version {version} needs a restart",
+                f"These fields only change when the bot restarts: {update.detail}. "
+                "Everything else in the version is in force now.",
+            )
+        elif update.kind == "rejected":
+            await self._event(
+                "settings_rejected", {"version": version, "detail": update.detail}, now
+            )
+            await self._alerts.send(
+                f"settings_rejected:{version}",
+                f"Settings version {version} rejected",
+                f"{update.detail}. The bot keeps the settings it was running with.",
+            )
+        else:
+            self._log_throttled("settings", now, "settings unreadable: %s", update.detail)
 
     async def _renew_lease(self, now: datetime) -> None:
         try:
@@ -353,9 +415,9 @@ class Engine:
 
     def _is_our_option(self, symbol: str) -> bool:
         """An option contract on one of the configured symbols."""
-        if symbol in self._config.symbols or not is_option_symbol(symbol):
+        if symbol in self._settings.pinned_symbols or not is_option_symbol(symbol):
             return False
-        return parse_option_symbol(symbol).underlying in self._config.symbols
+        return parse_option_symbol(symbol).underlying in self._settings.pinned_symbols
 
     def _track_option(self, symbol: str, *, held: bool = False) -> _SymbolState | None:
         """The state for an option contract on one of the bot's symbols, created on first
@@ -638,7 +700,9 @@ class Engine:
             allowed = (
                 self._perms.allow_entries if record.side is Side.BUY else self._perms.allow_exits
             )
-            if (not allowed or age > self._config.order_timeout_s) and not record.cancel_requested:
+            if (
+                not allowed or age > self._settings.order_timeout_s
+            ) and not record.cancel_requested:
                 try:
                     await self._broker.cancel(record.order_id)
                 except Exception as exc:
@@ -730,7 +794,7 @@ class Engine:
             await self._apply_target(target, now)
 
     async def _apply_target(self, target: Target, now: datetime) -> None:
-        if target.symbol in self._config.symbols:
+        if target.symbol in self._settings.pinned_symbols:
             st: _SymbolState | None = self._symbols[target.symbol]
         else:
             st = self._track_option(target.symbol)
@@ -823,7 +887,7 @@ class Engine:
         )
 
     def _flatten_now(self, now: datetime) -> bool:
-        minutes = self._config.flatten_before_close_min
+        minutes = self._settings.flatten_before_close_min
         if minutes is None:
             return False
         view = self._session.view(now)
@@ -844,7 +908,7 @@ class Engine:
         option = is_option_symbol(symbol)
         if option and self._expiring_now(symbol, now) and side is Side.SELL:
             reason = "option expires today"
-        if self._config.order_type == "MARKET" and not option:
+        if self._settings.order_type == "MARKET" and not option:
             return OrderRequest(symbol, side, quantity, OrderType.MARKET, None, reason)
         quote = self._market.quote(symbol)
         price: Decimal | None = None
@@ -852,7 +916,7 @@ class Engine:
             # Options: a limit at the quoted price itself. Their spreads are wide enough
             # that a market order, or a limit pushed through the quote, gives too much away,
             # and the quoted price is always on a valid price increment.
-            offset = Decimal(0) if option else self._config.limit_offset_bps / BPS
+            offset = Decimal(0) if option else self._settings.limit_offset_bps / BPS
             if side is Side.BUY:
                 price = (quote.ask * (1 + offset)).quantize(_CENT, rounding=ROUND_DOWN)
             else:
@@ -922,6 +986,8 @@ class Engine:
         return total
 
     def _entries_halted(self, now: datetime) -> str | None:
+        if self._live_settings is not None and not self._live_settings.loaded:
+            return "settings not loaded"
         if self._day.halted_reason:
             return self._day.halted_reason
         if self._equity_unknown:
@@ -1004,7 +1070,7 @@ class Engine:
             st.unknown_since = now
             await self._event("unknown_order", {"symbol": symbol, "order_ids": ids}, now)
         age = (now - st.unknown_since).total_seconds()
-        if self._config.cancel_unknown_orders and age >= self._config.order_timeout_s:
+        if self._settings.cancel_unknown_orders and age >= self._settings.order_timeout_s:
             for order in unknown:
                 log.warning("%s: cancelling unknown order %s", symbol, order.order_id)
                 await self._cancel_quietly(order.order_id)

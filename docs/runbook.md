@@ -181,6 +181,9 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `order_rejected` | The broker refused an order. |
 | `order_unconfirmed`, `order_adopted` | A reply was lost; later, the order was found at the broker. |
 | `unknown_order`, `symbol_frozen`, `entries_halted` | See the matching alerts above. |
+| `settings_applied` | A new settings version is in force. `diff` lists what changed. |
+| `settings_pending_restart` | A new version changes fields that only apply after a restart. `fields` names them. |
+| `settings_rejected` | The newest version does not validate. The bot kept the settings it had. |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
 restarts. To start it over, set `halt`, delete it and restart the bot. If the old

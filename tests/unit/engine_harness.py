@@ -18,6 +18,8 @@ from traider.marketdata import MarketData
 from traider.models import Bar, BrokerOrder, OrderRequest, OrderStatus, Quote, Side, Target
 from traider.risk import RiskManager
 from traider.session import SessionTracker, StaticSessionProvider
+from traider.settings import Settings
+from traider.settings_store import LiveSettings
 from traider.state.memory import MemoryStateStore
 from traider.strategy.base import Strategy, StrategyContext
 from traider.timeutil import ManualClock, trading_date
@@ -212,6 +214,7 @@ class Harness:
         session_provider=None,
         begin=True,
         restart_of: Harness | None = None,
+        settings_store=None,
     ) -> Harness:
         """``restart_of`` models a new process: same broker account, same durable state and
         the same wall clock, but an engine with empty memory."""
@@ -254,6 +257,10 @@ class Harness:
         # The market data outlives a restart here, and it drops bars it has already seen,
         # so a restarted bench must carry on from the last bar rather than start over.
         self._bars = restart_of._bars if restart_of is not None else 0
+        self.live_settings = None
+        if settings_store is not None:
+            self.live_settings = LiveSettings(settings_store, Settings.from_config(self.config))
+            await self.live_settings.start(self.clock.now())
         self.engine = Engine(
             config=self.config,
             clock=self.clock,
@@ -267,6 +274,7 @@ class Harness:
             alerts=self.alerts,
             instance_id=instance,
             auth_seconds_left=lambda: self.auth_seconds_left,
+            settings=self.live_settings,
         )
         self.requote()
         if begin:
