@@ -91,13 +91,15 @@ the same `TRAIDER_*` variables as today, and the bot behaves as it does now.
 is valid when a research table is configured. Without research, at least one
 pinned symbol is still required.
 
-**Applying a new version.** The bot reads `CURRENT` every 10 s, like the control
+**Applying a new version.** The bot reads the newest version every 10 s, like the control
 switch. A new version is validated with the same pydantic model.
 
-* Fields that can apply at once: `risk`, order parameters, `research`,
-  `pinned_symbols`, `cancel_unknown_orders`, flatten timing. They take effect on the
+* Fields that can apply at once: `risk` (except `allow_options`), order parameters,
+  `research`, `cancel_unknown_orders`, flatten timing. (`pinned_symbols` waits for a
+  restart in A1; A2 makes it live along with the dynamic universe.) They take effect on the
   next engine step, and a `settings_applied` event records the version.
-* Fields that need a restart: `strategy`, `strategy_params`, option chain span. The
+* Fields that need a restart: `strategy`, `strategy_params`, option chain span,
+  `risk.allow_options` (and `pinned_symbols` until A2). The
   bot keeps running on the old values, records `settings_pending_restart` and alerts
   once per version.
 * An invalid version (it should not get past the writer, but the bot does not trust
@@ -106,7 +108,7 @@ switch. A new version is validated with the same pydantic model.
 * An unreadable table means the last good version stays in force. If no version has
   ever been read in this process, entries are off (`entries_halted`: "settings not
   loaded").
-* **Bootstrap:** if the table has no `CURRENT`, the bot writes version 1 from the
+* **Bootstrap:** if the table has no version yet, the bot writes version 1 from the
   environment with a conditional put (`author: bootstrap`). A deploy therefore
   seeds the settings once and never overwrites them afterwards.
 
