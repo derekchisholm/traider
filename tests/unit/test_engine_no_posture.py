@@ -12,6 +12,7 @@ from traider.research.store import MemoryResearchStore
 
 OPEN = datetime(2026, 10, 8, 13, 30, tzinfo=UTC)  # Thursday 09:30 New York
 BEFORE_OPEN = datetime(2026, 10, 8, 13, 0, tzinfo=UTC)
+AFTER_CLOSE = datetime(2026, 10, 8, 20, 30, tzinfo=UTC)  # 16:30 New York
 MESSAGE = (
     "No usable research posture for today; the bot is standing aside. Check the pre-market "
     "run (alerts, META, the DLQ)."
@@ -67,7 +68,7 @@ async def test_the_delay_is_a_setting(tmp_path):
 
 async def test_not_before_the_open(tmp_path):
     h = await bench(tmp_path, start=BEFORE_OPEN)
-    await h.run_for(29 * 60)  # 08:59 to 09:28
+    await h.run_for(29 * 60)  # 09:00 to 09:29: the session is not open yet
     assert no_posture_alerts(h) == []
 
 
@@ -103,6 +104,43 @@ async def test_not_when_research_is_stale(tmp_path):
     await h.run_for(10 * 60)
     assert no_posture_alerts(h) == []
     assert "research_stale" in h.alert_keys()
+
+
+async def test_not_when_a_good_view_goes_stale(tmp_path):
+    class Flaky(MemoryResearchStore):
+        broken = False
+
+        async def day(self, day):
+            if self.broken:
+                raise RuntimeError("table unreachable")
+            return await super().day(day)
+
+    store = Flaky()
+    h = await bench(tmp_path, level="trade", store=store, research_settings={"max_stale_s": 60})
+    await h.run_for(6 * 60)  # 09:36: a good posture, read after the delay
+    assert h.research.view.posture is not None
+    store.broken = True
+    await h.run_for(3 * 60)  # the view goes stale with no posture
+    assert h.research.view.stale and h.research.view.posture is None
+    assert "research_stale" in h.alert_keys()
+    assert no_posture_alerts(h) == []
+    assert await h.events("research_no_posture") == []
+
+
+async def test_it_fires_again_on_the_next_trading_day(tmp_path):
+    h = await bench(tmp_path)
+    await h.run_for(6 * 60)  # Thursday 09:36
+    assert len(no_posture_alerts(h)) == 1
+    await h.run_for(24 * 3600, step=60)  # Friday 09:36, still no posture
+    assert len(no_posture_alerts(h)) == 2
+    (event,) = await h.events("research_no_posture")
+    assert event["data"] == {"day": "2026-10-09"}
+
+
+async def test_not_after_the_close(tmp_path):
+    h = await bench(tmp_path, start=AFTER_CLOSE)
+    await h.run_for(10 * 60)  # 16:30 to 16:40
+    assert no_posture_alerts(h) == []
 
 
 async def test_not_when_research_is_off(tmp_path):
