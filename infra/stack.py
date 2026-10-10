@@ -12,6 +12,7 @@ import bot
 import data
 import lambdas
 import network
+import research
 import settings as stack_settings
 
 
@@ -37,6 +38,13 @@ def build() -> Stack:
         tags=settings.tags,
     )
     deployed = bot.build(settings, net, store, reauth_param)
+    alarms: dict[str, bot.Alarm] = {"TaskStoppedAlarm": deployed.stopped_rule}
+    jobs = None
+    if settings.research_jobs:
+        jobs = research.build(settings, net, store, deployed)
+        alarms["ResearchFailedAlarm"] = jobs.failed_rule
+        alarms["ResearchNotStartedAlarm"] = jobs.dead_letter_alarm
+    bot.alert_topic_policy(store, alarms)
 
     # What the command line needs on your own machine: the bot's settings and where its
     # secrets live. The trading mode, the control switch and the state table are left
@@ -53,6 +61,10 @@ def build() -> Stack:
     }
     if store.research_table is not None:
         local["TRAIDER_RESEARCH_TABLE"] = store.research_table.name
+    if jobs is not None:
+        # `traider research run --dry-run` reads the key from the secret; the trail of a
+        # local run stays on your machine, so the bucket is left out.
+        local["TRAIDER_FINNHUB_SECRET_ID"] = jobs.finnhub_secret.arn
     if settings.callback_url:
         # Paste mode: `traider login` must use the same registered address.
         local["TRAIDER_SCHWAB_CALLBACK_URL"] = settings.callback_url
@@ -62,6 +74,13 @@ def build() -> Stack:
     research_outputs: dict[str, pulumi.Input[str]] = (
         {"researchTable": store.research_table.name} if store.research_table is not None else {}
     )
+    if jobs is not None:
+        research_outputs |= {
+            "researchBucket": jobs.bucket.bucket,
+            "finnhubSecretArn": jobs.finnhub_secret.arn,
+            "researchCluster": jobs.cluster.name,
+            "researchLogGroup": jobs.log_group.name,
+        }
     return Stack(
         outputs={
             # Register this address as the app's callback URL in the Schwab developer portal.

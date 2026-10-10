@@ -21,6 +21,7 @@ from traider.config import (
     RiskLimits,
     check_symbols,
 )
+from traider.research.job_settings import ResearchJobSettings
 
 #: Fields a running bot keeps until it restarts: the strategy is built once, and the feed
 #: sets up its option chains at start-up. Pinned symbols apply live, through the engine's
@@ -42,6 +43,8 @@ class Settings(BaseModel):
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
+    # How the research jobs run. The bot itself never reads it.
+    research_jobs: ResearchJobSettings = Field(default_factory=ResearchJobSettings)
     order_type: Literal["LIMIT", "MARKET"] = "LIMIT"
     limit_offset_bps: Annotated[Decimal, Field(ge=0, le=100)] = Decimal(5)
     order_timeout_s: PositiveFloat = 20.0

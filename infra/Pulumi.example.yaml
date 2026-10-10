@@ -31,6 +31,18 @@ config:
   # With research on, pinnedSymbols may be empty. Without a table, the bot behaves
   # exactly as it did before research existed.
   # traider:research: false
+
+  # The pre-market research run (needs traider:research: true): every weekday at 08:00
+  # New York time it reads the market, sets the day's posture and writes ranked picks to
+  # the research table, using Schwab, Finnhub's free tier and Claude on Amazon Bedrock
+  # (about $1-2 a run with the default model). Store a Finnhub key and enable Bedrock
+  # model access first: see docs/runbook.md, "Research jobs". How it runs (thresholds,
+  # models, budgets) is research_jobs in the versioned settings, not a stack setting.
+  # traider:researchJobs: false
+  # The schedule is created disabled, so nothing runs until you turn it on, after the
+  # key, model access and a dry run (needs traider:researchJobs: true).
+  # traider:researchScheduleEnabled: false
+
   # Give any subset; the rest keep their defaults. Unknown names are rejected.
   # Validated always, used only when research is on.
   # traider:researchSettings:

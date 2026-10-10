@@ -36,7 +36,16 @@ filterwarnings = [
 python_version = "3.13"
 strict = true
 warn_unreachable = true
-files = ["__main__.py", "stack.py", "bot.py", "data.py", "lambdas.py", "network.py", "settings.py"]
+files = [
+    "__main__.py",
+    "stack.py",
+    "bot.py",
+    "data.py",
+    "lambdas.py",
+    "network.py",
+    "research.py",
+    "settings.py",
+]
 
 [tool.ruff]
 line-length = 100

@@ -171,3 +171,30 @@ def test_research_settings_defaults_match_the_brief():
     assert s.reduced_factor == Decimal("0.5")
     assert s.intraday_flatten_min == 15
     assert s.swing_lookback_days == 10
+
+
+def test_research_job_locations_come_from_the_environment():
+    cfg = Config.from_env(
+        {
+            **BASE,
+            "TRAIDER_RESEARCH_BUCKET": "traider-dev-research-trail",
+            "TRAIDER_FINNHUB_SECRET_ID": "arn:aws:secretsmanager:us-east-1:1:secret:finnhub",
+            "TRAIDER_FINNHUB_API_KEY": "fh-local-key-0123456789",
+        }
+    )
+    assert cfg.research_bucket == "traider-dev-research-trail"
+    assert cfg.finnhub_secret_id == "arn:aws:secretsmanager:us-east-1:1:secret:finnhub"
+    assert cfg.finnhub_api_key == "fh-local-key-0123456789"
+
+
+def test_keys_never_show_in_a_printed_config():
+    from traider.app import describe
+
+    cfg = Config(
+        symbols=("SPY",),
+        finnhub_api_key="fh-local-key-0123456789",
+        schwab_app_secret="schwab-secret-0123456789",
+    )
+    for text in (repr(cfg), str(cfg), json.dumps(describe(cfg))):
+        assert "fh-local-key-0123456789" not in text
+        assert "schwab-secret-0123456789" not in text

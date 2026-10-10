@@ -27,6 +27,17 @@ def setup_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level.upper())
-    # Library chatter is not worth paying to store.
-    for noisy in ("botocore", "boto3", "urllib3", "aiohttp.access", "asyncio"):
+    # Library chatter is not worth paying to store. The research run's model client
+    # (anthropic, over httpx and httpcore) logs every request at INFO or DEBUG; the bot
+    # does not use those libraries, so for it nothing changes.
+    for noisy in (
+        "botocore",
+        "boto3",
+        "urllib3",
+        "aiohttp.access",
+        "asyncio",
+        "anthropic",
+        "httpx",
+        "httpcore",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)

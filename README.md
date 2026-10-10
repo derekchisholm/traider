@@ -36,6 +36,7 @@ flowchart LR
         secrets["Secrets Manager<br/>app key, Schwab sign-in"]
         state[("DynamoDB<br/>lease, counters, audit log")]
         research[("DynamoDB<br/>research picks<br/>(opt-in)")]
+        jobs["Fargate task, weekdays 08:00<br/>research run (opt-in)"]
         alerts["SNS<br/>alerts"]
         signin["HTTP API + Lambda<br/>Schwab sign-in"]
         watchdog["Lambda, daily<br/>sign-in expiry check"]
@@ -47,6 +48,10 @@ flowchart LR
     secrets --> engine
     engine <--> state
     research -- "read only" --> engine
+    schwab --> jobs
+    jobs -- "picks, posture" --> research
+    jobs <--> bedrock["Claude on Bedrock"]
+    finnhub[(Finnhub)] --> jobs
     engine --> alerts
     watchdog --> alerts
     alerts --> you
@@ -169,10 +174,10 @@ Other things to know:
 
 Verified, on the machine this was written on:
 
-- More than 1,300 automated tests for the bot pass. They run it against an in-process
+- More than 2,000 automated tests for the bot pass. They run it against an in-process
   fake of the Schwab API (sign-in, accounts, orders, quotes, price history, market
   hours, the streaming socket, and failures of each) and against a fake AWS.
-- More than 100 tests run the Pulumi program against provider mocks and check what it
+- More than 150 tests run the Pulumi program against provider mocks and check what it
   would create: network rules, IAM policies down to the exact resource, the schedule,
   where secrets go, and that the example configuration matches the real defaults.
 - Each safety rule was checked the other way round as well: the rule was broken on
@@ -197,9 +202,20 @@ Not verified. Treat each as something to watch on first contact:
   trade options before anything else.
 - **Research has only run against fakes.** The research table, the position ledger and the
   research rules were tested with in-memory stores, a fake DynamoDB (moto) and the fake
-  Schwab server. They have not met a real DynamoDB table or a real account, and the research
-  jobs that would fill the table are not built yet: until they exist, research is written by
-  hand (`traider research seed`).
+  Schwab server. They have not met a real DynamoDB table or a real account.
+- **The pre-market research run has never called a real service.** It was tested end to
+  end against a fake Schwab, a fake Finnhub, a scripted model and moto. Not verified:
+  - tool use and forced tool choice through Bedrock's `bedrock-mantle` endpoint, the IAM
+    action names it needs, and which Claude model ids your account and region can use;
+  - whether Schwab's movers and quotes reflect pre-market trading at 08:00 New York time,
+    and what `securityStatus` reads then (anything but "Normal" counts as halted);
+  - whether Schwab hands out a second access token while the bot's is still valid;
+  - how much of the earnings calendar, company news and profiles Finnhub's free tier covers;
+  - the token prices in the settings;
+  - the Scheduler, ECS task and dead-letter queue behaviour on real AWS.
+
+  The first thing to run is `traider research run --kind premarket --dry-run`
+  ([runbook](docs/runbook.md#research-jobs)).
 - **`pulumi up` has never been run.** The mocks prove the program is self-consistent
   and uses argument names the providers accept. They do not prove AWS accepts every
   value. Expect to fix something small on the first `pulumi preview`.
@@ -402,8 +418,8 @@ streaming connection per sign-in and the two would keep cutting each other off.
 
 Instead of a fixed symbol list, the bot can trade what **research** picked. Research is
 a table of ranked picks and a "posture" for the day that something else writes each
-morning (the research jobs are a separate piece, not built yet; until then you write it by
-hand, see [below](#seeding-picks-by-hand)). It is **opt-in**: set `traider:research: true`
+morning: the [pre-market research run](#the-pre-market-research-run), or you, by hand (see
+[below](#seeding-picks-by-hand)). It is **opt-in**: set `traider:research: true`
 on the stack, which creates the table and gives the bot read-only access to it. It is off by
 default because a bot with research on but nothing writing a posture would stand aside every
 day. With research off there is no table, no ledger and none of the rules below, and the
@@ -463,9 +479,68 @@ bot's after they are unpinned, until they are flat. It cannot tell your shares f
 symbols, not lots: shares you add by hand to a symbol the bot holds are managed, and
 flattened, as the bot's. Keep the bot's account to the bot.
 
+### The pre-market research run
+
+Every weekday at 08:00 New York time a separate Fargate task, started from the bot's own
+image, runs `traider research run --kind premarket`. It is **opt-in**: set
+`traider:researchJobs: true` (which needs `traider:research: true`). The schedule is
+created **disabled**; it fires only once you also set `traider:researchScheduleEnabled: true`,
+after the steps in the [runbook](docs/runbook.md#research-jobs) (key, model access, dry
+run). In order, the run:
+
+1. reads the market from Schwab (VIX, SPY, QQQ, IWM and the sector ETFs, the day's movers,
+   daily price history) and from Finnhub's free tier (the earnings calendar, company and
+   market news, company profiles);
+2. sets the day's **posture** with fixed code rules (VIX, SPY's gap, SPY against its 50-day
+   average, dates you list), then asks Claude for a second opinion that can only make it
+   stricter. On a `stand_aside` day it stops there: no picks, nothing forced;
+3. **screens** the candidates (movers, names that just reported earnings and your optional
+   watchlist) on price, liquidity, history and asset type, and scores them;
+4. has Claude on Amazon Bedrock **study the best few**, one name at a time, with read-only
+   tools and hard limits on calls, tokens, time and money;
+5. **checks every idea in code** (a fresh quote that is not halted, a sensible stop, liquid
+   puts for bearish ideas, an expiry that clears the next earnings date and stays inside
+   the earnings calendar's reach) and writes the ranked picks.
+
+The model only advises: it can make the posture stricter, never looser, and every pick
+passes code checks. Missing or stale data means standing aside. The run never places an
+order. **It is not financial advice**: it proposes picks for the strategy you choose.
+
+The bot reads the result as it reads any research. A run that hit a budget, ran out of
+time, lost the events vendor, could not reach the model (a failed posture review, or
+failed or timed-out model calls in half the deep-dives or more) or could not write its trail finishes
+as `partial`, and by default (`research.accept_partial_runs: false`) the bot ignores a
+partial run, posture included, so it stands aside that day. A run that fails writes no posture, so the bot
+stands aside too. Every run leaves a trail (what it saw, each conversation with the model,
+every decision) in a private S3 bucket for 400 days.
+
+How it runs is the `research_jobs` block of the versioned settings: change it with
+`traider settings apply` like anything else, and the next run uses it. The most useful
+fields:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `research_jobs.enabled` | true | false: no run, so no posture, so the bot stands aside |
+| `research_jobs.watchlist` | none | names you want looked at as well (up to 50) |
+| `research_jobs.posture.stand_aside_days` | none | dates to sit out, for example FOMC days |
+| `research_jobs.screen.deep_dive_count` | 12 | how many names Claude studies |
+| `research_jobs.dive.model` | `anthropic.claude-sonnet-5-5` | the model for the deep-dives (`posture_model` for the posture review) |
+| `research_jobs.rank.max_picks` | 10 | picks per run, at most 25 |
+| `research_jobs.budget.run_usd` / `day_usd` | 3.00 / 8.00 | Bedrock spend per run and per New York day |
+| `research_jobs.budget.prices` | Sonnet 5.5 at $2 / $10 per million tokens | what the budgets are counted in |
+
+Every model in use needs a price above zero in `budget.prices`; a model without one is
+never called. A dry run (`--dry-run`) is held to `run_usd` and to what is left of today's
+`day_usd`, but what it spends is not added to the day: dry runs are not counted in the
+day budget, only in their own run budget. **The default prices are unverified**: check them against AWS's Bedrock
+price list.
+
+It needs a Finnhub key and Bedrock model access first; the
+[runbook](docs/runbook.md#research-jobs) has the steps and what each alert means.
+
 ### Seeding picks by hand
 
-Until the research jobs exist, write research yourself to see this work on paper.
+Without the research run, or next to it on paper, you can write research yourself.
 `traider research seed FILE` writes a run of picks and a posture for today and
 `traider research show` prints what the bot would read. Both need the stack to have
 `traider:research: true` and the `localEnv` output loaded; the file format and the
@@ -568,6 +643,11 @@ Rough monthly cost in us-east-1, before tax and free tiers:
 | Logs, DynamoDB, Lambda, API, alerts | under $0.50 | under $0.50 |
 | **About** | **$3.50** | **$12** |
 
+The [pre-market research run](#the-pre-market-research-run), when switched on, adds
+roughly $1-2 a weekday in Bedrock tokens with the default model (an estimate, not
+measured; capped at `research_jobs.budget.day_usd` a day), so roughly $20-45 a month, plus
+well under a dollar of Fargate and S3. Finnhub's free tier costs nothing.
+
 There is no NAT gateway (about $32 a month saved): the task has a public address and
 a security group with no inbound rules and outbound HTTPS only.
 
@@ -583,7 +663,8 @@ src/traider/            the bot
   state/                lease, counters and audit log (DynamoDB or in memory)
   lambdas/              sign-in endpoint and expiry watchdog
   universe.py           which symbols the bot watches (pinned, held, picked)
-  research/             picks, posture, the research table, the bot's view of it
+  research/             picks, posture, the research table, the bot's view of it, and
+                        the pre-market research run (run.py) and its parts
   cli.py                run | check | login | backtest | settings | research
 tests/                  unit tests, the fake Schwab server, whole-bot tests
 infra/                  the Pulumi program (Python) and its tests

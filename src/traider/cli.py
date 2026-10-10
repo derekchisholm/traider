@@ -15,9 +15,10 @@ import os
 import secrets
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, TextIO
 
 import aiohttp
@@ -39,9 +40,12 @@ from traider.broker.schwab import SchwabBroker
 from traider.config import Config, ConfigError, RiskLimits, check_symbols
 from traider.log import setup_logging
 from traider.models import Bar
+from traider.research.run import RunDeps, run_premarket
+from traider.research.scrub import scrub
 from traider.research.seed import build_manual_run
 from traider.research.source import ResearchSource
 from traider.research.store import DynamoResearchStore, ResearchStore
+from traider.research.wiring import DEFAULT_TRAIL_DIR, SetupError, build_deps, close_llm
 from traider.schwab.client import API_BASE, SchwabClient, SchwabError
 from traider.schwab.hours import SchwabSessionProvider
 from traider.schwab.oauth import (
@@ -629,6 +633,77 @@ async def research_show(source: ResearchSource, out: TextIO, *, now: datetime) -
     return 0
 
 
+RESEARCH_KINDS = ("premarket",)  # the other kinds come in C2
+
+DRY_RUN_NOTICE = (
+    "Dry run: real calls to Schwab, Finnhub and Claude on Amazon Bedrock. The Bedrock calls "
+    "cost real money (about $1-2 a run with the default model). Nothing is written to the "
+    "research table (no picks, posture, cost or lock) and no alert is sent. The trail is "
+    "written to {where}.\n\n"
+)
+
+BuildDeps = Callable[..., Awaitable[RunDeps]]
+
+
+def _error_text(exc: BaseException) -> str:
+    """An exception as text that is safe to print: scrubbed, like META and alerts."""
+    text = str(exc) if isinstance(exc, SetupError) else f"{type(exc).__name__}: {exc}"
+    return scrub(text)
+
+
+async def research_run(
+    config: Config,
+    out: TextIO,
+    *,
+    kind: str,
+    dry_run: bool,
+    force: bool,
+    trail_dir: str,
+    build: BuildDeps = build_deps,
+    now: datetime | None = None,
+) -> int:
+    """One research run now. Returns the run's exit code: 0 done (or nothing to do),
+    1 failed or could not start, 2 another run holds the lock.
+
+    ``now`` is read after the setup, right before the run: the lock's lifetime counts from
+    it. Every error printed is scrubbed. The HTTP session and the model client are closed
+    on every path."""
+    if kind not in RESEARCH_KINDS:
+        out.write(f"unknown research kind {kind!r}; only premarket exists so far\n")
+        return 2
+    clock = SystemClock()
+    if dry_run:
+        out.write(DRY_RUN_NOTICE.format(where=trail_dir))
+        out.flush()
+    async with aiohttp.ClientSession() as http:
+        try:
+            deps = await build(
+                config, http, dry_run=dry_run, trail_dir=Path(trail_dir), clock=clock
+            )
+        except Exception as exc:
+            text = _error_text(exc)
+            log.error("the research run cannot start: %s", text)
+            out.write(f"cannot start the research run: {text}\n")
+            return 1
+        try:
+            started = now or clock.now()
+            outcome = await run_premarket(deps, started, dry_run=dry_run, force=force)
+        except Exception as exc:
+            # run_premarket records its own failures; this is a bug, so fail closed.
+            text = _error_text(exc)
+            log.error("the research run failed: %s", text)
+            out.write(f"research run failed: {text}\n")
+            return 1
+        finally:
+            await close_llm(deps.llm)
+    if dry_run:
+        out.write(json.dumps(outcome.report(), indent=2) + "\n")
+    else:
+        detail = f" ({outcome.detail})" if outcome.detail else ""
+        out.write(f"research {kind} {outcome.status}: {outcome.run_id}{detail}\n")
+    return outcome.exit_code
+
+
 def _research_store(config: Config) -> ResearchStore:
     assert config.research_table is not None
     return DynamoResearchStore(app.Aws(config.aws_region).table(config.research_table))
@@ -679,8 +754,30 @@ def _parser() -> argparse.ArgumentParser:
     apply = actions.add_parser("apply", help="write a JSON file as the next version")
     apply.add_argument("file")
     apply.add_argument("--note", default="", help="why, kept with the version")
-    research = commands.add_parser("research", help="write or read research by hand")
+    research = commands.add_parser(
+        "research", help="run the research jobs, or write or read research"
+    )
     research_actions = research.add_subparsers(dest="action", required=True)
+    run_research = research_actions.add_parser(
+        "run", help="run a research job now (what the 08:00 schedule runs)"
+    )
+    run_research.add_argument("--kind", required=True, choices=RESEARCH_KINDS)
+    run_research.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="make every real call (Bedrock costs money) but write nothing to the research "
+        "table; print the posture and picks",
+    )
+    run_research.add_argument(
+        "--force", action="store_true", help="run even if today's run already finished"
+    )
+    run_research.add_argument(
+        "--trail-dir",
+        default=DEFAULT_TRAIL_DIR,
+        metavar="DIR",
+        help=f"where the trail goes without a trail bucket, and on a dry run "
+        f"(default {DEFAULT_TRAIL_DIR})",
+    )
     seed = research_actions.add_parser("seed", help="write a JSON file as a manual research run")
     seed.add_argument("file")
     research_actions.add_parser("show", help="print the posture and live picks the bot would see")
@@ -730,6 +827,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not config.research_table:
                 print("TRAIDER_RESEARCH_TABLE is not set", file=sys.stderr)
                 return 2
+            if args.action == "run":
+                if args.dry_run:
+                    logging.getLogger().setLevel(logging.WARNING)
+                else:
+                    setup_logging(config.log_level)
+                return asyncio.run(
+                    research_run(
+                        config,
+                        sys.stdout,
+                        kind=args.kind,
+                        dry_run=args.dry_run,
+                        force=args.force,
+                        trail_dir=args.trail_dir,
+                    )
+                )
             research_store = _research_store(config)
             if args.action == "seed":
                 return asyncio.run(

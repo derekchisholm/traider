@@ -126,6 +126,13 @@ class Recorder(pulumi.runtime.Mocks):
             }
         if args.token == "aws:index/getRegion:getRegion":
             return {"name": REGION, "region": REGION, "id": REGION}
+        if args.token == "aws:index/getCallerIdentity:getCallerIdentity":
+            return {
+                "accountId": ACCOUNT,
+                "arn": f"arn:aws:iam::{ACCOUNT}:user/test",
+                "userId": "AIDATEST",
+                "id": ACCOUNT,
+            }
         raise AssertionError(f"unexpected provider call {args.token}")
 
 
