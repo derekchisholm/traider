@@ -101,10 +101,13 @@ def test_the_research_run_commands_in_the_docs_parse(capsys):
     for doc in DOCS:
         shown |= set(re.findall(r"traider (research run [a-z -]+)", text_of(doc)))
     assert "research run --kind premarket --dry-run" in {s.strip() for s in shown}
+    # Parsed as written, without --help: --help would exit 0 before an unknown flag is
+    # rejected.
     for command in shown:
-        with pytest.raises(SystemExit) as exit_:
-            cli.main([*command.split(), "--help"])
-        assert exit_.value.code == 0, f"`traider {command}` does not parse"
+        try:
+            cli._parser().parse_args(command.split())
+        except SystemExit as exit_:
+            raise AssertionError(f"`traider {command}` does not parse") from exit_
     capsys.readouterr()
 
 

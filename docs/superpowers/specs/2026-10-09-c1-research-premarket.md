@@ -36,9 +36,9 @@ watch, weekly, monthly, scorecard) come in C2 and reuse every C1 stage.
 | Retries and budget | The Bedrock client never retries (`max_retries=0`); each attempt is metered. After a budget refusal or an overrun the cost meter stops all further calls. Every estimate includes a 1000-token tool overhead. | A hidden retry would spend money the meter never saw. |
 | Fail closed on data | A missing or non-`Normal` `securityStatus` counts as halted. Bad daily bars are dropped. A name whose last daily bar is more than 3 weekdays old is dropped (`stale_history`). Stale SPY bars mean `stand_aside`. | Real pre-market `securityStatus` values are unverified; if they are not `Normal`, every name drops as `halted` and the dry run shows it. |
 | Earnings expiry | Counted in weekdays, not market holidays, so a clamp can land on a holiday. | No holiday calendar in the research path. |
-| Run status | A trail write failure makes the run `partial`. Daily-history errors add a note, and the run is `partial` when they reach half of the names or more. Past `max_run_s` before the screen: `partial`, posture written, 0 picks. A whole-run time box (`max_run_s` + 540 s) makes a run that is too slow `failed`. | An incomplete audit trail, an outage and a hung run must not pass as `ok`. |
+| Run status | A trail write failure makes the run `partial`. So does a failed posture review, or `llm_error` in at least half the dives started (for example no model access). Daily-history errors add a note, and the run is `partial` when they reach half of the names or more. Past `max_run_s` before the screen: `partial`, posture written, 0 picks. A whole-run time box (`max_run_s` + 540 s) makes a run that is too slow `failed`. | An incomplete audit trail, an outage and a hung run must not pass as `ok`. |
 | Scrubbing | All error and alert text is scrubbed before it reaches META, an alert or a log line. Botocore DEBUG logging must never be enabled where logs are kept: it prints secret values. | Vendor errors and model-written text can carry secrets or injected words. |
-| Rollout order | The schedule is live as soon as `traider:researchJobs` is deployed, and the Finnhub secret is created by the same `pulumi up`. So: enable Bedrock model access, deploy and store the key in one sitting (no 08:00 in between), run `traider research run --kind premarket --dry-run`, and only then leave it to the schedule. | A scheduled run with no key or no model access fails, and the bot stands aside. |
+| Rollout order | The schedule is created **DISABLED**; `traider:researchScheduleEnabled` (default false, needs `researchJobs`) turns it on. Order: enable Bedrock model access, deploy with `traider:researchJobs` (this creates the empty Finnhub secret), store the key, run `traider research run --kind premarket --dry-run`, then set `researchScheduleEnabled`. | Nothing fires before the key, model access and a dry run are checked. Only a missing Finnhub key stops a run before it starts (exit 1, no META; the stopped-with-an-error alert carries only stopCode/stoppedReason, the cause is in the logs: "cannot start the research run:"). Missing model access gives a `partial` run with notes (a failed posture review, or `llm_error` in at least half the dives started), so the bot stands aside. |
 | One run at a time | A DynamoDB lock item per run kind, with expiry. Plus skip-if-done: an `ok` or `partial` pre-market run for today means exit unless `--force`. | EventBridge Scheduler delivers at least once. |
 
 ### Not verified (no real AWS or Schwab in this work)
@@ -82,8 +82,9 @@ any exception ─▶ META failed, alert, exit 1 (no posture, so the bot stands a
   and the run is `partial`. A whole-run time box of `max_run_s` + 540 s makes a run that
   is too slow `failed`.
 * **Partial** means some planned work did not happen: the run or day budget was hit,
-  the deadline passed, the events vendor failed, daily history was unreadable for half
-  the names or more, or a trail file could not be written. By default the bot ignores partial
+  the deadline passed, the events vendor failed, the posture review failed, model calls failed
+  (`llm_error`) in at least half the deep-dives started, daily history was unreadable for
+  half the names or more, or a trail file could not be written. By default the bot ignores partial
   runs (`research.accept_partial_runs: false`), and that includes their posture. So a
   partial run means standing aside unless the owner opts in. This follows A's
   fail-closed rule.
@@ -401,7 +402,7 @@ Without a bucket, the trail goes to a local directory (`--trail-dir`, default
   | Task role | See below |
   | ECS task definition | `{prefix}-research`: same image, command `["research", "run", "--kind", "premarket"]`, 0.5 vCPU / 1 GB, same env as the bot plus the bucket and Finnhub secret |
   | Scheduler role | `ecs:RunTask` on the task definition family, `iam:PassRole` on the two task roles |
-  | Scheduler schedule | `cron(0 8 ? * MON-FRI *)`, timezone `America/New_York`, flexible window off, retry policy 2 retries within 10 minutes (the lock and skip-if-done make a retry safe, but a late run is not wanted); a start that still fails goes to the dead-letter queue |
+  | Scheduler schedule | `cron(0 8 ? * MON-FRI *)`, timezone `America/New_York`, created `DISABLED` unless `traider:researchScheduleEnabled`, flexible window off, retry policy 2 retries within 10 minutes (the lock and skip-if-done make a retry safe, but a late run is not wanted); a start that still fails goes to the dead-letter queue |
   | Failure rule | EventBridge rule: task stopped, group `family:{prefix}-research`, nonzero exit → SNS |
   | Dead-letter queue | SQS `{prefix}-research-schedule-dlq` (SSE) for starts the scheduler gives up on, with a CloudWatch alarm (queue depth > 0) → SNS. The alarm stays in ALARM until the queue is purged, so the runbook says to read the message and then purge it. |
 

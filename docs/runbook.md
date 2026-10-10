@@ -178,9 +178,9 @@ once every 15 minutes.
 | Research DATE: ok | The pre-market research run finished. The alert gives the posture, each pick (L long, B bearish, its horizon and score) and the cost. | Nothing. `traider research show` before the open shows what the bot will act on. |
 | Research DATE: partial | The run finished, but planned work did not happen: a budget stopped Bedrock calls, a deadline passed, Finnhub failed, the Bedrock posture review failed, Bedrock calls failed in half the deep-dives or more, daily history was unreadable for half the names or more, or the trail could not be written. The alert ends with the reasons. By default the bot ignores a partial run, posture included, so it stands aside today. | Read the reasons. Once the cause has passed, run it again (see [Research jobs](#research-jobs)). To trade on partial runs anyway, set `research.accept_partial_runs`; it applies to every partial run. |
 | Research DATE: failed | The run stopped at the stage it names (for example `collect`, `posture` or `dive`; a run that took longer than `research_jobs.max_run_s` plus 9 minutes fails too). It wrote no posture, so the bot stands aside today. | An expired Schwab sign-in is the usual cause: sign in, then run it again. Otherwise read the research logs. |
-| The research run stopped with an error | From AWS, not from the run: the research task exited with an error (it failed, it could not start, or another run held the lock). | Read the research logs (below). A run that cannot even start (no Finnhub key stored, no Bedrock access) writes no run record, so this alert is the only sign. If the task could not start, check the image and the roles. |
+| The research run stopped with an error | From AWS, not from the run: the research task exited with an error (it failed, it could not start, or another run held the lock). | Read the research logs (below). A run that cannot even start (no Finnhub key stored) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
 | Alarm: the scheduler could not start the research run | The scheduler gave up on starting the task (two retries within 10 minutes) and put the request in a dead-letter queue. No task ran, so the alert above cannot fire. The bot stands aside today. | Read the message, then **purge the queue** (below). If you do not, the alarm stays in ALARM and later failures send no new alert. |
-| No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) No summary means the run did not finish, or never ran. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
+| No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) No summary means the run did not finish, or never ran: the schedule is not enabled (`traider:researchScheduleEnabled`, off by default), the start failed, or the run is stuck. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
 
 ## Seeing what the bot did
 
@@ -337,19 +337,23 @@ pulumi config set traider:research true
 pulumi config set traider:researchJobs true
 pulumi up
 read -rs FINNHUB_KEY        # paste the key, press Enter; nothing is shown or saved
-aws secretsmanager put-secret-value --secret-id "$(pulumi stack output finnhubSecretArn)" \
-  --secret-string "{\"api_key\": \"$FINNHUB_KEY\"}"
+printf '{"api_key": "%s"}' "$FINNHUB_KEY" | aws secretsmanager put-secret-value \
+  --secret-id "$(pulumi stack output finnhubSecretArn)" --secret-string file:///dev/stdin
 unset FINNHUB_KEY
 ```
 
 The key goes in that command and nowhere else: not in a file, a Pulumi setting, a chat or a
-ticket. If it ever leaks (pasted anywhere else, even by accident), make a new one at Finnhub
-and store it the same way. A run with no key stored does not start; the stopped-with-an-error
-alert says so.
+ticket. Piping it in keeps it out of the command line (`printf` is a shell built-in, so it
+is not in the process list either); typing it into `--secret-string` directly would show it
+there briefly, which is acceptable on a personal machine but worse. If it ever leaks (pasted
+anywhere else, even by accident), make a new one at Finnhub and store it the same way. A run
+with no key stored does not start (exit 1, no run record); the stopped-with-an-error alert
+shows only a stop code and reason, and the research logs say "cannot start the research run:".
 
 **3. A dry run.** With the `localEnv` output loaded (README, step 5;
 reload it, it now carries the Finnhub secret) and AWS credentials that can read the secrets
-and tables and call Bedrock, from the repository root:
+and tables and call Bedrock, and a valid stored Schwab sign-in (sign in first if it has
+lapsed), from the repository root:
 
 ```sh
 uv run --env-file .env traider research run --kind premarket --dry-run
@@ -371,9 +375,11 @@ Finnhub and Bedrock. What the first dry run may show:
 - **Everything dropped as `stale_history`, or posture `stand_aside` with a note about SPY:**
   daily bars whose last bar is more than 3 weekdays old are dropped, and stale SPY bars mean
   `stand_aside`. Malformed bars are dropped too.
-- **A Bedrock error:** no model access, an id the region does not serve, or tool use the
-  endpoint does not support. Each failed attempt is counted against the budget; there are
-  no retries.
+- **A Bedrock problem:** no model access, an id the region does not serve, or tool use the
+  endpoint does not support. The run does not stop: it finishes `partial` (a failed posture
+  review, or failed model calls in half the deep-dives or more), and the JSON's notes and
+  counts say so. The bot would stand aside. Each failed attempt is counted against the
+  budget; there are no retries.
 
 **4. Enable the schedule.** Once a dry run looks right, from `infra/`:
 
