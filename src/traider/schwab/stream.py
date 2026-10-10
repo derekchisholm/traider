@@ -79,6 +79,7 @@ class SchwabStream:
         self._sink = sink
         self._clock = clock
         self._symbols = tuple(symbols)
+        self._changed = asyncio.Event()  # set when the symbols change; cleared when acted on
         self._backoff_initial_s = backoff_initial_s
         self._backoff_max_s = backoff_max_s
         self._sleep = sleep
@@ -98,14 +99,30 @@ class SchwabStream:
     def last_message_at(self) -> datetime | None:
         return self._last_message_at
 
+    def set_symbols(self, symbols: Sequence[str]) -> None:
+        """Watch these symbols instead. A live connection is closed and reopened at once
+        with the new subscription; the feed polls while that happens. The same symbols in
+        another order are not a change."""
+        new = tuple(symbols)
+        if set(new) == set(self._symbols):
+            return
+        self._symbols = new
+        self._changed.set()
+
     async def run(self) -> None:
         """Stay connected until cancelled."""
         backoff = self._backoff_initial_s
         while True:
+            if not self._symbols:
+                await self._changed.wait()  # nothing to watch: stay off the network
+                self._changed.clear()
+                continue
+            self._changed.clear()
             started = time.monotonic()
             try:
                 await self._connect_and_read()
-                log.warning("stream closed by the server")
+                if not self._changed.is_set():
+                    log.warning("stream closed by the server")
             except asyncio.CancelledError:
                 raise
             except (AuthUnavailable, SchwabError) as exc:
@@ -115,6 +132,9 @@ class SchwabStream:
             finally:
                 self._connected = False
                 self._fields.clear()
+            if self._changed.is_set():
+                backoff = self._backoff_initial_s
+                continue  # the symbols changed: reconnect now, no backoff
             if time.monotonic() - started > 60:
                 backoff = self._backoff_initial_s  # it was up for a while: start over
             await self._sleep(backoff * (1 + random.random() / 4))  # noqa: S311 - jitter
@@ -156,15 +176,32 @@ class SchwabStream:
             await self._command(ws, "CHART_EQUITY", "SUBS", {"keys": keys, "fields": CHART_FIELDS})
             self._connected = True
             log.info("stream connected, %d symbols", len(self._symbols))
-            async for message in ws:
-                if message.type is aiohttp.WSMsgType.TEXT:
-                    self._handle_text(message.data)
-                elif message.type in (
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.ERROR,
-                ):
-                    break
+            # The closer only closes the socket; this loop stays the one reader.
+            closer = asyncio.create_task(self._close_on_change(ws))
+            try:
+                async for message in ws:
+                    if message.type is aiohttp.WSMsgType.TEXT:
+                        self._handle_text(message.data)
+                    elif message.type in (
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR,
+                    ):
+                        break
+            finally:
+                closer.cancel()
+                await asyncio.gather(closer, return_exceptions=True)
+
+    async def _close_on_change(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Close the socket when the symbols change, so the run loop reconnects with the
+        new subscription. It never reads: that would be a second reader on the socket.
+        ``_changed`` is cleared at the top of the next loop, not here, so a change made
+        during the handshake still closes the connection that was being set up."""
+        await self._changed.wait()
+        try:
+            await ws.close()
+        except Exception as exc:
+            log.warning("stream: closing the socket after a symbol change failed: %s", exc)
 
     async def _command(
         self,

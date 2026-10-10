@@ -24,6 +24,7 @@ from typing import Any
 import aiohttp
 
 from traider.schwab.tokens import AuthUnavailable, TokenManager
+from traider.timeutil import ET
 
 API_BASE = "https://api.schwabapi.com"
 
@@ -153,20 +154,31 @@ class SchwabClient:
 
     # ------------------------------------------------------------- market data
 
-    async def quotes(self, symbols: Sequence[str]) -> Any:
+    async def quotes(self, symbols: Sequence[str], *, fields: str = "quote") -> Any:
+        """Quotes for up to a few hundred symbols. Research also asks for the
+        ``fundamental`` and ``reference`` fields."""
         return await self._get(
             "/marketdata/v1/quotes",
-            {"symbols": ",".join(symbols), "fields": "quote", "indicative": "false"},
+            {"symbols": ",".join(symbols), "fields": fields, "indicative": "false"},
         )
 
-    async def option_chain(self, symbol: str, start: date, end: date, *, strikes: int) -> Any:
-        """Calls and puts expiring between two dates, ``strikes`` strikes around the money.
+    async def movers(self, index: str, *, sort: str, frequency: int = 0) -> Any:
+        """The top movers on ``index`` (``EQUITY_ALL``, ``NYSE``, ``NASDAQ``, ...), sorted by
+        ``VOLUME``, ``TRADES``, ``PERCENT_CHANGE_UP`` or ``PERCENT_CHANGE_DOWN``."""
+        return await self._get(
+            f"/marketdata/v1/movers/{index}", {"sort": sort, "frequency": str(frequency)}
+        )
+
+    async def option_chain(
+        self, symbol: str, start: date, end: date, *, strikes: int, contract_type: str = "ALL"
+    ) -> Any:
+        """Contracts expiring between two dates, ``strikes`` strikes around the money.
         Kept narrow on purpose: Schwab fails on very large chain responses."""
         return await self._get(
             "/marketdata/v1/chains",
             {
                 "symbol": symbol,
-                "contractType": "ALL",
+                "contractType": contract_type,
                 "strikeCount": str(strikes),
                 "fromDate": start.isoformat(),
                 "toDate": end.isoformat(),
@@ -184,6 +196,24 @@ class SchwabClient:
                 "frequency": "1",
                 "startDate": str(int(start.timestamp() * 1000)),
                 "endDate": str(int(end.timestamp() * 1000)),
+                "needExtendedHoursData": "false",
+                "needPreviousClose": "false",
+            },
+        )
+
+    async def daily_history(self, symbol: str, start: date, end: date) -> Any:
+        """Daily candles for the regular session, from ``start`` to ``end`` inclusive."""
+        first = datetime(start.year, start.month, start.day, tzinfo=ET)
+        last = datetime(end.year, end.month, end.day, 23, 59, tzinfo=ET)
+        return await self._get(
+            "/marketdata/v1/pricehistory",
+            {
+                "symbol": symbol,
+                "periodType": "year",
+                "frequencyType": "daily",
+                "frequency": "1",
+                "startDate": str(int(first.timestamp() * 1000)),
+                "endDate": str(int(last.timestamp() * 1000)),
                 "needExtendedHoursData": "false",
                 "needPreviousClose": "false",
             },

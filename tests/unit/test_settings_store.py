@@ -368,12 +368,15 @@ async def test_refresh_keeps_restart_fields_and_says_a_restart_is_needed():
     store = MemorySettingsStore()
     live = LiveSettings(store, settings())
     await live.start(T0)
-    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    changed = settings(max_order_usd=Decimal(250)).model_copy(
+        update={"option_chain_days": 30, "pinned_symbols": ("QQQ",)}
+    )
     await store.write(changed, expected_version=1, author="cli", note="", now=T0)
     updates = await live.refresh(T0)
     assert [u.kind for u in updates] == ["applied", "pending_restart"]
-    assert updates[1].detail == "pinned_symbols"
-    assert live.current.pinned_symbols == ("SPY",)
+    assert updates[1].detail == "option_chain_days"
+    assert live.current.option_chain_days == 45
+    assert live.current.pinned_symbols == ("QQQ",)  # live: the engine's universe follows it
     assert live.current.risk.max_order_usd == Decimal(250)
 
 
@@ -488,11 +491,13 @@ async def test_pending_holds_the_stored_settings_while_a_restart_field_differs()
     live = LiveSettings(store, settings())
     await live.start(T0)
     assert live.pending is None
-    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    changed = settings(max_order_usd=Decimal(250)).model_copy(
+        update={"option_chain_days": 30, "pinned_symbols": ("QQQ",)}
+    )
     await store.write(changed, expected_version=1, author="cli", note="", now=T0)
     await live.refresh(T0)
     assert live.pending == changed  # as written, not merged
-    assert live.current.pinned_symbols == ("SPY",)
+    assert live.current.option_chain_days == 45
     # A later version that puts the restart field back clears it.
     await store.write(
         settings(max_order_usd=Decimal(100)), expected_version=2, author="cli", note="", now=T0
@@ -541,12 +546,14 @@ async def test_a_refresh_after_an_unreadable_start_keeps_the_running_restart_fie
     store.error = RuntimeError("no network")
     live = LiveSettings(store, settings())
     await live.start(T0)
-    changed = settings(max_order_usd=Decimal(250)).model_copy(update={"pinned_symbols": ("QQQ",)})
+    changed = settings(max_order_usd=Decimal(250)).model_copy(
+        update={"option_chain_days": 30, "pinned_symbols": ("QQQ",)}
+    )
     await store.write(changed, expected_version=0, author="cli", note="", now=T0)
     store.error = None
     updates = await live.refresh(T0)
     assert live.loaded
-    assert live.current.pinned_symbols == ("SPY",)
+    assert live.current.option_chain_days == 45
     assert live.current.risk.max_order_usd == Decimal(250)
     assert [u.kind for u in updates] == ["applied", "pending_restart"]
 
@@ -650,3 +657,40 @@ async def test_start_keeps_what_it_returned_in_start_updates():
     assert live.start_updates == []
     updates = await live.start(T0)
     assert updates and live.start_updates == updates
+
+
+async def test_with_research_off_a_version_with_no_pinned_symbols_is_rejected():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings(), require_pinned=True)
+    await live.start(T0)
+    empty = settings().model_copy(update={"pinned_symbols": ()})
+    await store.write(empty, expected_version=1, author="cli", note="", now=T0)
+    updates = await live.refresh(T0)
+    assert [u.kind for u in updates] == ["rejected"]
+    assert updates[0].detail == (
+        "settings version 2 has no pinned symbols and research is off, "
+        "so the bot would have nothing to trade"
+    )
+    assert live.current.pinned_symbols == ("SPY",)
+    assert await live.refresh(T0) == []  # reported once only
+
+
+async def test_with_research_off_a_start_version_with_no_pinned_symbols_is_rejected():
+    store = MemorySettingsStore()
+    empty = settings().model_copy(update={"pinned_symbols": ()})
+    await store.write(empty, expected_version=0, author="cli", note="", now=T0)
+    live = LiveSettings(store, settings(), require_pinned=True)
+    updates = await live.start(T0)
+    assert [u.kind for u in updates] == ["rejected"]
+    assert "no pinned symbols" in updates[0].detail
+    assert live.loaded is False
+    assert live.current.pinned_symbols == ("SPY",)
+
+
+async def test_with_research_on_no_pinned_symbols_is_fine():
+    store = MemorySettingsStore()
+    live = LiveSettings(store, settings())
+    await live.start(T0)
+    empty = settings().model_copy(update={"pinned_symbols": ()})
+    await store.write(empty, expected_version=1, author="cli", note="", now=T0)
+    assert [u.kind for u in await live.refresh(T0)] == ["applied"]

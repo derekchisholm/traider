@@ -9,7 +9,15 @@ from decimal import Decimal
 from typing import Any
 
 from traider.models import OrderRecord
-from traider.state.base import DayState, jsonable, order_from_dict, order_to_dict
+from traider.state.base import (
+    DayState,
+    LedgerEntry,
+    jsonable,
+    ledger_from_dict,
+    ledger_to_dict,
+    order_from_dict,
+    order_to_dict,
+)
 from traider.timeutil import trading_date
 
 
@@ -21,6 +29,7 @@ class MemoryStateStore:
         self._data.setdefault("days", {})
         self._data.setdefault("orders", {})
         self._data.setdefault("events", {})
+        self._data.setdefault("ledger", {})
 
     async def acquire_lease(self, owner: str, ttl_s: float, now: datetime) -> bool:
         lease = self._data.get("lease")
@@ -95,3 +104,13 @@ class MemoryStateStore:
 
     async def save_paper(self, data: dict[str, Any]) -> None:
         self._data["paper"] = copy.deepcopy(data)
+
+    async def ledger(self) -> dict[str, LedgerEntry]:
+        stored: dict[str, dict[str, Any]] = self._data["ledger"]
+        return {symbol: ledger_from_dict(item) for symbol, item in stored.items()}
+
+    async def put_ledger(self, entry: LedgerEntry) -> None:
+        self._data["ledger"][entry.symbol] = ledger_to_dict(entry)
+
+    async def delete_ledger(self, symbol: str) -> None:
+        self._data["ledger"].pop(symbol, None)

@@ -19,6 +19,7 @@ from typing import Any, ClassVar
 
 from traider.models import Bar, Quote, Target
 from traider.options import OptionQuote
+from traider.research.models import Pick, PostureLevel
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,9 @@ class StrategyContext:
     now: datetime
     positions: Mapping[str, int]  # shares (or option contracts) currently held, by symbol
     chains: Mapping[str, Sequence[OptionQuote]] = field(default_factory=dict)
+    # Live research picks by symbol, and today's posture. Empty and None when research is off.
+    picks: Mapping[str, Pick] = field(default_factory=dict)
+    posture: PostureLevel | None = None
 
     def position(self, symbol: str) -> int:
         return self.positions.get(symbol, 0)
@@ -34,6 +38,9 @@ class StrategyContext:
         """The option contracts on ``underlying`` to choose from, at most a minute old.
         Empty when options are off or the chain could not be loaded."""
         return self.chains.get(underlying, ())
+
+    def pick(self, symbol: str) -> Pick | None:
+        return self.picks.get(symbol)
 
 
 class Strategy(ABC):
@@ -45,6 +52,10 @@ class Strategy(ABC):
     def __init__(self, symbols: Sequence[str], params: Mapping[str, Any]) -> None:
         self.symbols = tuple(symbols)
         self.params = dict(params)
+
+    def on_universe(self, symbols: Sequence[str]) -> None:
+        """The symbols the bot now watches. Bars only arrive for these. Optional."""
+        self.symbols = tuple(symbols)
 
     @abstractmethod
     def on_bar(self, bar: Bar, ctx: StrategyContext) -> Sequence[Target]:

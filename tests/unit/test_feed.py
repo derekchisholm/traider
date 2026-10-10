@@ -10,6 +10,7 @@ from tests.unit.helpers import make_bar
 from traider.config import Config, RiskLimits
 from traider.feed import Feed
 from traider.marketdata import MarketData
+from traider.schwab.client import SchwabError
 from traider.session import SessionTracker, StaticSessionProvider
 from traider.timeutil import ManualClock
 
@@ -553,3 +554,304 @@ async def test_feed_takes_its_option_chain_settings_from_the_settings_it_is_give
         assert feed._chains_wanted is True
         assert feed._chain_span == timedelta(days=10)
         assert feed._chain_strikes == 5
+
+
+# --- a changing symbol set ------------------------------------------------------------------------
+
+
+async def test_new_symbols_are_warmed_up_from_history_on_the_next_poll(schwab, client, signed_in):
+    schwab.set_quote("SPY", 100, 100.02)
+    schwab.set_quote("NVDA", 120, 120.02)
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=3 - i), 120 + i) for i in range(3)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        await feed.poll_once()
+        warm = [(b.symbol, w) for b, w in feed.market.drain_bars() if b.symbol == "NVDA"]
+        assert len(warm) >= 2 and warm[0][1] is True
+        assert "NVDA" in feed._symbols
+
+
+async def test_only_the_last_warmup_bars_are_replayed_for_a_new_symbol(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=3 - i), 120 + i) for i in range(3)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        await feed._warm_pending(feed.clock.now())
+        bars = feed.market.drain_bars()
+    assert [(b.close, warm) for b, warm in bars] == [(Decimal(121), True), (Decimal(122), True)]
+
+
+async def test_a_symbol_whose_history_fails_is_retried(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        schwab.fail("GET", "/pricehistory", 503, times=3)  # every try of the first call
+        feed.set_symbols(("SPY", "NVDA"))
+        await feed.poll_once()
+        assert "NVDA" in feed._pending_warmup
+        await feed.poll_once()
+        assert "NVDA" not in feed._pending_warmup
+
+
+async def test_a_failing_symbol_does_not_hold_back_the_others(schwab, client, signed_in):
+    schwab.candles["AMD"] = [candle(MINUTE - timedelta(minutes=1), 150)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        schwab.fail("GET", "/pricehistory", 503, times=3)  # NVDA is asked first
+        feed.set_symbols(("SPY", "NVDA", "AMD"))
+        await feed._warm_pending(feed.clock.now())
+        assert list(feed._pending_warmup) == ["NVDA"]
+        assert {b.symbol for b, _ in feed.market.drain_bars()} == {"AMD"}
+
+
+async def test_symbols_already_followed_are_not_warmed_up_again(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY",))
+        assert feed._pending_warmup == {}
+
+
+async def test_a_symbol_dropped_before_its_warmup_is_not_warmed_up(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        feed.set_symbols(("SPY",))
+        await feed._warm_pending(feed.clock.now())
+        assert feed.market.drain_bars() == []
+    assert schwab.calls("GET", "/pricehistory") == []
+
+
+async def test_nothing_is_warmed_up_before_run_says_how_many_bars(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in) as feed:
+        assert feed._warmup_bars == 0
+        feed.set_symbols(("SPY", "NVDA"))
+        await feed._warm_pending(feed.clock.now())
+        assert feed._pending_warmup == {}
+    assert schwab.calls("GET", "/pricehistory") == []
+
+
+async def test_run_warms_up_symbols_that_arrive_while_it_runs(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        task = asyncio.create_task(feed.run(warmup_bars=5, poll_interval_s=0.01))
+        try:
+            await until(lambda: feed._warmup_bars == 5)
+            feed.set_symbols(("SPY", "NVDA"))
+            seen = []
+            await until(
+                lambda: (
+                    seen.extend(feed.market.drain_bars())
+                    or any(b.symbol == "NVDA" and warm for b, warm in seen)
+                )
+            )
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+async def test_no_symbols_means_no_quote_calls(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed.set_symbols(())
+        await feed.poll_once()
+    assert schwab.calls("GET", "/marketdata/v1/quotes") == []
+    assert schwab.calls("GET", "/pricehistory") == []
+
+
+async def test_the_stream_resubscribes_when_the_symbols_change(schwab, client, signed_in):
+    schwab.set_quote("SPY", 100, 100.02)
+    async with make_feed(schwab, client, signed_in, feed="stream") as feed:
+        task = asyncio.create_task(feed._stream.run())
+        try:
+            await schwab_connected(schwab)
+            feed.set_symbols(("SPY", "NVDA"))
+            await until(
+                lambda: any(
+                    r["command"] == "SUBS" and "NVDA" in r["parameters"]["keys"]
+                    for r in schwab.stream_requests
+                )
+            )
+            await until(lambda: feed._stream.connected)
+            assert schwab.subscriptions["CHART_EQUITY"] == {"SPY", "NVDA"}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_the_same_symbols_in_another_order_change_nothing(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in, feed="stream", symbols=("SPY", "QQQ")) as feed:
+        feed._warmup_bars = 2
+        calls = []
+        feed._stream.set_symbols = calls.append
+        feed.set_symbols(("QQQ", "SPY"))
+        assert (calls, feed._pending_warmup) == ([], {})
+        assert feed._symbols == ("QQQ", "SPY")
+
+
+async def test_warm_up_runs_after_the_quotes_and_even_when_the_market_is_closed(
+    schwab, client, signed_in
+):
+    schwab.set_quote("SPY", 100, 100.02)
+    order = []
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+
+        async def quotes_poll(now):
+            order.append("quotes")
+
+        async def warm(now):
+            order.append("warm")
+
+        feed._poll_quotes = quotes_poll
+        feed._warm_pending = warm
+        await feed.poll_once()
+    assert order == ["quotes", "warm"]
+
+
+async def test_a_failing_history_call_does_not_delay_the_quotes(schwab, client, signed_in):
+    schwab.set_quote("SPY", 100, 100.02)
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        quoted_before_history = []
+
+        async def history_fails(symbol, start, end):
+            quoted_before_history.append(feed.market.quote("SPY") is not None)
+            raise SchwabError("down")
+
+        client.price_history = history_fails
+        await feed.poll_once()
+        assert quoted_before_history[0] is True
+
+
+async def test_warm_up_still_runs_while_the_market_is_closed(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    evening = datetime(2026, 10, 8, 23, 0, 20, tzinfo=UTC)
+    async with make_feed(schwab, client, signed_in, now=evening) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        await feed.poll_once()
+        assert "NVDA" not in feed._pending_warmup
+
+
+async def test_warm_up_still_runs_while_the_stream_is_healthy(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    symbols = ("SPY", "NVDA")
+    async with make_feed(schwab, client, signed_in, feed="stream", symbols=symbols) as feed:
+        async with running(feed):
+            await schwab_connected(schwab)
+            await schwab.push_quote("SPY", 512.30, 512.34)
+            await schwab.push_quote("NVDA", 120.00, 120.02)
+            await until(feed.stream_healthy)
+            feed._warmup_bars = 2
+            feed._pending_warmup["NVDA"] = None
+            await feed.poll_once()
+            assert feed._pending_warmup == {}
+        assert schwab.calls("GET", "/marketdata/v1/quotes") == []  # the stream did the quotes
+
+
+async def test_a_symbol_dropped_during_its_history_call_is_not_replayed(schwab, client, signed_in):
+    schwab.candles["NVDA"] = [candle(MINUTE - timedelta(minutes=1), 120)]
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed._warmup_bars = 2
+        feed.set_symbols(("SPY", "NVDA"))
+        original = client.price_history
+
+        async def drops_while_waiting(symbol, start, end):
+            raw = await original(symbol, start, end)
+            feed.set_symbols(("SPY",))
+            return raw
+
+        client.price_history = drops_while_waiting
+        await feed._warm_pending(feed.clock.now())
+        assert feed.market.drain_bars() == []
+        assert feed._pending_warmup == {}
+
+
+# --- one failing symbol does not stall the rest -------------------------------------------
+
+
+def failing_for(client, bad: str):
+    """Make price history fail for ``bad`` every time, and count every history call."""
+    original = client.price_history
+    asked: list[str] = []
+
+    async def history(symbol, start, end):
+        asked.append(symbol)
+        if symbol == bad:
+            raise SchwabError("no history for this one")
+        return await original(symbol, start, end)
+
+    client.price_history = history
+    return asked
+
+
+async def test_warmup_queues_a_failing_symbol_and_warms_the_rest(schwab, client, signed_in):
+    for symbol in ("SPY", "QQQ"):
+        schwab.candles[symbol] = [candle(MINUTE - timedelta(minutes=1), 500)]
+    symbols = ("SPY", "BAD", "QQQ")
+    async with make_feed(schwab, client, signed_in, symbols=symbols) as feed:
+        failing_for(client, "BAD")
+        assert await feed.warmup(5) is True
+        assert list(feed._pending_warmup) == ["BAD"]
+        bars = feed.market.drain_bars()
+    assert {bar.symbol for bar, _ in bars} == {"SPY", "QQQ"}
+    assert all(warm for _, warm in bars)
+
+
+async def test_warmup_still_asks_again_when_nothing_could_be_fetched(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in, symbols=("SPY", "QQQ")) as feed:
+        schwab.fail("GET", "/pricehistory", 503, times=99)
+        assert await feed.warmup(5) is False
+        assert feed._pending_warmup == {}  # the whole warm-up is tried again instead
+
+
+async def test_with_no_symbols_warmup_is_done(schwab, client, signed_in):
+    async with make_feed(schwab, client, signed_in) as feed:
+        feed.set_symbols(())
+        assert await feed.warmup(5) is True
+
+
+async def test_a_failing_symbols_bars_do_not_hold_back_the_others(schwab, client, signed_in):
+    for symbol in ("SPY", "QQQ"):
+        schwab.candles[symbol] = [candle(MINUTE - timedelta(minutes=1), 500)]
+    symbols = ("SPY", "BAD", "QQQ")
+    async with make_feed(schwab, client, signed_in, symbols=symbols) as feed:
+        asked = failing_for(client, "BAD")
+        await feed.poll_once()
+        assert {bar.symbol for bar, _ in feed.market.drain_bars()} == {"SPY", "QQQ"}
+        assert asked == ["SPY", "BAD", "QQQ"]
+        feed.clock.advance(5)  # same minute: only the failed symbol is asked again
+        await feed.poll_once()
+        assert asked == ["SPY", "BAD", "QQQ", "BAD"]
+        feed.clock.advance(60)  # a new minute: everyone again
+        await feed.poll_once()
+        assert asked[4:] == ["SPY", "BAD", "QQQ"]
+
+
+async def test_run_starts_the_stream_with_one_symbols_history_failing(schwab, client, signed_in):
+    for symbol in ("SPY", "QQQ"):
+        schwab.candles[symbol] = [candle(MINUTE - timedelta(minutes=1), 500)]
+    symbols = ("SPY", "BAD", "QQQ")
+    async with make_feed(schwab, client, signed_in, feed="stream", symbols=symbols) as feed:
+        asked = failing_for(client, "BAD")
+        task = asyncio.create_task(
+            feed.run(warmup_bars=5, poll_interval_s=0.01, warmup_retry_s=0.01)
+        )
+        try:
+            await schwab_connected(schwab)
+            seen: list = []
+            await until(
+                lambda: (
+                    seen.extend(feed.market.drain_bars())
+                    or {b.symbol for b, warm in seen if warm} == {"SPY", "QQQ"}
+                )
+            )
+            await until(lambda: asked.count("BAD") >= 3)  # still being retried
+            assert "BAD" in feed._pending_warmup
+            assert schwab.subscriptions["CHART_EQUITY"] == {"SPY", "BAD", "QQQ"}
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

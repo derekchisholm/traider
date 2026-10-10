@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -81,7 +81,9 @@ class Feed:
         self._chain_span = timedelta(days=chosen.option_chain_days)
         self._chain_strikes = chosen.option_chain_strikes
         self._chain_tried_at: dict[str, datetime] = {}
-        self._bars_fetched_for: datetime | None = None
+        self._bars_fetched_for: dict[str, datetime] = {}  # symbol -> last minute fetched
+        self._pending_warmup: dict[str, None] = {}  # symbols to replay history for; ordered
+        self._warmup_bars = 0  # set by run(); 0 means no warm-up is wanted
         self._complained_at: datetime | None = None
 
     # -------------------------------------------------- sink for the stream
@@ -98,6 +100,45 @@ class Feed:
 
     def on_alive(self, when: datetime) -> None:
         self._market.mark_alive(when)
+
+    # -------------------------------------------------------------- symbols
+
+    def set_symbols(self, symbols: Sequence[str]) -> None:
+        """Follow the engine's universe. New symbols are warmed up from history on the
+        next poll; the stream resubscribes."""
+        new = tuple(symbols)
+        if set(new) == set(self._symbols):
+            self._symbols = new  # only the order differs: nothing to warm up or resubscribe
+            return
+        for symbol in new:
+            if symbol not in self._symbols:
+                self._pending_warmup[symbol] = None
+        for symbol in list(self._pending_warmup):
+            if symbol not in new:
+                del self._pending_warmup[symbol]  # dropped before it was warmed up
+        self._symbols = new
+        if self._stream is not None:
+            self._stream.set_symbols(new)
+
+    async def _warm_pending(self, now: datetime) -> None:
+        if not self._pending_warmup or self._warmup_bars <= 0:
+            self._pending_warmup.clear()
+            return
+        for symbol in list(self._pending_warmup):
+            try:
+                raw = await self._client.price_history(symbol, now - self.WARMUP_LOOKBACK, now)
+            except SchwabError as exc:
+                self._complain(now, "warm-up history for %s not available yet: %s", symbol, exc)
+                raw = None
+            if symbol not in self._symbols:
+                self._pending_warmup.pop(symbol, None)  # dropped while we were waiting
+                continue
+            if raw is None:
+                continue  # stays queued for the next poll
+            closed = [bar for bar in parse_candles(raw, symbol) if bar.start + _MINUTE <= now]
+            for bar in closed[-self._warmup_bars :]:
+                self._market.on_bar(bar, warmup=True)
+            self._pending_warmup.pop(symbol, None)
 
     # --------------------------------------------------------------- status
 
@@ -125,6 +166,7 @@ class Feed:
         warmup_retry_s: float = 30.0,
     ) -> None:
         """Warm up, then feed the market until cancelled."""
+        self._warmup_bars = warmup_bars
         while not await self.warmup(warmup_bars):
             await self._sleep(warmup_retry_s)
         interval = self._poll_interval_s if poll_interval_s is None else poll_interval_s
@@ -141,30 +183,56 @@ class Feed:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def warmup(self, bars_wanted: int) -> bool:
-        """Replay recent history so the strategy does not start cold. False means try again."""
+        """Replay recent history so the strategy does not start cold, symbol by symbol. A
+        symbol whose history fails is queued and retried by the polls, so one bad symbol
+        cannot hold up the rest. False (try again) only when no symbol's history could be
+        fetched at all, which at start-up means Schwab is not answering yet."""
         if bars_wanted <= 0:
             return True
         now = self._clock.now()
-        try:
-            for symbol in self._symbols:
+        symbols = self._symbols  # set_symbols may replace it while history is awaited
+        failed: list[str] = []
+        for symbol in symbols:
+            try:
                 raw = await self._client.price_history(symbol, now - self.WARMUP_LOOKBACK, now)
-                closed = [bar for bar in parse_candles(raw, symbol) if bar.start + _MINUTE <= now]
-                for bar in closed[-bars_wanted:]:
-                    self._market.on_bar(bar, warmup=True)
-        except SchwabError as exc:
-            self._complain(now, "warm-up history not available yet: %s", exc)
+            except SchwabError as exc:
+                self._complain(now, "warm-up history for %s not available yet: %s", symbol, exc)
+                failed.append(symbol)
+                continue
+            closed = [bar for bar in parse_candles(raw, symbol) if bar.start + _MINUTE <= now]
+            for bar in closed[-bars_wanted:]:
+                self._market.on_bar(bar, warmup=True)
+        if failed and len(failed) == len(symbols):
             return False
-        log.info("warm-up done for %d symbols", len(self._symbols))
+        for symbol in failed:
+            if symbol in self._symbols:
+                self._pending_warmup[symbol] = None
+        log.info(
+            "warm-up done for %d symbols, %d queued for a retry",
+            len(symbols) - len(failed),
+            len(failed),
+        )
         return True
 
     async def poll_once(self) -> None:
         """One REST refresh: options always, share quotes and bars unless the stream is
-        doing that job."""
+        doing that job. Warm-up of new symbols comes after the quotes, so a failing history
+        call cannot delay them, and before the bar poll, so its replayed bars arrive as
+        warm-up bars. It also runs when the market is closed or the stream is healthy."""
         now = self._clock.now()
         if not self._session.view(now).is_open:
+            await self._warm_pending(now)
             return
         await self._poll_options(now)
-        if self.stream_healthy():
+        polling = not self.stream_healthy()
+        if polling:
+            await self._poll_quotes(now)
+        await self._warm_pending(now)
+        if polling:
+            await self._poll_bars(now)
+
+    async def _poll_quotes(self, now: datetime) -> None:
+        if not self._symbols:
             return
         try:
             for quote in parse_quotes(await self._client.quotes(self._symbols), now).values():
@@ -172,20 +240,28 @@ class Feed:
         except SchwabError as exc:
             self._complain(now, "quote poll failed: %s", exc)
 
+    async def _poll_bars(self, now: datetime) -> None:
+        """Fetch the minute's bars once per symbol. A symbol whose fetch fails is asked
+        again on the next poll; the ones that worked wait for the next minute."""
         minute = now.replace(second=0, microsecond=0)
-        due = (now - minute).total_seconds() >= self.BAR_DELAY_S
-        if not due or self._bars_fetched_for == minute:
+        if (now - minute).total_seconds() < self.BAR_DELAY_S:
             return
-        try:
-            for symbol in self._symbols:
+        fetched = self._bars_fetched_for
+        for symbol in list(fetched):
+            if symbol not in self._symbols:
+                del fetched[symbol]  # dropped from the universe
+        for symbol in self._symbols:
+            if fetched.get(symbol) == minute:
+                continue
+            try:
                 raw = await self._client.price_history(symbol, minute - self.BAR_LOOKBACK, now)
-                for bar in parse_candles(raw, symbol):
-                    if bar.start + _MINUTE <= now:
-                        self.on_bar(bar)
-        except SchwabError as exc:
-            self._complain(now, "bar poll failed: %s", exc)
-            return
-        self._bars_fetched_for = minute
+            except SchwabError as exc:
+                self._complain(now, "bar poll for %s failed: %s", symbol, exc)
+                continue
+            for bar in parse_candles(raw, symbol):
+                if bar.start + _MINUTE <= now:
+                    self.on_bar(bar)
+            fetched[symbol] = minute
 
     async def _poll_options(self, now: datetime) -> None:
         watched = self._market.watched()

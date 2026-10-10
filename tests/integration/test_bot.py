@@ -573,3 +573,161 @@ async def test_no_settings_table_means_no_drift_to_report(world, aws):
     world.sign_in()
     await world.start(world.config())
     assert world.bot.settings_drift == []
+
+
+RESEARCH_TABLE = "traider-test-research"
+
+
+def create_research_table() -> None:
+    boto3.client("dynamodb").create_table(
+        TableName=RESEARCH_TABLE,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi1pk", "AttributeType": "S"},
+            {"AttributeName": "gsi1sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [
+                    {"AttributeName": "gsi1pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi1sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+
+
+async def seed_spy_pick(world, *, posture: bool = True) -> None:
+    """One ok run with a live SPY pick (and, unless told otherwise, a "trade" posture)."""
+    from datetime import date
+
+    from traider.research.models import Pick, Posture, RunMeta
+    from traider.research.store import DynamoResearchStore
+
+    create_research_table()
+    store = DynamoResearchStore(boto3.resource("dynamodb").Table(RESEARCH_TABLE))
+    now = world.clock.now()
+    await store.write_run(
+        RunMeta(
+            run_id="r1",
+            kind="manual",
+            status="ok",
+            started_at=now,
+            finished_at=now,
+            trading_day=date(2026, 10, 8),
+        ),
+        [
+            Pick.model_validate(
+                {
+                    "run_id": "r1",
+                    "rank": 1,
+                    "symbol": "SPY",
+                    "side": "long",
+                    "horizon": "intraday",
+                    "score": 90,
+                    "pre_score": 90,
+                    "thesis": "t",
+                    "invalidation": "1",
+                    "expires_at": (now + timedelta(hours=4)).isoformat(),
+                }
+            )
+        ],
+        Posture(level="trade", run_id="r1", at=now) if posture else None,
+    )
+
+
+async def test_bot_trades_a_researched_symbol_end_to_end(world, aws):
+    await seed_spy_pick(world)
+    world.sign_in()
+    config = world.config(symbols=(), research_table=RESEARCH_TABLE)
+    await world.start(config)
+    await world.ready()
+    assert world.bot.engine.universe == ("SPY",)
+    assert world.bot.feed._symbols == ("SPY",)
+    assert world.bot.strategy.symbols == ("SPY",)
+    for close in (100, 101, 102, 103):
+        await world.bar(close)
+
+    async def long():
+        return (await world.bot.broker.get_account()).position("SPY") > 0
+
+    await until(long, what="a buy of the researched symbol")
+
+
+async def test_a_pick_with_no_posture_today_is_watched_but_not_bought(world, aws):
+    await seed_spy_pick(world, posture=False)
+    world.sign_in()
+    await world.start(world.config(symbols=(), research_table=RESEARCH_TABLE))
+    await world.ready()
+    assert world.bot.engine.universe == ("SPY",)
+    for close in (100, 101, 102, 103):
+        await world.bar(close)
+    # The strategy has seen the bars and wants the position, and research has been read...
+    await until(lambda: world.bot.engine.target("SPY") is not None, what="strategy target")
+    polled = world.bot.engine._research_at
+    await until(lambda: world.bot.engine._research_at != polled, what="another research poll")
+    await asyncio.sleep(0.2)  # ...and many engine steps pass without a buy.
+    assert (await world.bot.broker.get_account()).positions == {}
+
+
+async def test_with_research_off_a_newly_pinned_symbol_reaches_the_feed(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    await world.start(config)
+    await world.ready()
+    assert world.bot.feed._symbols == ("SPY",)
+    current = await settings_store().latest()
+    pinned = current.settings.model_copy(update={"pinned_symbols": ("SPY", "QQQ")})
+    assert isinstance(pinned, Settings)
+    await settings_store().write(
+        pinned, expected_version=current.version, author="test", note="", now=START
+    )
+    await until(lambda: "QQQ" in world.bot.feed._symbols, what="the feed following the pin")
+    assert world.bot.engine.universe == ("SPY", "QQQ")
+
+
+async def test_the_live_start_alert_lists_the_universe(world, aws):
+    world.sign_in()
+    await world.start(live_config(world))
+    await until(lambda: any(key == "startup" for key, _, _ in world.bot.alerts.sent))
+    (_, _, body) = next(a for a in world.bot.alerts.sent if a[0] == "startup")
+    assert "Symbols: SPY\n" in body
+
+
+async def test_the_live_start_alert_says_research_chooses_when_nothing_is_pinned(world, aws):
+    create_research_table()
+    world.sign_in()
+    await world.start(live_config(world, symbols=(), research_table=RESEARCH_TABLE))
+    await until(lambda: any(key == "startup" for key, _, _ in world.bot.alerts.sent))
+    (_, _, body) = next(a for a in world.bot.alerts.sent if a[0] == "startup")
+    assert "Symbols: chosen by research\n" in body
+
+
+def test_the_startup_summary_says_whether_research_is_on(world):
+    assert app.describe(world.config())["research"] == "off"
+    on = world.config(symbols=(), research_table=RESEARCH_TABLE)
+    assert app.describe(on)["research"] == RESEARCH_TABLE
+
+
+async def test_a_stored_version_with_no_pinned_symbols_is_rejected_when_research_is_off(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    empty = Settings.from_config(config).model_copy(update={"pinned_symbols": ()})
+    await settings_store().write(empty, expected_version=0, author="test", note="", now=START)
+    await world.start(config)
+    assert world.bot.settings.pinned_symbols == ("SPY",)
+    assert world.bot.engine._live_settings.loaded is False

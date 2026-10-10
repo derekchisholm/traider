@@ -53,14 +53,20 @@ def test_bad_symbols_are_rejected():
 
 
 @pytest.mark.parametrize("symbols", [[], None])
-def test_empty_pinned_symbols_are_rejected(symbols):
+def test_empty_pinned_symbols_are_accepted(symbols):
     body = base().model_dump(mode="json")
     if symbols is None:
-        del body["pinned_symbols"]  # leaving it out is no way round the rule
+        del body["pinned_symbols"]  # leaving it out gives the default: none
     else:
         body["pinned_symbols"] = symbols
-    with pytest.raises(ValidationError, match="pinned_symbols"):
-        Settings.model_validate(body)
+    assert Settings.model_validate(body).pinned_symbols == ()
+
+
+def test_settings_carry_research_settings_and_allow_no_pinned_symbols():
+    config = Config(symbols=(), research_table="r", research={"min_score": 70})
+    settings = Settings.from_config(config)
+    assert settings.pinned_symbols == ()
+    assert settings.research.min_score == 70
 
 
 def test_an_unknown_strategy_is_rejected():
@@ -89,6 +95,7 @@ def test_restart_changes_lists_only_restart_fields():
     new = old.model_copy(
         update={
             "strategy_params": {"fast": 3, "slow": 9},
+            "pinned_symbols": ("QQQ",),  # live, so not listed
             "order_timeout_s": 5.0,
             "risk": old.risk.model_copy(update={"allow_options": True}),
         }
@@ -101,6 +108,7 @@ def test_merge_live_keeps_running_restart_fields_and_takes_the_rest():
     new = running.model_copy(
         update={
             "pinned_symbols": ("QQQ",),
+            "option_chain_days": 30,
             "order_timeout_s": 5.0,
             "risk": running.risk.model_copy(
                 update={"allow_options": True, "max_order_usd": Decimal(250)}
@@ -108,7 +116,8 @@ def test_merge_live_keeps_running_restart_fields_and_takes_the_rest():
         }
     )
     merged = merge_live(running, new)
-    assert merged.pinned_symbols == ("SPY",)
+    assert merged.pinned_symbols == ("QQQ",)  # live: the engine's universe follows it
+    assert merged.option_chain_days == running.option_chain_days
     assert merged.risk.allow_options is False
     assert merged.order_timeout_s == 5.0
     assert merged.risk.max_order_usd == Decimal(250)
@@ -118,7 +127,6 @@ def test_restart_fields_are_the_ones_the_process_cannot_change_under_itself():
     assert {
         "strategy",
         "strategy_params",
-        "pinned_symbols",
         "option_chain_days",
         "option_chain_strikes",
     } == RESTART_FIELDS

@@ -60,3 +60,31 @@ def test_system_clock_returns_aware_utc_now():
 )
 def test_days_the_market_trades_but_nothing_settles(day, expected):
     assert trades_without_settling(day) is expected
+
+
+def test_weekday_steps_skip_weekends():
+    from datetime import date
+
+    from traider.timeutil import next_weekday, weekdays_after, weekdays_between
+
+    friday, monday = date(2026, 10, 9), date(2026, 10, 12)
+    assert next_weekday(friday) == monday
+    assert next_weekday(date(2026, 10, 10)) == monday  # from a Saturday
+    assert weekdays_after(friday, 5) == date(2026, 10, 16)
+    assert weekdays_after(friday, 0) == friday
+    assert weekdays_between(friday, friday) == 0
+    assert weekdays_between(friday, monday) == 1
+    assert weekdays_between(friday, date(2026, 10, 23)) == 10
+    assert weekdays_between(monday, friday) == -1
+    assert weekdays_between(date(2026, 10, 8), friday) == 1
+
+
+def test_weekdays_after_refuses_a_negative_count():
+    from datetime import date
+
+    import pytest
+
+    from traider.timeutil import weekdays_after
+
+    with pytest.raises(ValueError, match="negative"):
+        weekdays_after(date(2026, 10, 9), -1)

@@ -17,14 +17,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from traider.config import (
     Config,
     PositiveFloat,
+    ResearchSettings,
     RiskLimits,
     check_symbols,
 )
+from traider.research.job_settings import ResearchJobSettings
 
-#: Fields a running bot keeps until it restarts: the strategy is built once, and the
-#: feed subscribes to its symbols and option chains at start-up.
+#: Fields a running bot keeps until it restarts: the strategy is built once, and the feed
+#: sets up its option chains at start-up. Pinned symbols apply live, through the engine's
+#: universe.
 RESTART_FIELDS = frozenset(
-    {"strategy", "strategy_params", "pinned_symbols", "option_chain_days", "option_chain_strikes"}
+    {"strategy", "strategy_params", "option_chain_days", "option_chain_strikes"}
 )
 #: Risk limits that are also fixed at start-up (the feed decides then whether to load chains).
 _RESTART_RISK_FIELDS = ("allow_options",)
@@ -33,11 +36,15 @@ _RESTART_RISK_FIELDS = ("allow_options",)
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # At least one symbol until research can choose them (sub-project A2).
-    pinned_symbols: tuple[str, ...]
+    # May be empty when research chooses the symbols. With no research, LiveSettings
+    # refuses an empty list (Task 11).
+    pinned_symbols: tuple[str, ...] = ()
     strategy: str = "sma_cross"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     risk: RiskLimits = Field(default_factory=RiskLimits)
+    research: ResearchSettings = Field(default_factory=ResearchSettings)
+    # How the research jobs run. The bot itself never reads it.
+    research_jobs: ResearchJobSettings = Field(default_factory=ResearchJobSettings)
     order_type: Literal["LIMIT", "MARKET"] = "LIMIT"
     limit_offset_bps: Annotated[Decimal, Field(ge=0, le=100)] = Decimal(5)
     order_timeout_s: PositiveFloat = 20.0
@@ -49,7 +56,7 @@ class Settings(BaseModel):
     @field_validator("pinned_symbols")
     @classmethod
     def _symbols_ok(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        return check_symbols(value)
+        return check_symbols(value, allow_empty=True)
 
     @model_validator(mode="after")
     def _strategy_builds(self) -> Self:
@@ -67,6 +74,7 @@ class Settings(BaseModel):
             strategy=config.strategy,
             strategy_params=config.strategy_params,
             risk=config.risk,
+            research=config.research,
             order_type=config.order_type,
             limit_offset_bps=config.limit_offset_bps,
             order_timeout_s=config.order_timeout_s,

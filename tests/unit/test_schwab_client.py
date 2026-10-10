@@ -381,3 +381,43 @@ async def test_option_chain_asks_for_a_bounded_slice(client, schwab):
         "fromDate": "2026-10-09",
         "toDate": "2026-11-23",
     }
+
+
+# --- reads the research jobs use ------------------------------------------------------------
+
+
+async def test_movers_are_requested_per_index_and_sort(client, schwab):
+    schwab.movers["NYSE"] = [{"symbol": "IBM", "netPercentChange": 0.05}]
+    raw = await client.movers("NYSE", sort="PERCENT_CHANGE_UP")
+    assert raw == {"screeners": [{"symbol": "IBM", "netPercentChange": 0.05}]}
+    (request,) = schwab.calls("GET", "/marketdata/v1/movers/NYSE")
+    assert request["query"] == {"sort": "PERCENT_CHANGE_UP", "frequency": "0"}
+
+
+async def test_daily_history_asks_for_daily_candles_between_new_york_dates(client, schwab):
+    await client.daily_history("NVDA", date(2026, 1, 2), date(2026, 10, 8))
+    (request,) = schwab.calls("GET", "/pricehistory")
+    assert request["query"] == {
+        "symbol": "NVDA",
+        "periodType": "year",
+        "frequencyType": "daily",
+        "frequency": "1",
+        "startDate": str(int(datetime(2026, 1, 2, 5, 0, tzinfo=UTC).timestamp() * 1000)),
+        "endDate": str(int(datetime(2026, 10, 9, 3, 59, tzinfo=UTC).timestamp() * 1000)),
+        "needExtendedHoursData": "false",
+        "needPreviousClose": "false",
+    }
+
+
+async def test_quotes_can_ask_for_more_fields(client, schwab):
+    await client.quotes(["NVDA"], fields="quote,fundamental,reference")
+    (request,) = schwab.calls("GET", "/marketdata/v1/quotes")
+    assert request["query"]["fields"] == "quote,fundamental,reference"
+
+
+async def test_option_chain_can_ask_for_puts_only(client, schwab):
+    await client.option_chain(
+        "NVDA", date(2026, 10, 16), date(2026, 11, 23), strikes=20, contract_type="PUT"
+    )
+    (request,) = schwab.calls("GET", "/chains")
+    assert request["query"]["contractType"] == "PUT"

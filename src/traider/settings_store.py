@@ -315,19 +315,36 @@ class LiveSettings:
     Caller contract: restart-only fields stay whatever ``current`` held when the process
     built its strategy, feed and engine, including the fallback after an unreadable
     start. ``refresh`` never changes them; it reports them as ``pending_restart``.
+
+    ``require_pinned`` is set when research is off: then a version with no pinned symbols
+    would leave the bot with nothing to trade, so it is rejected like an invalid one.
     """
 
-    def __init__(self, store: SettingsStore, fallback: Settings) -> None:
+    def __init__(
+        self, store: SettingsStore, fallback: Settings, *, require_pinned: bool = False
+    ) -> None:
         self._store = store
+        self._require_pinned = require_pinned
         self.current = fallback
         self.version: int | None = None
         self.loaded = False
         #: The newest stored settings, as written, while they differ from the running ones in
-        #: a restart-only field; None otherwise. The engine reads it to say what a restart
-        #: would change.
+        #: a restart-only field; None otherwise: what a restart would change to.
         self.pending: Settings | None = None
         self._rejected: set[tuple[int, str | None]] = set()
         self.start_updates: list[SettingsUpdate] = []
+
+    def _no_pinned(self, version: SettingsVersion) -> SettingsUpdate | None:
+        """A rejection for a version the bot could not trade on, else None. Remembers it, so
+        it is reported once."""
+        if not self._require_pinned or version.settings.pinned_symbols:
+            return None
+        self._rejected.add((version.version, version.at.isoformat()))
+        detail = (
+            f"settings version {version.version} has no pinned symbols and research is off, "
+            "so the bot would have nothing to trade"
+        )
+        return SettingsUpdate("rejected", version.version, detail)
 
     async def _bootstrap(self, now: datetime) -> SettingsVersion | None:
         """Write the fallback as version 1 of an empty store. Losing the race to another
@@ -361,6 +378,8 @@ class LiveSettings:
             return [SettingsUpdate("unreadable", None, f"{type(exc).__name__}: {exc}")]
         if latest is None:
             return [SettingsUpdate("unreadable", None, "no settings version after bootstrap")]
+        if (rejection := self._no_pinned(latest)) is not None:
+            return [rejection]
         self.current, self.version, self.loaded = latest.settings, latest.version, True
         return []
 
@@ -387,6 +406,8 @@ class LiveSettings:
         item = (latest.version, latest.at.isoformat())
         if item in self._rejected:
             return []
+        if (rejection := self._no_pinned(latest)) is not None:
+            return [rejection]
         # Restart-only fields keep the values the running objects were built from, even
         # when the process loaded late: start() may have built them from the fallback.
         # The merge is a mix of two validated bodies, so validate the mix too: whatever

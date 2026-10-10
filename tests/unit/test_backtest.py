@@ -1,11 +1,20 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from traider.backtest import BacktestError, load_bars_csv, max_drawdown, run_backtest
+from traider.backtest import (
+    BacktestError,
+    check_picks,
+    load_bars_csv,
+    load_picks_jsonl,
+    max_drawdown,
+    run_backtest,
+)
 from traider.config import Config
 from traider.models import Bar, Side
+from traider.timeutil import ET, trading_date
 
 OPEN = datetime(2026, 10, 8, 15, 0, tzinfo=UTC)  # Thursday 11:00 New York
 
@@ -258,3 +267,233 @@ def test_csv_missing_column_is_explained(tmp_path):
     path = write(tmp_path, "timestamp,open,high,low,volume\n2026-10-08T15:00:00Z,1,2,0.5,10\n")
     with pytest.raises(BacktestError, match="close"):
         load_bars_csv(path, symbol="SPY")
+
+
+# --- research picks and postures ----------------------------------------------------------
+
+
+def rising_bars(symbol, day, *, count=30) -> list[Bar]:
+    """One-minute bars from 09:31 New York on ``day`` that rise by 0.1 a minute."""
+    opening = datetime.fromisoformat(f"{day}T09:31:00").replace(tzinfo=ET)
+    out = []
+    for i in range(count):
+        price = Decimal(100) + Decimal("0.1") * i
+        start = (opening + timedelta(minutes=i)).astimezone(UTC)
+        out.append(Bar(symbol, start, price, price, price, price, 1000))
+    return out
+
+
+def pick(day, symbol="NVDA", **overrides) -> dict:
+    row = {
+        "day": day,
+        "symbol": symbol,
+        "side": "long",
+        "horizon": "intraday",
+        "score": 90,
+        "thesis": "t",
+        "invalidation": "1",
+    }
+    row.update(overrides)
+    return row
+
+
+def posture(day, level) -> dict:
+    return {"day": day, "posture": level}
+
+
+def research_config(**overrides) -> Config:
+    fields = {"symbols": (), "research_table": "x", "strategy_params": {"fast": 1, "slow": 2}}
+    fields.update(overrides)
+    return Config.model_validate(fields)
+
+
+def buy_days(result) -> set[str]:
+    """The days new positions were opened. Exits do not depend on research."""
+    return {trading_date(t.time).isoformat() for t in result.trades if t.side is Side.BUY}
+
+
+async def test_a_backtest_with_picks_trades_only_the_picked_symbol_on_its_day(tmp_path):
+    bars = rising_bars("NVDA", "2026-10-06") + rising_bars("AMD", "2026-10-06")
+    # AMD is only picked for the next day, so it has bars to replay but no pick on this one.
+    picks = [pick("2026-10-06"), pick("2026-10-07", "AMD")]
+    config = Config(symbols=(), research_table="x", strategy_params={"fast": 1, "slow": 2})
+    result = await run_backtest(bars, config, picks=picks)
+    assert {t.symbol for t in result.trades} == {"NVDA"}
+
+
+async def test_a_stand_aside_day_trades_nothing(tmp_path):
+    bars = rising_bars("NVDA", "2026-10-06")
+    picks = [pick("2026-10-06"), posture("2026-10-06", "stand_aside")]
+    config = Config(symbols=(), research_table="x", strategy_params={"fast": 1, "slow": 2})
+    result = await run_backtest(bars, config, picks=picks)
+    assert result.trades == ()
+    assert result.blocked["posture"] > 0
+
+
+async def test_without_a_posture_row_the_day_is_a_trade_day():
+    result = await run_backtest(
+        rising_bars("NVDA", "2026-10-06"), research_config(), picks=[pick("2026-10-06")]
+    )
+    assert result.trades
+
+
+async def test_a_day_with_no_research_rows_trades_nothing():
+    bars = rising_bars("NVDA", "2026-10-06") + rising_bars("NVDA", "2026-10-07")
+    result = await run_backtest(bars, research_config(), picks=[pick("2026-10-06")])
+    assert buy_days(result) == {"2026-10-06"}
+
+
+async def test_a_trade_day_then_a_stand_aside_day_trades_only_the_first():
+    bars = rising_bars("NVDA", "2026-10-06") + rising_bars("NVDA", "2026-10-07")
+    picks = [
+        pick("2026-10-06"),
+        pick("2026-10-07"),
+        posture("2026-10-06", "trade"),
+        posture("2026-10-07", "stand_aside"),
+    ]
+    # poll_s at its largest: the day change must still be seen at the new day's first bars.
+    config = research_config(research={"poll_s": 600})
+    result = await run_backtest(bars, config, picks=picks)
+    assert buy_days(result) == {"2026-10-06"}
+    assert result.blocked["posture"] > 0
+
+
+async def test_a_stand_aside_day_then_a_trade_day_trades_only_the_second():
+    bars = rising_bars("NVDA", "2026-10-06") + rising_bars("NVDA", "2026-10-07")
+    picks = [
+        pick("2026-10-06"),
+        pick("2026-10-07"),
+        posture("2026-10-06", "stand_aside"),
+        posture("2026-10-07", "trade"),
+    ]
+    result = await run_backtest(bars, research_config(research={"poll_s": 600}), picks=picks)
+    assert buy_days(result) == {"2026-10-07"}
+
+
+async def test_a_swing_pick_carries_to_the_next_day_and_an_intraday_pick_does_not():
+    bars = (
+        rising_bars("NVDA", "2026-10-06")
+        + rising_bars("AMD", "2026-10-06")
+        + rising_bars("NVDA", "2026-10-07")
+        + rising_bars("AMD", "2026-10-07")
+    )
+    picks = [
+        pick("2026-10-06", "NVDA", horizon="swing"),
+        pick("2026-10-06", "AMD", horizon="intraday"),
+        posture("2026-10-07", "trade"),
+    ]
+    result = await run_backtest(bars, research_config(), picks=picks)
+    bought = {
+        t.symbol
+        for t in result.trades
+        if t.side is Side.BUY and trading_date(t.time).isoformat() == "2026-10-07"
+    }
+    assert bought == {"NVDA"}
+
+
+async def test_a_pick_below_the_minimum_score_is_not_traded():
+    result = await run_backtest(
+        rising_bars("NVDA", "2026-10-06"),
+        research_config(),
+        picks=[pick("2026-10-06", score=10)],
+    )
+    assert result.trades == ()
+
+
+async def test_a_pinned_symbol_is_replayed_alongside_the_picks():
+    bars = rising_bars("SPY", "2026-10-06") + rising_bars("NVDA", "2026-10-06")
+    config = research_config(symbols=("SPY",))
+    result = await run_backtest(bars, config, picks=[pick("2026-10-06")])
+    assert {t.symbol for t in result.trades} == {"SPY", "NVDA"}
+
+
+async def test_bars_for_a_symbol_neither_pinned_nor_picked_are_an_error():
+    bars = rising_bars("NVDA", "2026-10-06") + rising_bars("AMD", "2026-10-06")
+    with pytest.raises(BacktestError, match="AMD"):
+        await run_backtest(bars, research_config(), picks=[pick("2026-10-06")])
+
+
+async def test_picks_work_with_a_configuration_that_has_no_research_table():
+    config = research_config(symbols=("SPY",), research_table=None)
+    bars = rising_bars("SPY", "2026-10-06") + rising_bars("NVDA", "2026-10-06")
+    result = await run_backtest(bars, config, picks=[pick("2026-10-06")])
+    assert {t.symbol for t in result.trades} == {"SPY", "NVDA"}
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        ([{"symbol": "NVDA"}], "row 1.*day"),
+        ([{"day": "10/06/2026", "posture": "trade"}], "row 1.*day"),
+        ([{"day": "2026-10-06", "posture": "maybe"}], "row 1.*posture"),
+        ([{"day": "2026-10-06", "posture": "trade", "symbol": "NVDA"}], "row 1"),
+        ([posture("2026-10-06", "trade"), posture("2026-10-06", "reduced")], "row 2.*posture"),
+        ([pick("2026-10-06", side="sideways")], "row 1"),
+        ([pick("2026-10-06", colour="red")], "row 1.*colour"),
+        ([pick("2026-10-06"), pick("2026-10-06")], "row 2.*already picked"),
+        (["not a row"], "row 1"),
+    ],
+)
+async def test_bad_pick_rows_are_refused_and_named(rows, message):
+    with pytest.raises(BacktestError, match=message):
+        await run_backtest(rising_bars("NVDA", "2026-10-06"), research_config(), picks=rows)
+
+
+async def test_picks_given_but_empty_means_research_says_nothing_so_pinned_symbols_wait():
+    config = research_config(symbols=("SPY",))
+    result = await run_backtest(rising_bars("SPY", "2026-10-06"), config, picks=[])
+    assert result.trades == ()
+    assert result.blocked["posture"] > 0
+
+
+async def test_without_picks_nothing_changes_for_a_research_only_config():
+    with pytest.raises(BacktestError, match="NVDA"):
+        await run_backtest(rising_bars("NVDA", "2026-10-06"), research_config())
+
+
+def test_load_picks_reads_json_lines_and_skips_blank_lines(tmp_path):
+    path = tmp_path / "p.jsonl"
+    path.write_text('{"day": "2026-10-06", "posture": "trade"}\n\n{"day": "2026-10-06"}\n')
+    assert load_picks_jsonl(path) == [
+        {"day": "2026-10-06", "posture": "trade"},
+        {"day": "2026-10-06"},
+    ]
+
+
+def test_bad_picks_lines_name_the_line(tmp_path):
+    path = tmp_path / "p.jsonl"
+    path.write_text('{"day": "2026-10-06", "posture": "trade"}\nnot json\n')
+    with pytest.raises(BacktestError, match="line 2"):
+        load_picks_jsonl(path)
+
+
+def test_a_picks_line_that_is_not_an_object_names_the_line(tmp_path):
+    path = tmp_path / "p.jsonl"
+    path.write_text("[1, 2]\n")
+    with pytest.raises(BacktestError, match="line 1"):
+        load_picks_jsonl(path)
+
+
+@pytest.mark.parametrize(
+    ("bad", "message"),
+    [
+        ('{"day": "2026-10-06", "posture": "maybe"}', "line 3.*posture"),
+        ('{"day": "2026-10-06", "symbol": "NVDA", "side": "sideways"}', "line 3"),
+        ('{"day": "2026-10-06", "posture": "trade", "symbol": "NVDA"}', "line 3"),
+        ('{"symbol": "NVDA"}', "line 3.*day"),
+    ],
+)
+async def test_row_errors_name_the_real_file_line_even_after_blank_lines(tmp_path, bad, message):
+    path = tmp_path / "p.jsonl"
+    path.write_text(f'{{"day": "2026-10-06", "posture": "trade"}}\n\n{bad}\n')
+    rows = load_picks_jsonl(path)
+    with pytest.raises(BacktestError, match=message):
+        await run_backtest(rising_bars("NVDA", "2026-10-06"), research_config(), picks=rows)
+
+
+async def test_a_duplicate_pick_names_the_line_of_the_second(tmp_path):
+    path = tmp_path / "p.jsonl"
+    line = json.dumps(pick("2026-10-06"))
+    path.write_text(f"{line}\n\n{line}\n")
+    with pytest.raises(BacktestError, match=r"line 3.*already picked"):
+        check_picks(load_picks_jsonl(path))

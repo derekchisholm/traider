@@ -7,6 +7,7 @@ Item layout, where ``ns`` is the trading mode so paper and live never mix::
     OPEN#ns         / <order id>     orders this bot placed that are not finished
     LOG#ns#<date>   / <ms>#<id>      append-only audit log
     PAPER#ns        / ACCOUNT        the paper-trading account
+    POS#ns          / <symbol>       positions this bot opened (the ledger)
 
 Counters use atomic updates and the lease uses a conditional write, so two
 instances cannot both believe they hold it.
@@ -25,7 +26,15 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from traider.models import OrderRecord
-from traider.state.base import DayState, jsonable, order_from_dict, order_to_dict
+from traider.state.base import (
+    DayState,
+    LedgerEntry,
+    jsonable,
+    ledger_from_dict,
+    ledger_to_dict,
+    order_from_dict,
+    order_to_dict,
+)
 from traider.timeutil import trading_date
 
 
@@ -191,6 +200,26 @@ class DynamoStateStore:
         await self._call(
             self._table.put_item, Item={**self._paper_key, "body": json.dumps(jsonable(data))}
         )
+
+    # -- position ledger ------------------------------------------------------
+
+    async def ledger(self) -> dict[str, LedgerEntry]:
+        items = await self._query(f"POS#{self._ns}")
+        entries = [ledger_from_dict(json.loads(item["body"])) for item in items]
+        return {entry.symbol: entry for entry in entries}
+
+    async def put_ledger(self, entry: LedgerEntry) -> None:
+        await self._call(
+            self._table.put_item,
+            Item={
+                "pk": f"POS#{self._ns}",
+                "sk": entry.symbol,
+                "body": json.dumps(ledger_to_dict(entry)),
+            },
+        )
+
+    async def delete_ledger(self, symbol: str) -> None:
+        await self._call(self._table.delete_item, Key={"pk": f"POS#{self._ns}", "sk": symbol})
 
     # -- helpers --------------------------------------------------------------
 
