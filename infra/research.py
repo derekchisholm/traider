@@ -30,6 +30,10 @@ TRAIL_EXPIRY_DAYS = 400
 START_RETRIES = 2  # a failed start is retried this often, within START_MAX_AGE_S
 START_MAX_AGE_S = 600
 DLQ_RETENTION_S = 14 * 24 * 3600  # the most SQS keeps a message
+# Bot settings the research task does not get: it never trades and never reads an account.
+NOT_FOR_RESEARCH = frozenset(
+    {"TRAIDER_TRADING_MODE", "TRAIDER_SCHWAB_ACCOUNT_HASH", "TRAIDER_SCHWAB_ACCOUNT_LAST4"}
+)
 
 
 @dataclass(frozen=True)
@@ -203,10 +207,11 @@ def build(settings: Settings, network: Network, data: Data, bot: Bot) -> Researc
     )
 
     # The bot's environment without its trading mode (research never trades; leaving it
-    # out also means a live stack's Config does not demand the bot's live-only settings),
-    # plus where research reads and writes.
+    # out also means a live stack's Config does not demand the bot's live-only settings)
+    # and without the account identifiers research never uses, plus where research reads
+    # and writes.
     environment: dict[str, pulumi.Input[str]] = {
-        **{k: v for k, v in settings.bot_env.items() if k != "TRAIDER_TRADING_MODE"},
+        **{k: v for k, v in settings.bot_env.items() if k not in NOT_FOR_RESEARCH},
         "TRAIDER_SCHWAB_APP_SECRET_ID": data.app_secret.arn,
         "TRAIDER_SCHWAB_TOKEN_SECRET_ID": data.token_secret.arn,
         "TRAIDER_SETTINGS_TABLE": data.settings_table.name,

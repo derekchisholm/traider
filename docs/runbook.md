@@ -176,8 +176,8 @@ once every 15 minutes.
 | Research is stale | The research table has been unreadable for longer than `research.max_stale_s` (10 minutes by default). | No new positions open; exits still work. Check the research table, the task role and the research jobs. |
 | Research readable again | It recovered. | Nothing. |
 | Research DATE: ok | The pre-market research run finished. The alert gives the posture, each pick (L long, B bearish, its horizon and score) and the cost. | Nothing. `traider research show` before the open shows what the bot will act on. |
-| Research DATE: partial | The run finished, but planned work did not happen: a budget stopped Bedrock calls, a deadline passed, Finnhub failed, the Bedrock posture review failed, Bedrock calls failed in half the deep-dives or more, daily history was unreadable for half the names or more, or the trail could not be written. The alert ends with the reasons. By default the bot ignores a partial run, posture included, so it stands aside today. | Read the reasons. Once the cause has passed, run it again (see [Research jobs](#research-jobs)). To trade on partial runs anyway, set `research.accept_partial_runs`; it applies to every partial run. |
-| Research DATE: failed | The run stopped at the stage it names (for example `collect`, `posture` or `dive`; a run that took longer than `research_jobs.max_run_s` plus 9 minutes fails too). It wrote no posture, so the bot stands aside today. | An expired Schwab sign-in is the usual cause: sign in, then run it again. Otherwise read the research logs. |
+| Research DATE: partial | The run finished, but planned work did not happen: a budget stopped Bedrock calls, a deadline passed, Finnhub failed, the Bedrock posture review failed, Bedrock calls failed or timed out in half the deep-dives or more, daily history was unreadable for half the names or more, or the trail could not be written. The alert ends with the reasons. By default the bot ignores a partial run, posture included, so it stands aside today. | Read the reasons. Once the cause has passed, run it again (see [Research jobs](#research-jobs)). To trade on partial runs anyway, set `research.accept_partial_runs`; it applies to every partial run. |
+| Research DATE: failed | The run stopped at the stage it names (for example `collect`, `posture` or `dive`; a run that took longer than `research_jobs.max_run_s` plus 9 minutes fails too). It wrote no posture, so the bot stands aside today. If the message says "was written as ok" (or partial) "then failed", the result was already in the table when something went wrong (for example the time box ran out while the alert was sent): it stands, and the bot uses it as usual. | An expired Schwab sign-in is the usual cause: sign in, then run it again. Otherwise read the research logs. After "was written as ... then failed", nothing to redo; read the research logs. |
 | The research run stopped with an error | From AWS, not from the run: the research task exited with an error (it failed, it could not start, or another run held the lock). | Read the research logs (below). A run that cannot even start (no Finnhub key stored) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
 | Alarm: the scheduler could not start the research run | The scheduler gave up on starting the task (two retries within 10 minutes) and put the request in a dead-letter queue. No task ran, so the alert above cannot fire. The bot stands aside today. | Read the message, then **purge the queue** (below). If you do not, the alarm stays in ALARM and later failures send no new alert. |
 | No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) No summary means the run did not finish, or never ran: the schedule is not enabled (`traider:researchScheduleEnabled`, off by default), the start failed, or the run is stuck. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
@@ -366,9 +366,10 @@ the posture and the picks as JSON and leaves the trail in `./research-trail`
 (`--trail-dir` to change that). This is the first time the run meets the real Schwab,
 Finnhub and Bedrock. What the first dry run may show:
 
-- **Every pick refused as `halted`:** the run counts a missing or non-"Normal"
+- **Everything dropped as `halted`:** the run counts a missing or non-"Normal"
   `securityStatus` as halted (fail closed), and what Schwab reports before the open is not
-  verified.
+  verified. Halted names are dropped at the screen, so no deep-dive runs and no model money
+  is spent on them; the counts show `drop_halted`.
 - **Few or no candidates:** movers or quotes at 08:00 may not reflect pre-market trading,
   or Finnhub's free tier may lack the earnings calendar or answer it empty (then the run
   is `partial`, with no swing picks). Each swing idea also gets its own earnings call for
@@ -379,8 +380,8 @@ Finnhub and Bedrock. What the first dry run may show:
   `stand_aside`. Malformed bars are dropped too.
 - **A Bedrock problem:** no model access, an id the region does not serve, or tool use the
   endpoint does not support. The run does not stop: it finishes `partial` (a failed posture
-  review, or failed model calls in half the deep-dives or more), and the JSON's notes and
-  counts say so. The bot would stand aside. Each failed attempt is counted against the
+  review, or failed or timed-out model calls in half the deep-dives or more), and the
+  JSON's notes and counts (`dive_llm_error`, `dive_timeout`, ...) say so. The bot would stand aside. Each failed attempt is counted against the
   budget; there are no retries.
 
 **4. Enable the schedule.** Once a dry run looks right, from `infra/`:

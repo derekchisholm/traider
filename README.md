@@ -508,7 +508,7 @@ order. **It is not financial advice**: it proposes picks for the strategy you ch
 
 The bot reads the result as it reads any research. A run that hit a budget, ran out of
 time, lost the events vendor, could not reach the model (a failed posture review, or
-failed model calls in half the deep-dives or more) or could not write its trail finishes
+failed or timed-out model calls in half the deep-dives or more) or could not write its trail finishes
 as `partial`, and by default (`research.accept_partial_runs: false`) the bot ignores a
 partial run, posture included, so it stands aside that day. A run that fails writes no posture, so the bot
 stands aside too. Every run leaves a trail (what it saw, each conversation with the model,

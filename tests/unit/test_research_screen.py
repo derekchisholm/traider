@@ -81,6 +81,8 @@ def test_earnings_candidates_reported_yesterday_after_the_close_or_today_before_
         ("NVDA", quote("NVDA", None, 99), "no_quote"),
         ("NVDA", quote("NVDA", 0, 99), "no_quote"),
         ("NVDA", quote("NVDA", -5, 99), "no_quote"),
+        ("NVDA", quote("NVDA", 100, 99, halted=True), "halted"),
+        ("OTCX", quote("OTCX", 50, 49, exchange="OTC Markets", halted=True), "halted"),
         ("SPY", quote("SPY", 500, 499, asset_type="COLLECTIVE_INVESTMENT"), "asset_type"),
         ("TQQQ", quote("TQQQ", 50, 49, sub_type="ETF"), "asset_type"),
         ("TVIX", quote("TVIX", 50, 49, sub_type="ETN"), "asset_type"),

@@ -251,8 +251,10 @@ class FinnhubEvents:
             if status == 200:
                 try:
                     return json.loads(body.decode("utf-8"))
-                except (UnicodeDecodeError, LookupError, ValueError):
-                    pass  # raised below, outside this block, so nothing is chained
+                except (UnicodeDecodeError, LookupError, ValueError, RecursionError):
+                    # RecursionError: a deeply nested reply. Raised below, outside this
+                    # block, so nothing is chained.
+                    pass
                 raise EventsUnavailable(f"finnhub {path}: reply was not JSON")
             if status in (401, 403):
                 raise EventsUnavailable(f"finnhub {path}: the API key was refused (HTTP {status})")

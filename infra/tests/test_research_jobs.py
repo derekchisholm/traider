@@ -203,6 +203,38 @@ def test_a_live_stacks_research_task_still_starts():
     assert Config.from_env(environment(live)).research_table == "traider-prod-research"
 
 
+ACCOUNT_IDS = ("TRAIDER_SCHWAB_ACCOUNT_HASH", "TRAIDER_SCHWAB_ACCOUNT_LAST4")
+
+
+def test_the_research_task_gets_no_account_identifiers():
+    live = deploy(
+        {
+            "research": True,
+            "researchJobs": True,
+            "tradingMode": "live",
+            "accountLast4": "9753",
+            "accountHash": "HASH0123456789",
+            "alertEmail": "ops@example.test",
+        },
+        stack="prod",
+    )
+    env = environment(live)
+    for name in ACCOUNT_IDS:
+        assert name not in env, name
+    assert "9753" not in json.dumps(env) and "HASH0123456789" not in json.dumps(env)
+    config = Config.from_env(env)
+    assert (config.account_hash, config.account_last4) == (None, None)
+    # The bot still gets them.
+    bot_env = {
+        item["name"]: item["value"]
+        for item in json.loads(live.one(TASK, "bot").inputs["containerDefinitions"])[0][
+            "environment"
+        ]
+    }
+    assert bot_env["TRAIDER_SCHWAB_ACCOUNT_LAST4"] == "9753"
+    assert bot_env["TRAIDER_SCHWAB_ACCOUNT_HASH"] == "HASH0123456789"
+
+
 def test_the_finnhub_secret_is_created_without_a_value(jobs):
     assert jobs.one(SECRET, "finnhub")
     assert jobs.of("aws:secretsmanager/secretVersion:SecretVersion") == []

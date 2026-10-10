@@ -45,6 +45,7 @@ ATR_DAYS = 14
 # Drop reasons, in the order the checks run.
 DROP_SYMBOL = "symbol"
 DROP_NO_QUOTE = "no_quote"
+DROP_HALTED = "halted"  # not trading normally: no dive is spent on it (rank checks again)
 DROP_ASSET_TYPE = "asset_type"
 DROP_OTC = "otc"
 DROP_PRICE = "price"
@@ -144,6 +145,8 @@ def quote_filter(symbol: str, quote: MarketQuote | None, settings: ScreenSetting
         return DROP_SYMBOL
     if quote is None or quote.last is None or quote.last <= 0:
         return DROP_NO_QUOTE
+    if quote.halted:
+        return DROP_HALTED
     if quote.is_etf:
         if not settings.allow_etfs:
             return DROP_ASSET_TYPE

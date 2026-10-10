@@ -35,8 +35,9 @@ import logging
 import secrets
 import time
 import traceback
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -265,6 +266,9 @@ class _Run:
         self.trail: Trail | None = None
         self.trail_failures = 0
         self.cost_added = False
+        # Set once write_run has returned: META, picks and posture are in the table and a
+        # later failure must not overwrite them.
+        self.written: RunOutcome | None = None
         # The earnings calendar's window. Nothing is known about earnings after
         # ``calendar_end``, so no swing pick outlives its close.
         self.calendar_start = previous_weekday(self.today)
@@ -291,7 +295,8 @@ class _Run:
             trading_day=self.today,
             models=tuple(dict.fromkeys((dive.posture_model, dive.model))),
             cost_usd=meter.spent_usd if meter else Decimal(0),
-            s3_prefix=self.trail.location if self.trail else "",
+            # The key prefix only: a bucket name carries the account id.
+            s3_prefix=trail_prefix(self.today, self.run_id) if self.trail else "",
             error=error,
             tokens_in=meter.tokens_in if meter else 0,
             tokens_out=meter.tokens_out if meter else 0,
@@ -722,10 +727,17 @@ class _Run:
             self.budget_noted = True
         if any(r.news_failed for r in results):
             self.note("company news unavailable during deep-dives", partial=True)
-        if failed := sum(1 for r in results if r.outcome == "llm_error"):
-            # Half or more failing looks like the model being unreachable, not one bad call.
+        ended = Counter(r.outcome for r in results)
+        for name, count in sorted(ended.items()):
+            if name != "submitted":
+                self.counts[f"dive_{name}"] = count
+        timed_out = ended["timeout"]
+        if failed := ended["llm_error"] + timed_out:
+            # Half or more failing or timing out looks like the model being unreachable or
+            # stuck, not one bad call.
             self.note(
-                f"model calls failed in {failed} of {len(results)} deep-dive(s)",
+                f"model calls failed in {failed} of {len(results)} deep-dive(s)"
+                + (f" ({timed_out} timed out)" if timed_out else ""),
                 partial=2 * failed >= len(results),
             )
         return results
@@ -821,13 +833,7 @@ class _Run:
         # After result.json: a failed write there makes the run partial too.
         status = RunStatus.PARTIAL if self.partial else RunStatus.OK
         meta = self.meta(status)
-        if not self.dry_run:
-            # The cost first: a write that fails afterwards must not hide what was spent.
-            await self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
-            self.cost_added = True
-            await self.deps.store.write_run(meta, ranked.picks, posture)
-            await self.alert(status, _summary(self.today, posture, ranked.picks, meta))
-        return RunOutcome(
+        outcome = RunOutcome(
             status.value,
             EXIT_OK,
             self.run_id,
@@ -836,6 +842,16 @@ class _Run:
             picks=ranked.picks,
             rejected=ranked.rejected,
         )
+        if not self.dry_run:
+            # The cost first: a write that fails afterwards must not hide what was spent.
+            # Marked before the await: an add cut off by the time box may still have
+            # landed, and the cost must never be added twice.
+            self.cost_added = True
+            await self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
+            await self.deps.store.write_run(meta, ranked.picks, posture)
+            self.written = outcome
+            await self.alert(status, _summary(self.today, posture, ranked.picks, meta))
+        return outcome
 
     async def fail(self, exc: BaseException) -> RunOutcome:
         leaves = _leaves(exc)
@@ -847,6 +863,17 @@ class _Run:
             frames = "".join(traceback.format_tb(leaf.__traceback__))
             log.error("research run %s failed in %s: %s\n%s", self.run_id, self.stage,
                       _describe(leaf), frames)  # fmt: skip
+        if self.written is not None:
+            # The result is in the table: META, picks and posture stand as written.
+            written = self.written
+            log.error("research run %s failed after its result was written as %s; "
+                      "it stands", self.run_id, written.status)  # fmt: skip
+            await self.alert(
+                RunStatus.FAILED,
+                f"traider research {KIND} {self.today.isoformat()}: the run was written as "
+                f"{written.status}, then failed: {error}. The written result stands.",
+            )
+            return replace(written, detail=error)
         meta = self.meta(RunStatus.FAILED, error=error)
         if not self.dry_run:
             if self.meter is not None and not self.cost_added and self.meter.spent > 0:

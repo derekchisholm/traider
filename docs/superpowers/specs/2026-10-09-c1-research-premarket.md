@@ -34,9 +34,9 @@ watch, weekly, monthly, scorecard) come in C2 and reuse every C1 stage.
 | Cost | Token prices are a setting (`$/Mtok` in and out, per model). Prices must be > 0, and a model with no price is never called. Defaults: Sonnet 5.5 at $2 in / $10 out, taken from a third-party listing, **unverified: the owner should check them against AWS Bedrock pricing**. There is a budget per run and one per New York day. | Prices change; budgets must not depend on hard-coded numbers, and a free or unpriced call would defeat the budgets. |
 | Settings home | New `Settings.research_jobs` block in the versioned settings. Each run reads the current version when it starts. | The web app (B) will tune it like everything else. |
 | Retries and budget | The Bedrock client never retries (`max_retries=0`); each attempt is metered. After a budget refusal or an overrun the cost meter stops all further calls. Every estimate includes a 1000-token tool overhead. | A hidden retry would spend money the meter never saw. |
-| Fail closed on data | A missing or non-`Normal` `securityStatus` counts as halted. Bad daily bars are dropped. A name whose last daily bar is more than 3 weekdays old is dropped (`stale_history`). Stale SPY bars mean `stand_aside`. | Real pre-market `securityStatus` values are unverified; if they are not `Normal`, every name drops as `halted` and the dry run shows it. |
+| Fail closed on data | A missing or non-`Normal` `securityStatus` counts as halted. Bad daily bars are dropped. A name whose last daily bar is more than 3 weekdays old is dropped (`stale_history`). Stale SPY bars mean `stand_aside`. | Real pre-market `securityStatus` values are unverified; if they are not `Normal`, every name drops as `halted` at the screen (no deep-dives) and the dry run shows it. |
 | Earnings expiry | Counted in weekdays, not market holidays, so a clamp can land on a holiday. | No holiday calendar in the research path. |
-| Run status | A trail write failure makes the run `partial`. So does a failed posture review, or `llm_error` in at least half the dives started (for example no model access). Daily-history errors add a note, and the run is `partial` when they reach half of the names or more. Past `max_run_s` before the screen: `partial`, posture written, 0 picks. A whole-run time box (`max_run_s` + 540 s) makes a run that is too slow `failed`. | An incomplete audit trail, an outage and a hung run must not pass as `ok`. |
+| Run status | A trail write failure makes the run `partial`. So does a failed posture review, or `llm_error` or `timeout` in at least half the dives started (for example no model access); each dive outcome other than `submitted` is counted (`dive_<outcome>`). Daily-history errors add a note, and the run is `partial` when they reach half of the names or more. Past `max_run_s` before the screen: `partial`, posture written, 0 picks. A whole-run time box (`max_run_s` + 540 s) makes a run that is too slow `failed`. | An incomplete audit trail, an outage and a hung run must not pass as `ok`. |
 | Scrubbing | All error and alert text is scrubbed before it reaches META, an alert or a log line. Botocore DEBUG logging must never be enabled where logs are kept: it prints secret values. | Vendor errors and model-written text can carry secrets or injected words. |
 | Rollout order | The schedule is created **DISABLED**; `traider:researchScheduleEnabled` (default false, needs `researchJobs`) turns it on. Order: enable Bedrock model access, deploy with `traider:researchJobs` (this creates the empty Finnhub secret), store the key, run `traider research run --kind premarket --dry-run`, then set `researchScheduleEnabled`. | Nothing fires before the key, model access and a dry run are checked. Only a missing Finnhub key stops a run before it starts (exit 1, no META; the stopped-with-an-error alert carries only stopCode/stoppedReason, the cause is in the logs: "cannot start the research run:"). Missing model access gives a `partial` run with notes (a failed posture review, or `llm_error` in at least half the dives started), so the bot stands aside. |
 | One run at a time | A DynamoDB lock item per run kind, with expiry. Plus skip-if-done: an `ok` or `partial` pre-market run for today means exit unless `--force`. | EventBridge Scheduler delivers at least once. |
@@ -82,8 +82,9 @@ any exception ─▶ META failed, alert, exit 1 (no posture, so the bot stands a
   and the run is `partial`. A whole-run time box of `max_run_s` + 540 s makes a run that
   is too slow `failed`.
 * **Partial** means some planned work did not happen: the run or day budget was hit,
-  the deadline passed, the events vendor failed, the posture review failed, model calls failed
-  (`llm_error`) in at least half the deep-dives started, daily history was unreadable for
+  the deadline passed, the events vendor failed (an empty earnings calendar over 5
+  weekdays or more counts), the posture review failed, model calls failed or timed out
+  (`llm_error` or `timeout`) in at least half the deep-dives started, daily history was unreadable for
   half the names or more, or a trail file could not be written. By default the bot ignores partial
   runs (`research.accept_partial_runs: false`), and that includes their posture. So a
   partial run means standing aside unless the owner opts in. This follows A's
@@ -163,6 +164,8 @@ no picks, and the run is `ok`. There are no forced trades.
 ## Screen
 
 **Filters,** from settings:
+* a quote with a last price, and not halted (`halted`: no deep-dive is spent on a name
+  that is not trading normally; rank checks again on the fresh quote);
 * asset type `EQUITY` (ETFs and ETNs are dropped unless `allow_etfs`);
 * not OTC or pink sheets;
 * `min_price` (5) ≤ price ≤ `max_price` (1000);
@@ -307,7 +310,8 @@ The bot's own `research.min_score` filter still applies after this.
   * `dives/<symbol>.json`
   * `result.json` (assessments, validation reasons, picks)
 
-  `RunMeta.s3_prefix` points there.
+  `RunMeta.s3_prefix` holds that key prefix, `runs/<day>/<run_id>/`, without the
+  bucket name (which carries the account id).
 * **`RunMeta`** gains, all defaulted so old items still parse:
   * `tokens_in: int = 0`
   * `tokens_out: int = 0`
@@ -495,13 +499,19 @@ Recorded from the implementation plan (`docs/superpowers/plans/2026-10-09-c1-res
   SigV4 client was needed.
 * **Own ECS cluster** (`{prefix}-research`): the bot's crash alarm watches the bot's
   cluster and must not fire for research.
-* **The research task's environment leaves out `TRAIDER_TRADING_MODE`** and the sign-in
-  link. Research never trades; on a live stack the bot's configuration would otherwise
-  demand the control switch and the state table.
+* **The research task's environment leaves out `TRAIDER_TRADING_MODE`**, the sign-in
+  link and the account identifiers (`TRAIDER_SCHWAB_ACCOUNT_HASH`,
+  `TRAIDER_SCHWAB_ACCOUNT_LAST4`). Research never trades or reads an account; on a live
+  stack the bot's configuration would otherwise demand the control switch and the state
+  table.
 * **Trail bucket name** gets the account id: `{prefix}-research-trail-{account}`.
 * **Lock:** `acquire_lock(name, owner, ttl_s, now)`; it lives `max_run_s` + 10 minutes.
 * **Cost** is added to the day before the final write, and a failed run adds what it
-  spent, so a failed write never hides money spent.
+  spent, so a failed write never hides money spent. It is never added twice: once the
+  add has started (even if the time box cuts it off), a failure does not add it again.
+* **After the write:** once `write_run` has returned, a later failure (the time box
+  running out while the alert is sent) leaves META, picks and posture as written. It is
+  logged, scrubbed, and a failure alert says the written result stands.
 * **Dry run:** no lock, no "already done" check, no alert. It reads the day's cost.
 * **Expiry:** the earnings clamp applies to swing picks. An intraday pick is refused
   (`earnings_too_close`) only when earnings are today at an unknown hour.

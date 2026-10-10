@@ -347,7 +347,11 @@ async def test_the_key_is_in_no_error_and_no_repr(events, finnhub):
 # --- review fixes ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("body", [b"\xff\xfe[]", b"\xc3\x28", b"not json", b""])
+@pytest.mark.parametrize(
+    "body",
+    [b"\xff\xfe[]", b"\xc3\x28", b"not json", b"", b"[" * 100_000 + b"]" * 100_000],
+    ids=["bom", "bad-utf8", "text", "empty", "deeply-nested"],
+)
 async def test_a_reply_that_cannot_be_decoded_is_events_unavailable_and_not_retried(
     events, finnhub, body
 ):

@@ -32,6 +32,7 @@ from tests.fakes.research import (
 )
 from traider.alerts import LogAlerter
 from traider.config import ResearchSettings
+from traider.research.dive import DiveResult
 from traider.research.events import EarningsEvent, EventsUnavailable
 from traider.research.llm import LLMError
 from traider.research.market import QuoteBatch
@@ -153,7 +154,8 @@ async def test_the_golden_morning():
         "assessed": 4,
         "picks": 3,
     }
-    assert meta.s3_prefix == f"memory://runs/{DAY}/{outcome.run_id}/"
+    # The key prefix only: no bucket name, so no account id, in the research table.
+    assert meta.s3_prefix == f"runs/{DAY}/{outcome.run_id}/"
     assert meta.finished_at == NOW
     assert await d.store.day_cost(DAY) == Decimal("0.0280")
 
@@ -955,3 +957,130 @@ async def test_without_a_calendar_no_symbol_checks_are_made():
     outcome = await run_premarket(d, NOW)
     assert len(events.called("earnings_calendar")) == 1
     assert {r.symbol: r.reason for r in outcome.rejected}["NVDA"] == "earnings_unknown"
+
+
+# --- dive outcomes: a timeout is a failure too ------------------------------------------
+
+
+def dives_that(monkeypatch, outcomes):
+    """Dives for the symbols in ``outcomes`` end that way without asking the model."""
+    real = run_module.run_dive
+
+    async def fake(ctx, **kwargs):
+        if ctx.symbol in outcomes:
+            return DiveResult(ctx.symbol, outcome=outcomes[ctx.symbol])
+        return await real(ctx, **kwargs)
+
+    monkeypatch.setattr(run_module, "run_dive", fake)
+
+
+async def test_dive_timeouts_count_with_model_errors_toward_partial(monkeypatch):
+    dives_that(monkeypatch, {"MSFT": "timeout"})
+    llm = golden_llm()
+    llm.dives["PLTR"] = [LLMError("Bedrock refused the request (HTTP 500)")]
+    outcome = await run_premarket(deps(llm=llm), NOW)
+    assert outcome.status == "partial"
+    assert "model calls failed in 2 of 4 deep-dive(s) (1 timed out)" in outcome.meta.notes
+    assert outcome.meta.counts["dive_timeout"] == 1
+    assert outcome.meta.counts["dive_llm_error"] == 1
+
+
+async def test_half_the_dives_timing_out_is_partial(monkeypatch):
+    dives_that(monkeypatch, {"MSFT": "timeout", "PLTR": "timeout"})
+    outcome = await run_premarket(deps(), NOW)
+    assert outcome.status == "partial"
+    assert "model calls failed in 2 of 4 deep-dive(s) (2 timed out)" in outcome.meta.notes
+
+
+async def test_one_timeout_of_four_is_noted_but_still_ok(monkeypatch):
+    dives_that(monkeypatch, {"MSFT": "timeout"})
+    outcome = await run_premarket(deps(), NOW)
+    assert outcome.status == "ok"
+    assert outcome.meta.notes == ("model calls failed in 1 of 4 deep-dive(s) (1 timed out)",)
+
+
+async def test_every_dive_outcome_but_submitted_is_counted(monkeypatch):
+    dives_that(
+        monkeypatch,
+        {"NVDA": "invalid", "AMD": "turn_limit", "MSFT": "input_limit", "PLTR": "budget"},
+    )
+    outcome = await run_premarket(deps(), NOW)
+    counts = outcome.meta.counts
+    assert {k: v for k, v in counts.items() if k.startswith("dive_")} == {
+        "dive_invalid": 1,
+        "dive_turn_limit": 1,
+        "dive_input_limit": 1,
+        "dive_budget": 1,
+    }
+
+
+# --- after the result is written, a failure does not undo it ----------------------------
+
+
+class HangingFirstAlert(LogAlerter):
+    """The first alert (the run's ok) never returns; later ones are recorded."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hung = False
+
+    async def send(self, kind, subject, message):
+        if not self.hung:
+            self.hung = True
+            await asyncio.Event().wait()
+        await super().send(kind, subject, message)
+
+
+async def test_a_box_that_expires_after_the_write_leaves_the_ok_result_standing(monkeypatch):
+    monkeypatch.setattr(
+        run_module, "_run_deadline", lambda max_run_s: asyncio.get_running_loop().time() + 0.5
+    )
+    d = deps()
+    d.alerts = HangingFirstAlert()
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert (outcome.status, outcome.exit_code) == ("ok", 0)
+    assert "RunDeadline" in outcome.detail
+    meta = await stored_meta(d.store, outcome.run_id)
+    assert meta.status is RunStatus.OK  # not overwritten with failed
+    assert meta == outcome.meta
+    view = await bot_view(d.store, datetime(2026, 10, 9, 14, 0, tzinfo=UTC))
+    assert view.level is PostureLevel.REDUCED and sorted(view.picks) == ["AMD", "NVDA"]
+    assert await d.store.day_cost(DAY) == Decimal("0.0280")  # once
+    (alert,) = d.alerts.sent
+    assert alert[0] == "research_run_failed"
+    assert "written as ok" in alert[2] and "RunDeadline" in alert[2]
+    assert ("LOCK#premarket", "LOCK") not in d.store.keys
+
+
+async def test_a_cost_add_cut_off_by_the_box_is_not_added_again(monkeypatch):
+    class SlowCostStore(MemoryResearchStore):
+        hung = False
+
+        async def add_day_cost(self, day, usd):
+            total = await super().add_day_cost(day, usd)
+            if not self.hung:  # the first lands, but its answer never comes back
+                self.hung = True
+                await asyncio.Event().wait()
+            return total
+
+    monkeypatch.setattr(
+        run_module, "_run_deadline", lambda max_run_s: asyncio.get_running_loop().time() + 0.5
+    )
+    d = deps(store=SlowCostStore())
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert (outcome.status, outcome.exit_code) == ("failed", 1)
+    assert outcome.meta.error.startswith("write: RunDeadline")
+    assert await d.store.day_cost(DAY) == Decimal("0.0280")  # not 0.0560
+    assert (await stored_meta(d.store, outcome.run_id)).status is RunStatus.FAILED
+
+
+async def test_a_halted_name_is_dropped_at_the_screen_and_never_dived():
+    market, events = market_day()
+    market.quote_map["MSFT"] = market.quote_map["MSFT"].model_copy(update={"halted": True})
+    d = deps(market=market, events=events)
+    outcome = await run_premarket(d, NOW)
+    screen = {row["symbol"]: row for row in d.trail.only().files["screen.json"]}
+    assert screen["MSFT"]["dropped"] == "halted"
+    assert outcome.meta.counts["drop_halted"] == 1
+    assert d.llm.requests_for("MSFT") == []
+    assert [p.symbol for p in outcome.picks] == ["NVDA", "AMD", "PLTR"]
