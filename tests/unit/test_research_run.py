@@ -354,13 +354,64 @@ async def test_stand_aside_means_no_dives_and_no_picks():
     assert (await bot_view(d.store)).level is PostureLevel.STAND_ASIDE
 
 
-async def test_a_failed_posture_review_means_at_least_reduced():
+async def test_a_failed_posture_review_means_at_least_reduced_and_partial():
     llm = golden_llm()
     llm.posture = [LLMError("Bedrock refused the request (HTTP 403)")]
     outcome = await run_premarket(deps(llm=llm), NOW)
-    assert outcome.status == "ok"
+    # Partial: the posture is the code's alone, not the reviewed one the run planned.
+    assert outcome.status == "partial"
     assert outcome.posture.level is PostureLevel.REDUCED
     assert outcome.meta.notes == ("posture review failed: Bedrock refused the request (HTTP 403)",)
+
+
+async def test_an_invalid_posture_review_is_partial_too():
+    llm = golden_llm()
+    llm.posture = [posture_reply("bogus")]
+    outcome = await run_premarket(deps(llm=llm), NOW)
+    assert outcome.status == "partial"
+    assert outcome.posture.level is PostureLevel.REDUCED
+    assert outcome.meta.notes == ("posture review failed: invalid submit_posture (1 error(s))",)
+
+
+async def test_no_model_access_at_all_is_partial_not_ok():
+    # No Bedrock access: the review and every deep-dive fail.
+    denied = LLMError("Bedrock refused the request (HTTP 403)")
+    llm = ScriptedLLM(
+        posture=[denied], dives={s: [denied] for s in ("NVDA", "AMD", "MSFT", "PLTR")}
+    )
+    d = deps(llm=llm)
+    outcome = await run_premarket(d, NOW)
+    assert (outcome.status, outcome.picks) == ("partial", ())
+    assert "model calls failed in 4 of 4 deep-dive(s)" in outcome.meta.notes
+    (alert,) = d.alerts.sent
+    assert alert[0] == "research_run_partial"
+
+
+async def test_every_dive_failing_is_partial_even_with_a_good_review():
+    llm = golden_llm()
+    for symbol in ("NVDA", "AMD", "MSFT", "PLTR"):
+        llm.dives[symbol] = [LLMError("Bedrock could not be asked (APIConnectionError)")]
+    outcome = await run_premarket(deps(llm=llm), NOW)
+    assert outcome.status == "partial"
+    assert outcome.meta.notes == ("model calls failed in 4 of 4 deep-dive(s)",)
+
+
+async def test_half_the_dives_failing_is_partial():
+    llm = golden_llm()
+    llm.dives["MSFT"] = [LLMError("Bedrock refused the request (HTTP 500)")]
+    llm.dives["PLTR"] = [LLMError("Bedrock refused the request (HTTP 500)")]
+    outcome = await run_premarket(deps(llm=llm), NOW)
+    assert outcome.status == "partial"
+    assert "model calls failed in 2 of 4 deep-dive(s)" in outcome.meta.notes
+
+
+async def test_one_failed_dive_of_four_is_noted_but_still_ok():
+    llm = golden_llm()
+    llm.dives["MSFT"] = [LLMError("Bedrock refused the request (HTTP 500)")]
+    outcome = await run_premarket(deps(llm=llm), NOW)
+    assert outcome.status == "ok"
+    assert outcome.meta.notes == ("model calls failed in 1 of 4 deep-dive(s)",)
+    assert [p.symbol for p in outcome.picks] == ["NVDA", "AMD", "PLTR"]
 
 
 async def test_prompt_injection_in_the_news_changes_nothing_that_matters():
@@ -618,8 +669,8 @@ async def test_a_posture_failure_note_is_scrubbed_and_short():
     assert any(r.startswith("code: posture review failed: denied: token") for r in reasons)
     assert all("d1c2b3a4e5f6a7b8c9d0e1f2" not in r and len(r) <= 500 for r in reasons)
     assert "d1c2b3a4e5f6a7b8c9d0e1f2" not in json.dumps(d.trail.only().files["posture.json"])
-    view = await bot_view(d.store)
-    assert "d1c2b3a4e5f6a7b8c9d0e1f2" not in json.dumps(view.posture.model_dump(mode="json"))
+    (stored,) = [d.store.raw(*k) for k in d.store.keys if k[1].startswith("POSTURE#")]
+    assert "d1c2b3a4e5f6a7b8c9d0e1f2" not in stored["body"]
 
 
 async def test_an_overrun_is_noted():

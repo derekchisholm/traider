@@ -132,7 +132,7 @@ async def test_the_model_can_make_the_posture_stricter():
     decision = await decide(llm, metrics())
     assert decision.level is REDUCED
     assert decision.reasons == ("code: no rule matched", "model: CPI at 08:30")
-    assert decision.reviewed and not decision.notes
+    assert decision.reviewed and not decision.notes and not decision.review_failed
     (request,) = llm.requests
     assert request["tool_choice"] == {"type": "tool", "name": "submit_posture"}
     assert request["model"] == MODEL
@@ -149,6 +149,7 @@ async def test_stand_aside_skips_the_review():
     decision = await decide(llm, metrics(vix=None))
     assert decision.level is STAND_ASIDE
     assert decision.reasons == ("code: missing data: vix",)
+    assert not decision.review_failed  # no review was attempted
     assert llm.requests == []
 
 
@@ -171,6 +172,7 @@ async def test_a_failed_or_nonsense_review_means_at_least_reduced(answer):
     assert decision.notes and decision.notes[0].startswith("posture review failed")
     assert "at least reduced" in decision.reasons[-1]
     assert not decision.budget_hit
+    assert decision.review_failed  # attempted and failed: the run is partial
 
 
 async def test_a_review_the_budget_cannot_cover_is_not_made():
@@ -178,6 +180,7 @@ async def test_a_review_the_budget_cannot_cover_is_not_made():
     decision = await decide(llm, metrics(), budget="0.001")
     assert decision.level is REDUCED
     assert decision.budget_hit
+    assert not decision.review_failed  # a budget stop, not a failed review
     assert llm.requests == []
 
 

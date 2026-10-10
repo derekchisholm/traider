@@ -184,6 +184,9 @@ class PostureDecision:
     notes: tuple[str, ...] = ()
     reviewed: bool = False
     budget_hit: bool = False
+    # The model review was attempted and did not succeed (an error or an invalid answer);
+    # not set for a review skipped for budget or for a stand-aside the code decided.
+    review_failed: bool = False
 
 
 async def review_posture(
@@ -286,7 +289,12 @@ async def decide_posture(
         level = stricter(code_level, PostureLevel.REDUCED)
         reasons.append(f"code: {exc}, so at least reduced")
         return PostureDecision(
-            level, _clip(reasons), metrics, notes=(str(exc),), budget_hit=exc.budget
+            level,
+            _clip(reasons),
+            metrics,
+            notes=(str(exc),),
+            budget_hit=exc.budget,
+            review_failed=not exc.budget,
         )
     reasons += [f"model: {r}" for r in review.reasons]
     level = stricter(code_level, review.level)

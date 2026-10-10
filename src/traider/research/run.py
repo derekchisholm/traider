@@ -10,7 +10,8 @@
 
 Exit codes: 0 ok, partial, skipped, closed or disabled; 1 failed; 2 the lock is held.
 A run is ``partial`` when planned work did not happen: a budget stopped calls, the
-deadline passed, the events vendor failed, or a trail file could not be written. The bot
+deadline passed, the events vendor failed, the model review failed, model calls failed in
+half or more of the deep-dives, or a trail file could not be written. The bot
 ignores partial runs by default.
 
 Time: the lock lives ``max_run_s + LOCK_SPARE_S`` from the start. The whole run is boxed
@@ -481,8 +482,10 @@ class _Run:
             sector_gaps=_sector_gaps(snapshot.context),
             headlines=snapshot.market_news,
         )
+        # A failed review is partial: the posture is only the code's (made at least
+        # reduced), not what the run planned.
         for text in decision.notes:
-            self.note(text, partial=decision.budget_hit)
+            self.note(text, partial=decision.budget_hit or decision.review_failed)
         self.budget_noted = self.budget_noted or decision.budget_hit
         return decision
 
@@ -690,6 +693,12 @@ class _Run:
             self.budget_noted = True
         if any(r.news_failed for r in results):
             self.note("company news unavailable during deep-dives", partial=True)
+        if failed := sum(1 for r in results if r.outcome == "llm_error"):
+            # Half or more failing looks like the model being unreachable, not one bad call.
+            self.note(
+                f"model calls failed in {failed} of {len(results)} deep-dive(s)",
+                partial=2 * failed >= len(results),
+            )
         return results
 
     # ------------------------------------------------------------------- finish
