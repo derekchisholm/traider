@@ -10,7 +10,11 @@ not. Per assessment, in order; the first failure drops the name with its reason 
                          a spread within ``max_put_spread_pct`` and open interest of at least
                          ``min_put_oi``
 5. expiry                intraday: today's close. Swing: the close ``swing_days`` weekdays out,
-                         refused without an earnings calendar (``earnings_unknown``), and
+                         but never past the close of ``calendar_end``, the last day the
+                         earnings calendar covers (a date after it is unknown). Refused as
+                         ``earnings_unknown`` without a calendar, when this symbol's earnings
+                         were not confirmed by a symbol-scoped call, or for a share-class
+                         symbol (a "/" or "." in it: vendors spell those differently). Then
                          moved to the close of the last weekday before an earnings date in
                          ``[today, expiry]`` (not one today before the open); a swing pick
                          left expiring today or earlier is ``earnings_too_close``. Intraday
@@ -53,6 +57,9 @@ class RankInput:
     atr: float
     sector: str | None
     earnings: tuple[EarningsEvent, ...]  # this symbol's, from the calendar
+    # A symbol-scoped calendar call answered for this name. Without it a swing pick is
+    # refused (``earnings_unknown``); intraday picks do not need it.
+    earnings_confirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +80,18 @@ def close_of(day: date) -> datetime:
     return datetime.combine(day, time(16, 0), tzinfo=ET).astimezone(UTC)
 
 
+def share_class(symbol: str) -> bool:
+    """A share-class symbol (BRK/B, BRK.B): its spelling differs between vendors, so its
+    earnings cannot be matched by symbol with confidence."""
+    return "/" in symbol or "." in symbol
+
+
 def swing_expiry_day(
-    today: date, swing_days: int, earnings: Sequence[EarningsEvent]
+    today: date, swing_days: int, earnings: Sequence[EarningsEvent], calendar_end: date
 ) -> date | None:
-    """The day a swing pick expires at the close, or None when earnings come too soon."""
-    expiry = weekdays_after(today, swing_days)
+    """The day a swing pick expires at the close, or None when earnings come too soon.
+    Never after ``calendar_end``: the earnings calendar says nothing past it."""
+    expiry = min(weekdays_after(today, swing_days), calendar_end)
     for event in sorted(earnings, key=lambda e: e.day):
         if not today <= event.day <= expiry:
             continue
@@ -108,6 +122,7 @@ def validate_and_rank(
     today: date,
     close: datetime,
     earnings_ok: bool,
+    calendar_end: date,
     settings: RankSettings,
 ) -> RankResult:
     rejected: list[Rejection] = []
@@ -150,11 +165,11 @@ def validate_and_rank(
                 continue
             horizon, expires = Horizon.INTRADAY, close
         else:
-            if not earnings_ok:
+            if not earnings_ok or not item.earnings_confirmed or share_class(item.symbol):
                 rejected.append(Rejection(item.symbol, "earnings_unknown"))
                 continue
             assert a.swing_days is not None
-            day = swing_expiry_day(today, a.swing_days, item.earnings)
+            day = swing_expiry_day(today, a.swing_days, item.earnings, calendar_end)
             if day is None:
                 rejected.append(Rejection(item.symbol, "earnings_too_close"))
                 continue
@@ -208,6 +223,7 @@ async def rank_and_validate(
     today: date,
     close: datetime,
     earnings_ok: bool,
+    calendar_end: date,
     settings: RankSettings,
 ) -> RankResult:
     """Fetch a fresh quote for every name (one batch) and puts for bearish ones, then
@@ -235,6 +251,7 @@ async def rank_and_validate(
         today=today,
         close=close,
         earnings_ok=earnings_ok,
+        calendar_end=calendar_end,
         settings=settings,
     )
     return replace(result, chain_failures=failed)

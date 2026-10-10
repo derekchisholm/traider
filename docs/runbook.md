@@ -370,8 +370,10 @@ Finnhub and Bedrock. What the first dry run may show:
   `securityStatus` as halted (fail closed), and what Schwab reports before the open is not
   verified.
 - **Few or no candidates:** movers or quotes at 08:00 may not reflect pre-market trading,
-  or Finnhub's free tier may lack the earnings calendar (then the run is `partial`, with no
-  swing picks).
+  or Finnhub's free tier may lack the earnings calendar or answer it empty (then the run
+  is `partial`, with no swing picks). Each swing idea also gets its own earnings call for
+  its symbol; if that fails, the note "earnings check failed" says which picks were
+  refused (`earnings_unknown`).
 - **Everything dropped as `stale_history`, or posture `stand_aside` with a note about SPY:**
   daily bars whose last bar is more than 3 weekdays old are dropped, and stale SPY bars mean
   `stand_aside`. Malformed bars are dropped too.

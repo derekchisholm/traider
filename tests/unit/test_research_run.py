@@ -14,7 +14,9 @@ from tests.fakes.research import (
     MSFT_PASS,
     NOW,
     NVDA_SWING,
+    PLTR_LONG,
     TODAY,
+    FakeEvents,
     FakeMarketData,
     ScriptedLLM,
     _dive_symbol,
@@ -30,6 +32,7 @@ from tests.fakes.research import (
 )
 from traider.alerts import LogAlerter
 from traider.config import ResearchSettings
+from traider.research.events import EarningsEvent, EventsUnavailable
 from traider.research.llm import LLMError
 from traider.research.market import QuoteBatch
 from traider.research.models import PostureLevel, RunMeta, RunStatus
@@ -146,6 +149,7 @@ async def test_the_golden_morning():
         "drop_history": 1,
         "drop_otc": 1,
         "dived": 4,
+        "earnings_checks": 1,
         "assessed": 4,
         "picks": 3,
     }
@@ -841,3 +845,113 @@ def test_the_run_flow_never_imports_order_code():
 
     source = Path(run_module.__file__).read_text(encoding="utf-8")
     assert "place_order" not in source and "broker" not in source
+
+
+# --- the earnings calendar: how far it reaches, and when it says nothing ----------------
+
+CALENDAR_START = date(2026, 10, 8)  # the weekday before TODAY
+
+
+async def test_a_swing_pick_never_outlives_the_earnings_calendar():
+    # Lookahead 3: the calendar covers through Wednesday 10-14, so NVDA's 5-day swing
+    # (Friday 10-16 unclamped) expires at Wednesday's close.
+    d = deps(settings=jobs(collect={"earnings_lookahead_days": 3}))
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "ok"
+    nvda = next(p for p in outcome.picks if p.symbol == "NVDA")
+    assert nvda.expires_at == datetime(2026, 10, 14, 20, 0, tzinfo=UTC)
+    assert d.events.called("earnings_calendar")[0] == (CALENDAR_START, date(2026, 10, 14))
+
+
+async def test_an_empty_calendar_over_a_week_is_unavailable_not_quiet():
+    market, events = market_day()
+    events.calendar = []
+    d = deps(market=market, events=events)
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "partial"
+    assert {r.symbol: r.reason for r in outcome.rejected}["NVDA"] == "earnings_unknown"
+    assert d.trail.only().files["snapshot.json"]["earnings_ok"] is False
+    assert any(n.startswith("earnings calendar returned nothing") for n in outcome.meta.notes)
+    assert [c for c in events.called("earnings_calendar") if len(c) == 3] == []
+
+
+async def test_an_empty_calendar_over_a_few_days_can_be_quiet():
+    # Lookahead 1: three weekdays (yesterday, today, Monday) with no earnings is plausible.
+    market, events = market_day()
+    events.calendar = []
+    d = deps(market=market, events=events, settings=jobs(collect={"earnings_lookahead_days": 1}))
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "ok"
+    assert d.trail.only().files["snapshot.json"]["earnings_ok"] is True
+    nvda = next(p for p in outcome.picks if p.symbol == "NVDA")
+    assert nvda.expires_at == datetime(2026, 10, 12, 20, 0, tzinfo=UTC)  # the calendar's end
+
+
+async def test_each_swing_candidate_has_its_earnings_confirmed_by_symbol():
+    d = deps()
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "ok"
+    # NVDA is the only swing idea: AMD and PLTR are intraday, MSFT passed.
+    assert d.events.called("earnings_calendar") == [
+        (CALENDAR_START, date(2026, 10, 23)),
+        (CALENDAR_START, date(2026, 10, 23), "NVDA"),
+    ]
+    assert outcome.meta.counts["earnings_checks"] == 1
+
+
+async def test_earnings_only_the_symbol_call_knows_still_clamp_the_swing():
+    class GappyCalendar(FakeEvents):
+        """The market-wide calendar misses NVDA's report; the symbol call has it."""
+
+        async def earnings_calendar(self, start, end, symbol=None):
+            found = await super().earnings_calendar(start, end, symbol)
+            if symbol == "NVDA":
+                found.append(EarningsEvent(symbol="NVDA", day=date(2026, 10, 14), hour="amc"))
+            return found
+
+    market, events = market_day()
+    gappy = GappyCalendar()
+    gappy.__dict__.update(events.__dict__)
+    d = deps(market=market, events=gappy)
+    outcome = await run_premarket(d, NOW)
+    nvda = next(p for p in outcome.picks if p.symbol == "NVDA")
+    assert nvda.expires_at == datetime(2026, 10, 13, 20, 0, tzinfo=UTC)  # Tuesday's close
+    assert nvda.earnings_date == date(2026, 10, 14)
+
+
+async def test_a_failed_symbol_check_refuses_that_swing_pick_only():
+    market, events = market_day()
+    events.symbol_failures["NVDA"] = EventsUnavailable("finnhub /calendar/earnings: HTTP 503")
+    d = deps(market=market, events=events)
+    outcome = await run_premarket(d, NOW)
+    assert outcome.status == "ok"  # noted, but not partial on its own
+    assert {r.symbol: r.reason for r in outcome.rejected}["NVDA"] == "earnings_unknown"
+    assert [p.symbol for p in outcome.picks] == ["AMD", "PLTR"]
+    assert (
+        "earnings check failed for 1 name(s), no swing pick for them: "
+        "finnhub /calendar/earnings: HTTP 503"
+    ) in outcome.meta.notes
+    assert outcome.meta.counts["earnings_check_failures"] == 1
+
+
+async def test_at_most_max_picks_symbol_checks_best_first():
+    llm = golden_llm()
+    llm.dives["PLTR"] = [submit(**(PLTR_LONG | {"horizon": "swing", "swing_days": 3}))]
+    market, events = market_day()
+    d = deps(market=market, events=events, llm=llm, settings=jobs(rank={"max_picks": 1}))
+    outcome = await run_premarket(d, NOW)
+    assert [c for c in events.called("earnings_calendar") if len(c) == 3] == [
+        (CALENDAR_START, date(2026, 10, 23), "NVDA")
+    ]
+    assert [p.symbol for p in outcome.picks] == ["NVDA"]
+    # Not checked, so never a swing pick, whatever else happens to the names above it.
+    assert {r.symbol: r.reason for r in outcome.rejected}["PLTR"] == "earnings_unknown"
+
+
+async def test_without_a_calendar_no_symbol_checks_are_made():
+    market, events = market_day()
+    events.failures["earnings_calendar"] = EventsUnavailable("finnhub: HTTP 503")
+    d = deps(market=market, events=events)
+    outcome = await run_premarket(d, NOW)
+    assert len(events.called("earnings_calendar")) == 1
+    assert {r.symbol: r.reason for r in outcome.rejected}["NVDA"] == "earnings_unknown"

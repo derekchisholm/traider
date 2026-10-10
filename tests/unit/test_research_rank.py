@@ -18,10 +18,12 @@ from traider.research.rank import (
     swing_expiry_day,
     validate_and_rank,
 )
+from traider.timeutil import weekdays_after
 
 CLOSE = datetime(2026, 10, 9, 20, 0, tzinfo=UTC)
 RUN = "premarket-20261009T120000Z-ab12"
 SETTINGS = RankSettings()
+CALENDAR_END = weekdays_after(TODAY, 10)  # the default earnings lookahead
 LIQUID = [PutContract(symbol="P", strike=48, days=14, bid=1.0, ask=1.05, open_interest=500)]
 
 
@@ -37,7 +39,9 @@ def assessment(**overrides) -> Assessment:
     return Assessment.model_validate(fields | overrides)
 
 
-def item(symbol="NVDA", *, pre=70, atr=2.0, sector="Semis", earnings=(), **a) -> RankInput:
+def item(
+    symbol="NVDA", *, pre=70, atr=2.0, sector="Semis", earnings=(), confirmed=True, **a
+) -> RankInput:
     return RankInput(
         symbol=symbol,
         assessment=assessment(**a),
@@ -46,10 +50,13 @@ def item(symbol="NVDA", *, pre=70, atr=2.0, sector="Semis", earnings=(), **a) ->
         atr=atr,
         sector=sector,
         earnings=tuple(earnings),
+        earnings_confirmed=confirmed,
     )
 
 
-def rank(inputs, *, fresh=None, puts=None, earnings_ok=True, settings=SETTINGS):
+def rank(
+    inputs, *, fresh=None, puts=None, earnings_ok=True, settings=SETTINGS, calendar_end=CALENDAR_END
+):
     fresh = (
         fresh if fresh is not None else {i.symbol: quote(i.symbol, 104.0, 100.0) for i in inputs}
     )
@@ -61,6 +68,7 @@ def rank(inputs, *, fresh=None, puts=None, earnings_ok=True, settings=SETTINGS):
         today=TODAY,
         close=CLOSE,
         earnings_ok=earnings_ok,
+        calendar_end=calendar_end,
         settings=settings,
     )
 
@@ -176,27 +184,27 @@ def test_rule_5_swing_expiry_is_clamped_before_earnings():
 )
 def test_swing_expiry_day(day, hour, expiry):
     event = EarningsEvent(symbol="X", day=day, hour=hour)
-    assert swing_expiry_day(TODAY, 5, [event]) == expiry
+    assert swing_expiry_day(TODAY, 5, [event], CALENDAR_END) == expiry
 
 
 def test_swing_expiry_day_earnings_on_the_expiry_day_after_the_close_clamps_to_the_day_before():
     friday = EarningsEvent(symbol="X", day=date(2026, 10, 16), hour="amc")
-    assert swing_expiry_day(TODAY, 5, [friday]) == date(2026, 10, 15)
+    assert swing_expiry_day(TODAY, 5, [friday], CALENDAR_END) == date(2026, 10, 15)
 
 
 def test_swing_expiry_day_earnings_on_a_weekend_clamps_to_the_friday_before():
     saturday = EarningsEvent(symbol="X", day=date(2026, 10, 17), hour="unknown")
-    assert swing_expiry_day(TODAY, 10, [saturday]) == date(2026, 10, 16)
+    assert swing_expiry_day(TODAY, 10, [saturday], CALENDAR_END) == date(2026, 10, 16)
     sunday = EarningsEvent(symbol="X", day=date(2026, 10, 18), hour="amc")
-    assert swing_expiry_day(TODAY, 10, [sunday]) == date(2026, 10, 16)
+    assert swing_expiry_day(TODAY, 10, [sunday], CALENDAR_END) == date(2026, 10, 16)
 
 
 def test_swing_expiry_day_with_several_events_the_earliest_wins():
     late = EarningsEvent(symbol="X", day=date(2026, 10, 15), hour="amc")
     early = EarningsEvent(symbol="X", day=date(2026, 10, 13), hour="amc")
     middle = EarningsEvent(symbol="X", day=date(2026, 10, 14), hour="bmo")
-    assert swing_expiry_day(TODAY, 10, [late, early, middle]) == date(2026, 10, 12)
-    assert swing_expiry_day(TODAY, 10, [early, middle, late]) == date(2026, 10, 12)
+    assert swing_expiry_day(TODAY, 10, [late, early, middle], CALENDAR_END) == date(2026, 10, 12)
+    assert swing_expiry_day(TODAY, 10, [early, middle, late], CALENDAR_END) == date(2026, 10, 12)
 
 
 def test_rule_5_a_swing_pick_with_earnings_next_trading_day_is_too_close():
@@ -292,6 +300,7 @@ async def test_ranking_fetches_one_quote_batch_and_puts_for_bearish_names_only()
         today=TODAY,
         close=CLOSE,
         earnings_ok=True,
+        calendar_end=CALENDAR_END,
         settings=SETTINGS,
     )
     assert [p.symbol for p in result.picks] == ["NVDA", "AMD"]
@@ -310,6 +319,7 @@ async def test_a_chain_that_cannot_be_read_means_illiquid():
         today=TODAY,
         close=CLOSE,
         earnings_ok=True,
+        calendar_end=CALENDAR_END,
         settings=SETTINGS,
     )
     assert reasons(result) == {"AMD": "illiquid_puts"}
@@ -328,6 +338,7 @@ async def test_a_failed_chain_read_is_logged_by_symbol_and_type_only(caplog):
             today=TODAY,
             close=CLOSE,
             earnings_ok=True,
+            calendar_end=CALENDAR_END,
             settings=SETTINGS,
         )
     assert "AMD" in caplog.text and "RuntimeError" in caplog.text
@@ -345,6 +356,7 @@ async def test_a_halted_name_is_dropped_and_its_chain_is_not_read():
         today=TODAY,
         close=CLOSE,
         earnings_ok=True,
+        calendar_end=CALENDAR_END,
         settings=SETTINGS,
     )
     assert reasons(result) == {"AMD": "halted"}
@@ -362,5 +374,69 @@ async def test_a_failed_quote_batch_raises():
             today=TODAY,
             close=CLOSE,
             earnings_ok=True,
+            calendar_end=CALENDAR_END,
             settings=SETTINGS,
         )
+
+
+# --- the swing expiry stays inside the earnings calendar ------------------------------
+# The calendar covers trading days through L = weekdays_after(today, lookahead): an
+# earnings date after L is unknown, so a swing pick never outlives L's close.
+
+LOOKAHEAD_5 = weekdays_after(TODAY, 5)  # Friday 2026-10-16
+
+
+def test_a_swing_pick_longer_than_the_calendar_is_clamped_to_its_last_day():
+    (pick,) = rank([item(horizon="swing", swing_days=20)], calendar_end=LOOKAHEAD_5).picks
+    assert pick.expires_at == close_of(LOOKAHEAD_5)
+    assert pick.horizon.value == "swing"
+
+
+def test_earnings_just_past_the_calendar_cannot_be_held_through():
+    # Earnings on L+3 are outside the calendar, so the run never saw them. Unclamped, a
+    # 20-day swing would run straight through them; clamped, it is out at L's close.
+    l_plus_3 = weekdays_after(TODAY, 8)
+    assert swing_expiry_day(TODAY, 20, [], LOOKAHEAD_5) == LOOKAHEAD_5
+    unseen = EarningsEvent(symbol="NVDA", day=l_plus_3, hour="bmo")
+    assert swing_expiry_day(TODAY, 20, [unseen], LOOKAHEAD_5) == LOOKAHEAD_5
+    (pick,) = rank([item(horizon="swing", swing_days=20)], calendar_end=LOOKAHEAD_5).picks
+    assert pick.expires_at == close_of(LOOKAHEAD_5) < close_of(l_plus_3)
+
+
+def test_earnings_inside_the_calendar_still_clamp_earlier():
+    wednesday = EarningsEvent(symbol="X", day=date(2026, 10, 14), hour="amc")
+    assert swing_expiry_day(TODAY, 20, [wednesday], LOOKAHEAD_5) == date(2026, 10, 13)
+
+
+def test_a_shorter_swing_is_not_stretched_to_the_calendar():
+    assert swing_expiry_day(TODAY, 2, [], LOOKAHEAD_5) == date(2026, 10, 13)
+
+
+@pytest.mark.parametrize("calendar_end", [TODAY, date(2026, 10, 8)])
+def test_a_calendar_that_ends_today_or_earlier_leaves_no_swing(calendar_end):
+    assert swing_expiry_day(TODAY, 20, [], calendar_end) is None
+    result = rank([item(horizon="swing", swing_days=20)], calendar_end=calendar_end)
+    assert reasons(result) == {"NVDA": "earnings_too_close"}
+
+
+def test_the_calendar_does_not_limit_intraday_picks():
+    (pick,) = rank([item()], calendar_end=TODAY).picks
+    assert pick.expires_at == CLOSE
+
+
+# --- a swing pick needs this symbol's earnings confirmed --------------------------------
+
+
+def test_an_unconfirmed_swing_pick_is_refused_as_earnings_unknown():
+    result = rank([item(horizon="swing", swing_days=5, confirmed=False)])
+    assert reasons(result) == {"NVDA": "earnings_unknown"}
+    # Intraday picks do not need it.
+    assert rank([item(confirmed=False)]).picks
+
+
+@pytest.mark.parametrize("symbol", ["BRK/B", "BRK.B", "BF.A"])
+def test_a_share_class_symbol_is_never_a_swing_pick(symbol):
+    # Vendors spell share classes differently, so its earnings may not match by symbol.
+    result = rank([item(symbol, horizon="swing", swing_days=5)])
+    assert reasons(result) == {symbol: "earnings_unknown"}
+    assert rank([item(symbol)]).picks  # intraday is fine

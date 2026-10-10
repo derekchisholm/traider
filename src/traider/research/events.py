@@ -62,7 +62,11 @@ class Profile(BaseModel):
 
 
 class EventsData(Protocol):
-    async def earnings_calendar(self, start: date, end: date) -> list[EarningsEvent]: ...
+    async def earnings_calendar(
+        self, start: date, end: date, symbol: str | None = None
+    ) -> list[EarningsEvent]:
+        """Earnings dates in ``[start, end]``: every company's, or only ``symbol``'s."""
+        ...
 
     async def company_news(self, symbol: str, start: date, end: date) -> list[NewsItem]: ...
 
@@ -202,11 +206,13 @@ class FinnhubEvents:
     def __repr__(self) -> str:  # the key stays out of logs and tracebacks
         return f"FinnhubEvents(base_url={self._base!r})"
 
-    async def earnings_calendar(self, start: date, end: date) -> list[EarningsEvent]:
-        raw = await self._get(
-            "/calendar/earnings", {"from": start.isoformat(), "to": end.isoformat()}
-        )
-        return parse_earnings(raw)
+    async def earnings_calendar(
+        self, start: date, end: date, symbol: str | None = None
+    ) -> list[EarningsEvent]:
+        params = {"from": start.isoformat(), "to": end.isoformat()}
+        if symbol is not None:
+            params["symbol"] = symbol
+        return parse_earnings(await self._get("/calendar/earnings", params))
 
     async def company_news(self, symbol: str, start: date, end: date) -> list[NewsItem]:
         raw = await self._get(

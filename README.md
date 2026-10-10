@@ -499,8 +499,8 @@ run). In order, the run:
 4. has Claude on Amazon Bedrock **study the best few**, one name at a time, with read-only
    tools and hard limits on calls, tokens, time and money;
 5. **checks every idea in code** (a fresh quote that is not halted, a sensible stop, liquid
-   puts for bearish ideas, an expiry that clears the next earnings date) and writes the
-   ranked picks.
+   puts for bearish ideas, an expiry that clears the next earnings date and stays inside
+   the earnings calendar's reach) and writes the ranked picks.
 
 The model only advises: it can make the posture stricter, never looser, and every pick
 passes code checks. Missing or stale data means standing aside. The run never places an

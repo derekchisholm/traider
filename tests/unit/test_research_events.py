@@ -61,6 +61,28 @@ async def test_earnings_calendar_reads_dates_hours_and_estimates(events, finnhub
     assert request["query"] == {"from": "2026-10-08", "to": "2026-10-23"}
 
 
+async def test_an_earnings_calendar_for_one_symbol_sends_the_symbol(events, finnhub):
+    finnhub.earnings = [{"date": "2026-10-14", "hour": "amc", "symbol": "NVDA"}]
+    found = await events.earnings_calendar(date(2026, 10, 8), date(2026, 10, 23), "NVDA")
+    assert found == [EarningsEvent(symbol="NVDA", day=date(2026, 10, 14), hour="amc")]
+    (request,) = finnhub.requests
+    assert request["query"] == {"from": "2026-10-08", "to": "2026-10-23", "symbol": "NVDA"}
+
+
+async def test_the_fake_calendar_for_one_symbol_gives_only_that_symbol():
+    fake = FakeEvents()
+    fake.calendar = [
+        EarningsEvent(symbol="NVDA", day=date(2026, 10, 14)),
+        EarningsEvent(symbol="AMD", day=date(2026, 10, 14)),
+    ]
+    found = await fake.earnings_calendar(TODAY, date(2026, 10, 23), "NVDA")
+    assert [e.symbol for e in found] == ["NVDA"]
+    fake.symbol_failures["NVDA"] = EventsUnavailable("finnhub /calendar/earnings: HTTP 503")
+    with pytest.raises(EventsUnavailable):
+        await fake.earnings_calendar(TODAY, date(2026, 10, 23), "NVDA")
+    assert len(await fake.earnings_calendar(TODAY, date(2026, 10, 23))) == 2
+
+
 async def test_news_is_newest_first_with_short_summaries(events, finnhub):
     finnhub.company_news["NVDA"] = [
         {"datetime": 1760000000, "source": "Wire", "headline": "older", "summary": "s"},

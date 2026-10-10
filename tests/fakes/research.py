@@ -164,6 +164,8 @@ class FakeEvents:
         self.general: list[NewsItem] = []
         self.profiles: dict[str, Profile] = {}
         self.failures: dict[str, Exception] = {}  # method name -> raised on every call
+        # symbol -> raised by a symbol-scoped earnings_calendar call for it
+        self.symbol_failures: dict[str, Exception] = {}
         self.calls: list[tuple[str, Any]] = []
 
     def _enter(self, name: str, detail: Any) -> None:
@@ -178,9 +180,20 @@ class FakeEvents:
         for name in ("earnings_calendar", "company_news", "market_news", "profile"):
             self.failures[name] = EventsUnavailable(f"finnhub {name}: HTTP 503")
 
-    async def earnings_calendar(self, start: date, end: date) -> list[EarningsEvent]:
-        self._enter("earnings_calendar", (start, end))
-        return [e for e in self.calendar if start <= e.day <= end]
+    async def earnings_calendar(
+        self, start: date, end: date, symbol: str | None = None
+    ) -> list[EarningsEvent]:
+        if symbol is None:
+            self._enter("earnings_calendar", (start, end))
+        else:
+            self._enter("earnings_calendar", (start, end, symbol))
+            if symbol in self.symbol_failures:
+                raise self.symbol_failures[symbol]
+        return [
+            e
+            for e in self.calendar
+            if start <= e.day <= end and (symbol is None or e.symbol == symbol)
+        ]
 
     async def company_news(self, symbol: str, start: date, end: date) -> list[NewsItem]:
         self._enter("company_news", symbol)

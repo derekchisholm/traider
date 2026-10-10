@@ -5,12 +5,14 @@
       -> stand_aside? yes -> write the posture, no picks, ok
       -> screen (filters, stale history, features, pre_score, top K)
       -> deep-dives (tool loops, budgets, concurrency, deadline)
+      -> earnings check (a symbol-scoped calendar call per swing idea)
       -> rank + validate -> add the cost -> write picks + posture + META ok|partial -> alert
     any exception -> META failed, alert, exit 1 (no posture, so the bot stands aside)
 
 Exit codes: 0 ok, partial, skipped, closed or disabled; 1 failed; 2 the lock is held.
 A run is ``partial`` when planned work did not happen: a budget stopped calls, the
-deadline passed, the events vendor failed, the model review failed, model calls failed in
+deadline passed, the events vendor failed (an empty earnings calendar over a week or
+more counts as failed), the model review failed, model calls failed in
 half or more of the deep-dives, or a trail file could not be written. The bot
 ignores partial runs by default.
 
@@ -60,7 +62,14 @@ from traider.research.posture import (
     decide_posture,
     posture_metrics,
 )
-from traider.research.rank import RankInput, RankResult, Rejection, rank_and_validate
+from traider.research.rank import (
+    RankInput,
+    RankResult,
+    Rejection,
+    blended_score,
+    rank_and_validate,
+    share_class,
+)
 from traider.research.screen import (
     DROP_HISTORY,
     DROP_HISTORY_ERROR,
@@ -110,6 +119,9 @@ MAX_NOTES = 20
 # its features would describe an old market.
 MAX_BAR_AGE_WEEKDAYS = 3
 DROP_STALE_HISTORY = "stale_history"
+# A market-wide earnings calendar with no rows over at least this many weekdays is taken
+# as a vendor problem, not a quiet week: it counts as unavailable.
+EMPTY_CALENDAR_WEEKDAYS = 5
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -253,6 +265,10 @@ class _Run:
         self.trail: Trail | None = None
         self.trail_failures = 0
         self.cost_added = False
+        # The earnings calendar's window. Nothing is known about earnings after
+        # ``calendar_end``, so no swing pick outlives its close.
+        self.calendar_start = previous_weekday(self.today)
+        self.calendar_end = weekdays_after(self.today, self.jobs.collect.earnings_lookahead_days)
 
     # ------------------------------------------------------------------ helpers
 
@@ -374,8 +390,11 @@ class _Run:
             snapshot, decision=decision, top=top, quotes=quotes, bars=bars, profiles=profiles
         )
 
-        self.stage = "rank"
         by_symbol = {row.symbol: row for row in top}
+        self.stage = "earnings_check"
+        earnings, confirmed = await self.confirm_earnings(snapshot, results, by_symbol)
+
+        self.stage = "rank"
         inputs = [
             RankInput(
                 symbol=r.symbol,
@@ -384,7 +403,8 @@ class _Run:
                 features=by_symbol[r.symbol].features.as_dict(),
                 atr=by_symbol[r.symbol].atr,
                 sector=p.industry if (p := profiles.get(r.symbol)) else None,
-                earnings=_events_for(snapshot.earnings, r.symbol),
+                earnings=earnings.get(r.symbol, ()),
+                earnings_confirmed=r.symbol in confirmed,
             )
             for r in results
             if r.assessment is not None
@@ -398,6 +418,7 @@ class _Run:
             today=self.today,
             close=session.close,
             earnings_ok=snapshot.earnings_ok,
+            calendar_end=self.calendar_end,
             settings=self.jobs.rank,
         )
         if ranked.chain_failures:
@@ -422,13 +443,21 @@ class _Run:
         earnings: list[EarningsEvent] = []
         earnings_ok = True
         try:
-            earnings = await deps.events.earnings_calendar(
-                previous_weekday(today),
-                weekdays_after(today, jobs.collect.earnings_lookahead_days),
-            )
+            earnings = await deps.events.earnings_calendar(self.calendar_start, self.calendar_end)
         except EventsUnavailable as exc:
             earnings_ok = False
             self.note(f"earnings calendar unavailable, no swing picks: {exc}", partial=True)
+        else:
+            span = weekdays_between(self.calendar_start, self.calendar_end) + 1
+            if not earnings and span >= EMPTY_CALENDAR_WEEKDAYS:
+                # No company reporting for a week or more is not believable: an empty
+                # reply must not read as "no earnings ahead".
+                earnings_ok = False
+                self.note(
+                    f"earnings calendar returned nothing for {span} weekdays; treated as "
+                    "unavailable, no swing picks",
+                    partial=True,
+                )
         market_news: list[NewsItem] = []
         news_ok = True
         if jobs.collect.market_news_count:
@@ -700,6 +729,64 @@ class _Run:
                 partial=2 * failed >= len(results),
             )
         return results
+
+    # --------------------------------------------------------- earnings check
+
+    async def confirm_earnings(
+        self,
+        snapshot: Snapshot,
+        results: Sequence[DiveResult],
+        rows: Mapping[str, ScreenRow],
+    ) -> tuple[dict[str, tuple[EarningsEvent, ...]], set[str]]:
+        """Each name's earnings, and which swing ideas a symbol-scoped calendar call
+        confirmed. The market-wide calendar can miss a name; a swing pick needs its own
+        check. At most ``rank.max_picks`` calls, best ideas first, one at a time. A failed
+        call refuses that name's swing pick only: noted, but not partial on its own."""
+        earnings = {r.symbol: _events_for(snapshot.earnings, r.symbol) for r in results}
+        confirmed: set[str] = set()
+        if not snapshot.earnings_ok:
+            return earnings, confirmed  # no swing picks at all
+        settings = self.jobs.rank
+
+        def order(r: DiveResult) -> tuple[int, int, str]:
+            assert r.assessment is not None
+            pre = rows[r.symbol].pre_score
+            return (-blended_score(r.assessment.score, pre, settings.llm_weight), -pre, r.symbol)
+
+        swing = sorted(
+            (
+                r
+                for r in results
+                if r.assessment is not None
+                and r.assessment.side != "pass"
+                and r.assessment.horizon == "swing"
+                and not share_class(r.symbol)  # refused anyway
+            ),
+            key=order,
+        )[: settings.max_picks]
+        failed: list[str] = []
+        first_error = ""
+        for r in swing:
+            try:
+                found = await self.deps.events.earnings_calendar(
+                    self.calendar_start, self.calendar_end, r.symbol
+                )
+            except EventsUnavailable as exc:
+                failed.append(r.symbol)
+                first_error = first_error or str(exc)
+                continue
+            merged = dict.fromkeys((*earnings[r.symbol], *_events_for(found, r.symbol)))
+            earnings[r.symbol] = tuple(sorted(merged, key=lambda e: e.day))
+            confirmed.add(r.symbol)
+        if swing:
+            self.counts["earnings_checks"] = len(swing)
+        if failed:
+            self.counts["earnings_check_failures"] = len(failed)
+            self.note(
+                f"earnings check failed for {len(failed)} name(s), no swing pick for them: "
+                f"{first_error}"
+            )
+        return earnings, confirmed
 
     # ------------------------------------------------------------------- finish
 

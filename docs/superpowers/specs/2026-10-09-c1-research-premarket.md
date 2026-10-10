@@ -103,7 +103,11 @@ The `Snapshot` (pydantic) is stored in S3 as `snapshot.json`.
 * **Earnings:** the Finnhub calendar from yesterday to 10 weekdays out. Each entry has
   symbol, date and hour (`bmo` / `amc` / unknown). Names reporting yesterday after the
   close or today before the open become candidates. The whole calendar is kept, so
-  swing expiries can check upcoming dates.
+  swing expiries can check upcoming dates. After the deep-dives, each swing idea (side
+  not `pass`, best first, at most `max_picks`, one call at a time) gets a symbol-scoped
+  calendar call over the same window, merged into that name's dates, because the
+  market-wide calendar can miss a name. A failed call refuses that name's swing pick
+  (`earnings_unknown`) and adds a note; it does not make the run partial on its own.
 * **Market news:** the latest 30 Finnhub general headlines. Untrusted.
 * **Watchlist:** `research_jobs.watchlist` (default empty), for names the owner wants
   looked at. It is optional; the owner does not have to maintain it.
@@ -116,6 +120,7 @@ The `Snapshot` (pydantic) is stored in S3 as `snapshot.json`.
 |---|---|
 | A Schwab context or mover call | The run fails |
 | The Finnhub calendar | `earnings_ok = false`, no earnings candidates, swing picks not allowed, run is partial |
+| The Finnhub calendar answers with no rows over 5 weekdays or more | Treated as unavailable: the same as a failure, with a note |
 | Finnhub news | No news for that use, run is partial |
 
 ## Posture
@@ -268,8 +273,12 @@ for the report.
    → `illiquid_puts`.
 5. **Expiry:**
    * Intraday expires at today's close.
-   * Swing expires at the close `swing_days` weekdays out, and is refused when
-     `earnings_ok` is false → `earnings_unknown`.
+   * Swing expires at the close `swing_days` weekdays out, but never past the close of
+     L = `earnings_lookahead_days` weekdays out, the last day the calendar covers (an
+     earnings date after L is unknown).
+   * A swing pick is refused → `earnings_unknown` when `earnings_ok` is false, when its
+     symbol-scoped calendar call failed or was not made, or when its symbol has a `/`
+     or `.` in it (share classes are spelled differently by different vendors).
    * If an earnings date E falls in `[today, expiry]` (but not today before the open),
      the expiry is clamped to the close of the last weekday before E.
    * A swing pick whose clamped expiry is today or earlier → `earnings_too_close`.
