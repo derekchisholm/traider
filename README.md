@@ -530,7 +530,9 @@ fields:
 | `research_jobs.budget.prices` | Sonnet 5.5 at $2 / $10 per million tokens | what the budgets are counted in |
 
 Every model in use needs a price above zero in `budget.prices`; a model without one is
-never called. **The default prices are unverified**: check them against AWS's Bedrock
+never called. A dry run (`--dry-run`) is held to `run_usd` and to what is left of today's
+`day_usd`, but what it spends is not added to the day: dry runs are not counted in the
+day budget, only in their own run budget. **The default prices are unverified**: check them against AWS's Bedrock
 price list.
 
 It needs a Finnhub key and Bedrock model access first; the

@@ -178,7 +178,7 @@ once every 15 minutes.
 | Research DATE: ok | The pre-market research run finished. The alert gives the posture, each pick (L long, B bearish, its horizon and score) and the cost. | Nothing. `traider research show` before the open shows what the bot will act on. |
 | Research DATE: partial | The run finished, but planned work did not happen: a budget stopped Bedrock calls, a deadline passed, Finnhub failed, the Bedrock posture review failed, Bedrock calls failed or timed out in half the deep-dives or more, daily history was unreadable for half the names or more, or the trail could not be written. The alert ends with the reasons. By default the bot ignores a partial run, posture included, so it stands aside today. | Read the reasons. Once the cause has passed, run it again (see [Research jobs](#research-jobs)). To trade on partial runs anyway, set `research.accept_partial_runs`; it applies to every partial run. |
 | Research DATE: failed | The run stopped at the stage it names (for example `collect`, `posture` or `dive`; a run that took longer than `research_jobs.max_run_s` plus 9 minutes fails too). It wrote no posture, so the bot stands aside today. If the message says "was written as ok" (or partial) "then failed", the result was already in the table when something went wrong (for example the time box ran out while the alert was sent): it stands, and the bot uses it as usual. | An expired Schwab sign-in is the usual cause: sign in, then run it again. Otherwise read the research logs. After "was written as ... then failed", nothing to redo; read the research logs. |
-| The research run stopped with an error | From AWS, not from the run: the research task exited with an error (it failed, it could not start, or another run held the lock). | Read the research logs (below). A run that cannot even start (no Finnhub key stored) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
+| The research run stopped with an error | From AWS, not from the run: the research task exited with an error (it failed, it could not start, or another run held the lock). | Read the research logs (below). A run that cannot even start (no Finnhub key stored or readable, invalid or unreadable settings, no research table or no AWS region) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
 | Alarm: the scheduler could not start the research run | The scheduler gave up on starting the task (two retries within 10 minutes) and put the request in a dead-letter queue. No task ran, so the alert above cannot fire. The bot stands aside today. | Read the message, then **purge the queue** (below). If you do not, the alarm stays in ALARM and later failures send no new alert. |
 | No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) No summary means the run did not finish, or never ran: the schedule is not enabled (`traider:researchScheduleEnabled`, off by default), the start failed, or the run is stuck. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
 
@@ -342,13 +342,17 @@ printf '{"api_key": "%s"}' "$FINNHUB_KEY" | aws secretsmanager put-secret-value 
 unset FINNHUB_KEY
 ```
 
-The key goes in that command and nowhere else: not in a file, a Pulumi setting, a chat or a
+`file:///dev/stdin` is not verified; if it fails, use `--secret-string "$(cat)"` and type the JSON, then Ctrl-D, or a `umask 077` temp file removed right after (either keeps the key out of shell history).
+
+The key goes in that command and nowhere else: not in a file you keep, a Pulumi setting, a chat or a
 ticket. Piping it in keeps it out of the command line (`printf` is a shell built-in, so it
 is not in the process list either); typing it into `--secret-string` directly would show it
 there briefly, which is acceptable on a personal machine but worse. If it ever leaks (pasted
 anywhere else, even by accident), make a new one at Finnhub and store it the same way. A run
-with no key stored does not start (exit 1, no run record); the stopped-with-an-error alert
-shows only a stop code and reason, and the research logs say "cannot start the research run:".
+with no key stored does not start (exit 1, no run record); nor does one whose settings are
+invalid or unreadable, or that has no research table or AWS region. The
+stopped-with-an-error alert shows only a stop code and reason, and the research logs say
+"cannot start the research run:".
 
 **3. A dry run.** With the `localEnv` output loaded (README, step 5;
 reload it, it now carries the Finnhub secret) and AWS credentials that can read the secrets
