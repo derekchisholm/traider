@@ -206,14 +206,30 @@ async def test_a_week_of_picks_is_scored():
 
 async def test_the_bot_never_sees_the_scorecard():
     from traider.config import ResearchSettings
+    from traider.research.models import Posture, PostureLevel
     from traider.research.source import ResearchSource
 
-    d = await deps()
-    await run_scorecard(d, NOW)
-    source = ResearchSource(d.store, ResearchSettings)
+    store = MemoryResearchStore()
+    await a_week(store)
+    # Today's pre-market run, as the bot would use it: a posture and a live swing pick.
+    posture = Posture(level=PostureLevel.TRADE, run_id="premarket-t", at=NOW.replace(hour=12))
+    await store.write_run(
+        run_meta("premarket-t", TODAY),
+        [pick("MU", 1, "premarket-t", horizon="swing", expires=date(2026, 10, 14))],
+        posture,
+    )
+    settings = ResearchSettings()
+    source = ResearchSource(store, lambda: settings)
     await source.refresh(NOW)
-    assert "scorecard" not in {run.kind for run in (await d.store.day(DAY)).runs.values()}
-    assert source.view.posture is None
+    before = source.view
+    assert before.posture == posture and set(before.picks) == {"MU"}  # NVDA expired at 16:00
+
+    d = await deps(store=store)
+    assert (await run_scorecard(d, NOW)).status == "ok"
+    await source.refresh(NOW)
+    after = source.view
+    assert (after.posture, after.picks, after.level) == (before.posture, before.picks, before.level)
+    assert "scorecard" not in {run.kind for run in (await store.day(DAY)).runs.values()}
 
 
 async def test_final_outcomes_are_skipped_and_still_summarised():
@@ -538,3 +554,66 @@ async def test_an_event_log_error_reaches_meta_and_the_alert_scrubbed():
     assert "event log was unreadable for 1 day(s)" in message
     for text in (message, written, *outcome.meta.notes):
         assert "eyJhbGciOiJIUzI1NiJ9" not in text and "c2VjcmV0" not in text
+
+
+async def test_a_status_never_goes_backwards_even_with_nothing_to_keep():
+    m = market()
+    m.bars["NVDA"] = m.bars["NVDA"][1:]  # no pick-day bar this time: scored as pending
+    d = await deps(m=m)
+    before = stored_outcome_final().model_copy(update={"status": OutcomeStatus.PARTIAL})
+    assert before.entry is None and before.traded is None  # nothing known to keep
+    await d.store.put_outcome(before)
+    await run_scorecard(d, NOW)
+    after = stored(d.store, before.key)
+    assert after.status is OutcomeStatus.PARTIAL and after.updated_at == NOW
+
+
+# --- the bot's event log ------------------------------------------------------------------
+
+
+class Counting(MemoryStateStore):
+    def __init__(self):
+        super().__init__("paper")
+        self.read = []
+
+    async def events(self, day):
+        self.read.append(day)
+        return await super().events(day)
+
+
+async def test_a_pick_that_keeps_its_outcome_needs_no_log_read():
+    m = SomeBarsFail({"NVDA"})
+    m.bars = market().bars
+    state = Counting()
+    d = await deps(m=m, state=state)
+    await d.store.put_outcome(
+        stored_outcome_final().model_copy(update={"status": OutcomeStatus.PARTIAL})
+    )
+    await run_scorecard(d, NOW)
+    # NVDA (live Monday to Friday) is kept: only AMD's Monday, TSLA's Tuesday, PLTR's Thursday.
+    assert state.read == ["2026-10-05", "2026-10-06", "2026-10-08"]
+
+
+async def test_half_the_log_days_or_more_unreadable_is_partial():
+    state = Unreadable({"2026-10-05", "2026-10-06", "2026-10-07"})  # 3 of Monday to Friday
+    state._data = (await bot_log())._data
+    d = await deps(state=state)
+    outcome = await run_scorecard(d, NOW)
+    assert outcome.status == "partial"
+    assert outcome.meta.counts["event_log_failures"] == 3
+    ((_, subject, message),) = d.alerts.sent
+    assert subject == f"Scorecard {DAY}: partial"
+    assert "the bot's event log was unreadable for 3 day(s)" in message
+
+
+async def test_exactly_half_the_log_days_unreadable_is_partial():
+    store = MemoryResearchStore()
+    await store.write_run(
+        run_meta("premarket-a", MON),
+        [pick("NVDA", 1, "premarket-a", horizon="swing", expires=TUE)],
+        None,
+    )
+    state = Unreadable({"2026-10-06"})  # Tuesday: 1 of the 2 days NVDA was live
+    d = await deps(store=store, state=state)
+    outcome = await run_scorecard(d, NOW)
+    assert outcome.status == "partial" and outcome.meta.counts["event_log_failures"] == 1

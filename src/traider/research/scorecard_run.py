@@ -8,9 +8,11 @@
 No model is called. A symbol whose bars cannot be read keeps its last outcome (or gets a
 ``pending`` one) and a note; half the symbols or more unreadable makes the run ``partial``.
 An unreadable event-log day makes ``traded`` unknown (None) for the picks it covers, with a
-note. A value an earlier scorecard knew is never overwritten with None: an unreadable log
-day or a bar Schwab no longer returns keeps what was known. Anything else fails the run.
-Nothing the bot reads depends on the scorecard.
+note; half the days read or more unreadable makes the run ``partial``. A pick that keeps its
+last outcome for want of bars needs no log read. A value an earlier scorecard knew is never
+overwritten with None (an unreadable log day, a bar Schwab no longer returns), and an
+outcome's status never goes backwards. Anything else fails the run. Nothing the bot reads
+depends on the scorecard.
 
 Writes go outcomes, then the day's summary, then META last: META ``ok`` or ``partial``
 means everything before it is in. A write that fails part-way fails the run (META
@@ -41,6 +43,7 @@ from traider.research.models import (
 from traider.research.run import (
     BARS_CONCURRENCY,
     EXIT_OK,
+    MAX_NOTES,
     RunBase,
     RunDeps,
     RunOutcome,
@@ -55,7 +58,7 @@ from traider.research.scorecard import (
     summary_text,
     traded_from_logs,
 )
-from traider.research.scrub import scrub
+from traider.research.scrub import LIMIT, scrub
 from traider.schwab.client import SchwabError
 from traider.schwab.parse import ParseError
 from traider.timeutil import previous_weekday, trading_date, weekdays_between, weekdays_from
@@ -65,7 +68,9 @@ log = logging.getLogger(__name__)
 KIND: Final = "scorecard"
 EVENT: Final = "research_scorecard"
 BARS_SPARE_DAYS = 5  # history asked for beyond the oldest pick day, for holidays
-MESSAGE_LIMIT = 8000  # the alert: the summary line plus at most MAX_NOTES scrubbed notes
+# The alert: the summary line (well under LIMIT) and "; notes: " plus the notes, which
+# RunBase.note bounds to MAX_NOTES of at most LIMIT characters each.
+MESSAGE_LIMIT: Final = (MAX_NOTES + 1) * (LIMIT + 2) + len("; notes: ")
 # Every field an outcome may leave unknown. A known value there is never replaced by None.
 KEEP_KNOWN: Final = tuple(
     name for name, info in PickOutcome.model_fields.items() if info.default is None
@@ -135,7 +140,9 @@ class ScorecardRun(RunBase):
         self.stage = "bars"
         bars = await self.bars(todo)
         self.stage = "event_log"
-        logs = await self.event_logs(todo)
+        # A pick whose bars cannot be read keeps its last outcome: no log read for it.
+        scoring = [e for e in todo if bars.get(e.pick.symbol) is not None or e.key not in existing]
+        logs = await self.event_logs(scoring)
 
         self.stage = "score"
         fresh: list[Scored] = []
@@ -273,7 +280,8 @@ class ScorecardRun(RunBase):
         self, entries: Sequence[Entry]
     ) -> Mapping[date, Sequence[Mapping[str, Any]] | None] | None:
         """The bot's event log for every day a pick was live. None without a state table;
-        a day that cannot be read is None (``traded`` is then unknown)."""
+        a day that cannot be read is None (``traded`` is then unknown). Half the days or more
+        unreadable makes the run partial."""
         state = self.deps.state
         if state is None:
             if entries:
@@ -302,7 +310,9 @@ class ScorecardRun(RunBase):
             self.counts["event_log_failures"] = failed
             self.note(
                 f"the bot's event log was unreadable for {failed} day(s), so traded is "
-                f"unknown there: {first_error}"
+                f"unknown there: {first_error}",
+                # Half the days or more looks like an outage, not one bad read.
+                partial=2 * failed >= len(days),
             )
         return logs
 
@@ -313,7 +323,7 @@ def _not_final(outcome: PickOutcome | None) -> bool:
 
 def keep_known(fresh: PickOutcome, before: PickOutcome | None) -> PickOutcome:
     """``fresh``, with every value it does not know taken from ``before`` where that knew
-    it, and the further of the two statuses. ``fresh`` itself when nothing is taken."""
+    it, and the further of the two statuses. ``fresh`` itself when nothing changes."""
     if before is None:
         return fresh
     known = {
@@ -321,7 +331,8 @@ def keep_known(fresh: PickOutcome, before: PickOutcome | None) -> PickOutcome:
         for name in KEEP_KNOWN
         if getattr(fresh, name) is None and (value := getattr(before, name)) is not None
     }
-    if not known:
-        return fresh
+    # A status never goes backwards, whether or not a value was kept.
     status = max(fresh.status, before.status, key=STATUS_ORDER.index)
+    if not known and status is fresh.status:
+        return fresh
     return fresh.model_copy(update={**known, "status": status})

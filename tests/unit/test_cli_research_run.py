@@ -739,3 +739,80 @@ async def test_a_scorecard_dry_run_says_it_calls_no_model(tmp_path):
 def test_the_scorecard_kind_parses():
     args = cli._parser().parse_args(["research", "run", "--kind", "scorecard", "--dry-run"])
     assert (args.kind, args.dry_run) == ("scorecard", True)
+
+
+async def test_the_wiring_refuses_a_state_table_without_a_namespace(aws_stack, tmp_path):
+    import aiohttp
+
+    from tests.unit.test_state import TABLE as STATE_TABLE
+    from tests.unit.test_state import make_table as make_state_table
+
+    make_state_table()
+    async with aiohttp.ClientSession() as http:
+        with pytest.raises(SetupError, match="TRAIDER_STATE_NAMESPACE"):
+            await build_deps(
+                stack_config(aws_stack, state_table=STATE_TABLE),
+                http,
+                dry_run=False,
+                trail_dir=tmp_path,
+                clock=ManualClock(NOW),
+                llm=golden_llm(),
+            )
+
+
+async def test_the_wiring_reads_the_bots_state_in_the_namespace_it_names(aws_stack, tmp_path):
+    import aiohttp
+
+    from tests.unit.test_state import TABLE as STATE_TABLE
+    from tests.unit.test_state import make_table as make_state_table
+    from traider.research.botstate import held_symbols
+    from traider.state.base import LedgerEntry
+    from traider.state.dynamo import DynamoStateStore
+
+    table = make_state_table()
+    for namespace, symbol in (("live", "NVDA"), ("paper", "AMD")):
+        state = DynamoStateStore(table, namespace)
+        await state.put_ledger(LedgerEntry(symbol, horizon="swing", side="long", opened_at=NOW))
+        await state.log_event("order_submitted", {"symbol": symbol}, NOW)
+    async with aiohttp.ClientSession() as http:
+        built = {
+            name: await build_deps(
+                stack_config(aws_stack, **extra),
+                http,
+                dry_run=False,
+                trail_dir=tmp_path,
+                clock=ManualClock(NOW),
+                llm=golden_llm(),
+            )
+            for name, extra in (
+                ("live", {"state_table": STATE_TABLE, "state_namespace": "live"}),
+                ("premarket", {}),
+            )
+        }
+    live = built["live"].state
+    assert live is not None
+    assert await held_symbols(live) == {"NVDA"}
+    (event,) = await live.events(NOW.date().isoformat())
+    assert event["data"] == {"symbol": "NVDA"}
+    # Without a state table, the pre-market build is as before: no bot state.
+    assert built["premarket"].state is None
+    assert isinstance(built["premarket"].store, DynamoResearchStore)
+
+
+def test_each_kind_has_exactly_one_runner():
+    from traider.research.scorecard_run import run_scorecard
+
+    assert set(cli._runners()) == set(cli.RESEARCH_KINDS)
+    assert cli._runner("premarket") is cli.run_premarket
+    assert cli._runner("scorecard") is run_scorecard
+    with pytest.raises(ValueError, match="no runner for research kind 'weekly'"):
+        cli._runner("weekly")
+
+
+def test_the_dry_run_help_fits_every_kind(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["research", "run", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "write nothing to the research table" in text
+    assert "premarket and intraday make real Bedrock calls" in text
+    assert "the scorecard calls no model" in text

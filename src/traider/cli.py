@@ -653,11 +653,16 @@ BuildDeps = Callable[..., Awaitable[RunDeps]]
 Runner = Callable[..., Awaitable[RunOutcome]]
 
 
+def _runners() -> dict[str, Runner]:
+    """Each kind's runner. Built when the run starts, so tests can replace a runner."""
+    return {"premarket": run_premarket, "scorecard": run_scorecard}
+
+
 def _runner(kind: str) -> Runner:
-    """Looked up when the run starts, so tests can replace a runner."""
-    if kind == "scorecard":
-        return run_scorecard
-    return run_premarket
+    try:
+        return _runners()[kind]
+    except KeyError:
+        raise ValueError(f"no runner for research kind {kind!r}") from None
 
 
 def _error_text(exc: BaseException) -> str:
@@ -781,8 +786,9 @@ def _parser() -> argparse.ArgumentParser:
     run_research.add_argument(
         "--dry-run",
         action="store_true",
-        help="make every real call (Bedrock costs money) but write nothing to the research "
-        "table; print the posture and picks",
+        help="make every real call but write nothing to the research table and send no "
+        "alert; print what the run decided. premarket and intraday make real Bedrock calls "
+        "(they cost money); the scorecard calls no model",
     )
     run_research.add_argument(
         "--force", action="store_true", help="run even if today's run already finished"
