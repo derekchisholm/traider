@@ -265,7 +265,8 @@ class _Run:
         self.meter: CostMeter | None = None
         self.trail: Trail | None = None
         self.trail_failures = 0
-        self.cost_added = False
+        self.cost_added = False  # set only once add_day_cost has returned
+        self.cost_task: asyncio.Task[Decimal] | None = None
         # Set once write_run has returned: META, picks and posture are in the table and a
         # later failure must not overwrite them.
         self.written: RunOutcome | None = None
@@ -844,10 +845,13 @@ class _Run:
         )
         if not self.dry_run:
             # The cost first: a write that fails afterwards must not hide what was spent.
-            # Marked before the await: an add cut off by the time box may still have
-            # landed, and the cost must never be added twice.
+            # Shielded, so the time box cannot cut the add off halfway; fail() waits for
+            # one still under way. Never under-counted: an add that raised is tried again.
+            self.cost_task = asyncio.ensure_future(
+                self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
+            )
+            await asyncio.shield(self.cost_task)
             self.cost_added = True
-            await self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
             await self.deps.store.write_run(meta, ranked.picks, posture)
             self.written = outcome
             await self.alert(status, _summary(self.today, posture, ranked.picks, meta))
@@ -876,6 +880,7 @@ class _Run:
             return replace(written, detail=error)
         meta = self.meta(RunStatus.FAILED, error=error)
         if not self.dry_run:
+            await self._settle_cost()
             if self.meter is not None and not self.cost_added and self.meter.spent > 0:
                 try:
                     await self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
@@ -891,6 +896,26 @@ class _Run:
                 f"traider research {KIND} {self.today.isoformat()} failed: {error}",
             )
         return RunOutcome("failed", EXIT_FAILED, self.run_id, meta=meta, detail=error)
+
+    async def _settle_cost(self) -> None:
+        """Wait for a cost add the time box interrupted, at most until half the margin
+        before the lock expires is gone. If it finished, the cost is in; if it raised or
+        is still going, fail() adds it (again): over-counting only makes budgets stricter."""
+        task = self.cost_task
+        if task is None or self.cost_added:
+            return
+        if not task.done():
+            wait = self.box + RUN_BOX_MARGIN_S / 2 - asyncio.get_running_loop().time()
+            await asyncio.wait({task}, timeout=max(wait, 0.0))  # never cancels the add
+        if not task.done():
+            log.error("the day's cost add did not finish in time; adding it again")
+            return
+        if task.cancelled():
+            return
+        if (exc := task.exception()) is not None:
+            log.error("could not add the run's cost to the day: %s", _describe(exc))
+            return
+        self.cost_added = True
 
     async def alert(self, status: RunStatus, message: str) -> None:
         subject = f"Research {self.today.isoformat()}: {status.value}"

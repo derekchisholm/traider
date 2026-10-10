@@ -1052,26 +1052,70 @@ async def test_a_box_that_expires_after_the_write_leaves_the_ok_result_standing(
     assert ("LOCK#premarket", "LOCK") not in d.store.keys
 
 
-async def test_a_cost_add_cut_off_by_the_box_is_not_added_again(monkeypatch):
-    class SlowCostStore(MemoryResearchStore):
-        hung = False
+def box_in(monkeypatch, seconds):
+    monkeypatch.setattr(
+        run_module, "_run_deadline", lambda max_run_s: asyncio.get_running_loop().time() + seconds
+    )
+
+
+async def test_a_cost_add_that_raises_is_retried_so_the_day_never_under_counts():
+    class FlakyCostStore(MemoryResearchStore):
+        calls = 0
 
         async def add_day_cost(self, day, usd):
-            total = await super().add_day_cost(day, usd)
-            if not self.hung:  # the first lands, but its answer never comes back
-                self.hung = True
-                await asyncio.Event().wait()
-            return total
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("throttled")  # nothing was added
+            return await super().add_day_cost(day, usd)
 
-    monkeypatch.setattr(
-        run_module, "_run_deadline", lambda max_run_s: asyncio.get_running_loop().time() + 0.5
-    )
+    d = deps(store=FlakyCostStore())
+    outcome = await run_premarket(d, NOW)
+    assert (outcome.status, outcome.exit_code) == ("failed", 1)
+    assert outcome.meta.error == "write: RuntimeError: throttled"
+    assert await d.store.day_cost(DAY) == Decimal("0.0280")
+    assert d.store.calls == 2
+
+
+async def test_a_cost_add_cut_off_by_the_box_finishes_and_is_not_added_again(monkeypatch):
+    class SlowCostStore(MemoryResearchStore):
+        calls = 0
+
+        async def add_day_cost(self, day, usd):
+            self.calls += 1
+            await asyncio.sleep(0.5)  # the box runs out while this is under way
+            return await super().add_day_cost(day, usd)
+
+    box_in(monkeypatch, 0.3)
     d = deps(store=SlowCostStore())
     outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    await asyncio.sleep(0.7)  # anything still in the background lands before we look
     assert (outcome.status, outcome.exit_code) == ("failed", 1)
     assert outcome.meta.error.startswith("write: RunDeadline")
-    assert await d.store.day_cost(DAY) == Decimal("0.0280")  # not 0.0560
+    assert await d.store.day_cost(DAY) == Decimal("0.0280")  # once: shielded, then waited for
+    assert d.store.calls == 1
     assert (await stored_meta(d.store, outcome.run_id)).status is RunStatus.FAILED
+
+
+async def test_a_cost_add_that_never_answers_is_added_again_rather_than_lost(monkeypatch):
+    # Past the wait it is unknown whether the first add landed: count it again. Over-counting
+    # only makes the budget stricter.
+    class HungCostStore(MemoryResearchStore):
+        calls = 0
+
+        async def add_day_cost(self, day, usd):
+            self.calls += 1
+            total = await super().add_day_cost(day, usd)
+            if self.calls == 1:
+                await asyncio.Event().wait()  # it landed, but the answer never comes back
+            return total
+
+    box_in(monkeypatch, 0.3)
+    monkeypatch.setattr(run_module, "RUN_BOX_MARGIN_S", 0.4)  # waits at most 0.2 s
+    d = deps(store=HungCostStore())
+    outcome = await asyncio.wait_for(run_premarket(d, NOW), 5)
+    assert outcome.status == "failed"
+    assert await d.store.day_cost(DAY) == Decimal("0.0560")
+    assert d.store.calls == 2
 
 
 async def test_a_halted_name_is_dropped_at_the_screen_and_never_dived():

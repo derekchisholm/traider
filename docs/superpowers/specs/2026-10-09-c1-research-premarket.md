@@ -507,8 +507,10 @@ Recorded from the implementation plan (`docs/superpowers/plans/2026-10-09-c1-res
 * **Trail bucket name** gets the account id: `{prefix}-research-trail-{account}`.
 * **Lock:** `acquire_lock(name, owner, ttl_s, now)`; it lives `max_run_s` + 10 minutes.
 * **Cost** is added to the day before the final write, and a failed run adds what it
-  spent, so a failed write never hides money spent. It is never added twice: once the
-  add has started (even if the time box cuts it off), a failure does not add it again.
+  spent, so a failed write never hides money spent. It is never under-counted: the add
+  is shielded from the time box, a failure waits for one still under way (up to half the
+  lock margin), and an add that raised or did not finish in time is added again. A rare
+  double count only makes the budget stricter.
 * **After the write:** once `write_run` has returned, a later failure (the time box
   running out while the alert is sent) leaves META, picks and posture as written. It is
   logged, scrubbed, and a failure alert says the written result stands.
