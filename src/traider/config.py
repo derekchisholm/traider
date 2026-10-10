@@ -89,15 +89,51 @@ class RiskLimits(BaseModel):
         return self
 
 
+class ResearchSettings(BaseModel):
+    """How the bot uses research. Only matters when a research table is configured."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    poll_s: Annotated[float, Field(ge=10, le=600)] = 60.0
+    # A failed read leaves the last snapshot in force this long; after that, no entries.
+    max_stale_s: Annotated[float, Field(ge=60, le=3600)] = 600.0
+    min_score: Annotated[int, Field(ge=0, le=100)] = 60
+    max_symbols: Annotated[int, Field(ge=1, le=25)] = 25
+    accept_partial_runs: bool = False
+    # Share of max_total_exposure_usd that intraday positions may use; swing gets the rest.
+    intraday_share: Annotated[Decimal, Field(ge=0, le=1)] = Decimal("0.5")
+    # On a "reduced" day, order and position caps are multiplied by this.
+    reduced_factor: Annotated[Decimal, Field(gt=0, le=1)] = Decimal("0.5")
+    # Intraday positions are sold this many minutes before the close.
+    intraday_flatten_min: Annotated[int, Field(ge=1, le=120)] = 15
+    # How many earlier trading days to look back for swing picks that have not expired.
+    swing_lookback_days: Annotated[int, Field(ge=1, le=30)] = 10
+
+
+def check_symbols(value: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
+    """The rules every list of equity symbols follows."""
+    if not value and not allow_empty:
+        raise ValueError("at least one symbol is required")
+    if len(value) > 25:
+        raise ValueError("at most 25 symbols")
+    for symbol in value:
+        if not _SYMBOL.match(symbol):
+            raise ValueError(f"not a valid equity symbol: {symbol!r}")
+    if len(set(value)) != len(value):
+        raise ValueError("duplicate symbols")
+    return value
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     # What to trade and how.
     trading_mode: Literal["paper", "live"] = "paper"
-    symbols: tuple[str, ...]
+    symbols: tuple[str, ...] = ()
     strategy: str = "sma_cross"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     risk: RiskLimits = Field(default_factory=RiskLimits)
+    research: ResearchSettings = Field(default_factory=ResearchSettings)
     order_type: Literal["LIMIT", "MARKET"] = "LIMIT"
     limit_offset_bps: Annotated[Decimal, Field(ge=0, le=100)] = Decimal(5)
     order_timeout_s: PositiveFloat = 20.0
@@ -128,14 +164,22 @@ class Config(BaseModel):
     control_param: str | None = None
     control: str = "paper"  # used only when control_param is unset
     state_table: str | None = None
+    settings_table: str | None = None
+    research_table: str | None = None
+    # The research jobs' audit trail (S3) and where their Finnhub key is stored.
+    research_bucket: str | None = None
+    finnhub_secret_id: str | None = None
     alert_topic_arn: str | None = None
     reauth_url: str | None = None
 
     # Local-development alternatives to Secrets Manager.
     schwab_app_key: str | None = None
-    schwab_app_secret: str | None = None
+    # Kept out of repr, so a logged or printed Config never shows it.
+    schwab_app_secret: str | None = Field(default=None, repr=False)
     schwab_token_file: str | None = None
     schwab_callback_url: str | None = None
+    # For local research runs only; deployed runs read finnhub_secret_id.
+    finnhub_api_key: str | None = Field(default=None, repr=False)
 
     heartbeat_file: str = "/tmp/traider-heartbeat"  # noqa: S108
     log_level: str = "INFO"
@@ -143,16 +187,13 @@ class Config(BaseModel):
     @field_validator("symbols")
     @classmethod
     def _symbols_ok(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("at least one symbol is required")
-        if len(value) > 25:
-            raise ValueError("at most 25 symbols")
-        for symbol in value:
-            if not _SYMBOL.match(symbol):
-                raise ValueError(f"not a valid equity symbol: {symbol!r}")
-        if len(set(value)) != len(value):
-            raise ValueError("duplicate symbols")
-        return value
+        return check_symbols(value, allow_empty=True)
+
+    @model_validator(mode="after")
+    def _something_to_trade(self) -> Self:
+        if not self.symbols and not self.research_table:
+            raise ValueError("at least one symbol is required unless a research table is set")
+        return self
 
     @field_validator("account_last4")
     @classmethod
@@ -183,8 +224,11 @@ class Config(BaseModel):
                 continue  # blank means unset
             name = key[len(PREFIX) :].lower()
             values[_ENV_ALIASES.get(name, name)] = _convert(key, name, raw)
-        if "symbols" not in values:
-            raise ConfigError(f"{PREFIX}SYMBOLS is required, for example {PREFIX}SYMBOLS=SPY,QQQ")
+        if "symbols" not in values and "research_table" not in values:
+            raise ConfigError(
+                f"{PREFIX}SYMBOLS is required (or {PREFIX}RESEARCH_TABLE), "
+                f"for example {PREFIX}SYMBOLS=SPY,QQQ"
+            )
         if "aws_region" not in values and env.get("AWS_REGION"):
             values["aws_region"] = env["AWS_REGION"]
         try:
@@ -197,7 +241,7 @@ _ENV_ALIASES = {
     "schwab_account_hash": "account_hash",
     "schwab_account_last4": "account_last4",
 }
-_JSON_FIELDS = {"strategy_params", "risk"}
+_JSON_FIELDS = {"strategy_params", "risk", "research"}
 
 
 def _convert(key: str, name: str, raw: str) -> Any:

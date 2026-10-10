@@ -36,7 +36,7 @@ async def until(predicate, timeout=3.0):
 
 
 @contextlib.asynccontextmanager
-async def running(schwab, client, tokens, symbols=("SPY", "QQQ"), connect=True):
+async def running(schwab, client, tokens, symbols=("SPY", "QQQ"), connect=True, **extra):
     sink = Recorder()
     async with aiohttp.ClientSession() as session:
         stream = SchwabStream(
@@ -48,6 +48,7 @@ async def running(schwab, client, tokens, symbols=("SPY", "QQQ"), connect=True):
             symbols=symbols,
             backoff_initial_s=0.01,
             backoff_max_s=0.05,
+            **extra,
         )
         task = asyncio.create_task(stream.run())
         try:
@@ -305,3 +306,116 @@ async def test_refused_login_is_retried_with_a_fresh_access_token(schwab, client
         r["parameters"]["Authorization"] for r in schwab.stream_requests if r["command"] == "LOGIN"
     ]
     assert used[0] != used[1]
+
+
+# --- a changing symbol set -------------------------------------------------------------------
+
+
+class SleepLog:
+    """Stands in for the backoff sleep: records each call and waits a moment."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, seconds):
+        self.calls.append(seconds)
+        await asyncio.sleep(0.01)
+
+
+def closers():
+    return [t for t in asyncio.all_tasks() if "_close_on_change" in repr(t.get_coro())]
+
+
+async def test_new_symbols_are_subscribed_on_a_fresh_connection_without_backoff(
+    schwab, client, signed_in
+):
+    slept = SleepLog()
+    async with running(schwab, client, signed_in, sleep=slept) as (stream, _):
+        stream.set_symbols(("SPY", "NVDA"))
+        await until(lambda: schwab.stream_logins == 2 and stream.connected)
+    assert schwab.subscriptions == {
+        "LEVELONE_EQUITIES": {"SPY", "NVDA"},
+        "CHART_EQUITY": {"SPY", "NVDA"},
+    }
+    assert slept.calls == []  # reconnected at once: not a failure, so no backoff
+
+
+async def test_the_same_symbols_again_do_not_reconnect(schwab, client, signed_in):
+    async with running(schwab, client, signed_in) as (stream, _):
+        stream.set_symbols(("SPY", "QQQ"))
+        await asyncio.sleep(0.1)
+        assert stream.connected is True
+    assert schwab.stream_logins == 1
+
+
+async def test_a_change_during_the_handshake_is_not_lost_and_not_a_failure(
+    schwab, client, signed_in, monkeypatch
+):
+    monkeypatch.setattr(SchwabStream, "REPLY_TIMEOUT_S", 0.05)
+    schwab.stream_silent_subs = True  # the first connection stays in the handshake
+    slept = SleepLog()
+    async with running(schwab, client, signed_in, connect=False, sleep=slept) as (stream, _):
+        await until(lambda: subscriptions_sent(schwab) >= 1)
+        stream.set_symbols(("NVDA",))
+        schwab.stream_silent_subs = False
+        await until(
+            lambda: stream.connected and schwab.subscriptions.get("CHART_EQUITY") == {"NVDA"}
+        )
+    assert slept.calls == []  # the failed handshake was followed by an immediate reconnect
+
+
+async def test_the_stream_does_not_connect_without_symbols_and_wakes_when_they_arrive(
+    schwab, client, signed_in
+):
+    async with running(schwab, client, signed_in, symbols=(), connect=False) as (stream, _):
+        await asyncio.sleep(0.1)
+        assert (stream.connected, schwab.stream_logins) == (False, 0)
+        assert schwab.calls("GET", "/userPreference") == []
+        stream.set_symbols(("SPY",))
+        await until(lambda: stream.connected)
+    assert schwab.subscriptions["CHART_EQUITY"] == {"SPY"}
+
+
+async def test_emptying_the_symbols_disconnects_and_waits_without_spinning(
+    schwab, client, signed_in
+):
+    slept = SleepLog()
+    async with running(schwab, client, signed_in, sleep=slept) as (stream, _):
+        stream.set_symbols(())
+        await until(lambda: not stream.connected and schwab.sockets == [])
+        asked = len(schwab.calls("GET", "/userPreference"))
+        await asyncio.sleep(0.15)
+        assert len(schwab.calls("GET", "/userPreference")) == asked  # idle, not looping
+        assert (stream.connected, schwab.stream_logins, slept.calls) == (False, 1, [])
+        stream.set_symbols(("QQQ",))
+        await until(lambda: stream.connected)
+    assert schwab.stream_logins == 2
+
+
+async def test_the_closer_task_does_not_outlive_its_connection(schwab, client, signed_in):
+    async with running(schwab, client, signed_in) as (stream, _):
+        assert len(closers()) == 1
+        await schwab.drop_streams()
+        await until(lambda: schwab.stream_logins == 2 and stream.connected)
+        assert len(closers()) == 1  # the first connection's closer is gone
+    await until(lambda: closers() == [])
+
+
+async def test_the_same_symbols_in_another_order_do_not_reconnect(schwab, client, signed_in):
+    async with running(schwab, client, signed_in) as (stream, _):
+        stream.set_symbols(("QQQ", "SPY"))
+        await asyncio.sleep(0.1)
+        assert stream.connected is True
+    assert schwab.stream_logins == 1
+
+
+async def test_a_failure_to_close_the_socket_is_logged(caplog):
+    class BrokenSocket:
+        async def close(self):
+            raise RuntimeError("socket is gone")
+
+    stream = SchwabStream(None, None, None, sink=Recorder(), clock=SystemClock(), symbols=("SPY",))
+    stream.set_symbols(("QQQ",))
+    with caplog.at_level("WARNING", logger="traider.schwab.stream"):
+        await stream._close_on_change(BrokenSocket())
+    assert "socket is gone" in caplog.text

@@ -35,6 +35,8 @@ flowchart LR
         control["Parameter Store<br/>control switch"]
         secrets["Secrets Manager<br/>app key, Schwab sign-in"]
         state[("DynamoDB<br/>lease, counters, audit log")]
+        research[("DynamoDB<br/>research picks<br/>(opt-in)")]
+        jobs["Fargate task, weekdays 08:00<br/>research run (opt-in)"]
         alerts["SNS<br/>alerts"]
         signin["HTTP API + Lambda<br/>Schwab sign-in"]
         watchdog["Lambda, daily<br/>sign-in expiry check"]
@@ -45,6 +47,11 @@ flowchart LR
     control --> engine
     secrets --> engine
     engine <--> state
+    research -- "read only" --> engine
+    schwab --> jobs
+    jobs -- "picks, posture" --> research
+    jobs <--> bedrock["Claude on Bedrock"]
+    finnhub[(Finnhub)] --> jobs
     engine --> alerts
     watchdog --> alerts
     alerts --> you
@@ -72,10 +79,10 @@ These are enforced in code and each has tests that fail if the rule stops workin
 | Kill switch | Set the control parameter to `halt` and the bot stops ordering and cancels its working orders, normally within 10 to 15 seconds; longer if Schwab or AWS is slow, and cancelling needs a working Schwab sign-in. `close_only` allows sells only. If the switch cannot be read for a minute, the bot halts itself. |
 | Small hard limits | Per-order, per-position and total exposure caps, a daily order count, a daily loss limit that stops new buys, a cooldown, and checks for wide spreads, stale or frozen quotes and halted securities. Defaults are deliberately small (500 / 1000 / 2000 dollars). |
 | Long only, cash only | It never shorts and, by default, never borrows: a buy must be covered by cash that no other order of the bot's has claimed, and not by money from a sale that has yet to settle (see [Settled cash](#settled-cash)). |
-| The broker is the truth | Positions are read from the broker before every order. The bot keeps no position book of its own to drift out of step. |
+| The broker is the truth | Positions are read from the broker before every order. The bot keeps no position book of its own to drift out of step. (With [research](#research-and-the-universe) on it also records which symbols it opened itself, never how many shares.) |
 | Never resend on doubt | If an order's fate is unknown (a timeout, a lost reply), the bot does not send it again. It looks the order up and waits for the position to show what happened. Only after a minute in which the broker shows no such order and the position has not moved does it treat the order as never placed. If things do not add up it freezes the symbol and alerts you. |
 | One bot at a time | A lease in DynamoDB lets exactly one instance trade or touch orders, and it is re-checked right before each order. Deploys stop the old task before starting the new one. |
-| Fail closed | No control value, no lease, no market hours, no fresh account data, no usable quote, no valid sign-in: no order. |
+| Fail closed | No control value, no lease, no market hours, no fresh account data, no usable quote, no valid sign-in: no order. With research on, also no research read yet or a stale one, no posture for today, no live pick, or an unreadable position ledger: no new position. |
 | A new day starts clean | What the strategy wanted yesterday is forgotten at midnight New York time. Nothing trades in the morning until the strategy has asked again. |
 | Exits are not capped | The limits that stop the bot taking risk (size caps, order count, loss halt, cooldown) do not stop it selling what it holds. A sell still needs an open market, a fresh quote, the lease and a valid sign-in, like any order. |
 
@@ -167,10 +174,10 @@ Other things to know:
 
 Verified, on the machine this was written on:
 
-- More than 850 automated tests for the bot pass. They run it against an in-process
+- More than 2,000 automated tests for the bot pass. They run it against an in-process
   fake of the Schwab API (sign-in, accounts, orders, quotes, price history, market
   hours, the streaming socket, and failures of each) and against a fake AWS.
-- More than 100 tests run the Pulumi program against provider mocks and check what it
+- More than 150 tests run the Pulumi program against provider mocks and check what it
   would create: network rules, IAM policies down to the exact resource, the schedule,
   where secrets go, and that the example configuration matches the real defaults.
 - Each safety rule was checked the other way round as well: the rule was broken on
@@ -193,6 +200,22 @@ Not verified. Treat each as something to watch on first contact:
   on, `traider check` reads a chain and one contract's quote and fails if the bot
   would refuse to trade on it. Paper
   trade options before anything else.
+- **Research has only run against fakes.** The research table, the position ledger and the
+  research rules were tested with in-memory stores, a fake DynamoDB (moto) and the fake
+  Schwab server. They have not met a real DynamoDB table or a real account.
+- **The pre-market research run has never called a real service.** It was tested end to
+  end against a fake Schwab, a fake Finnhub, a scripted model and moto. Not verified:
+  - tool use and forced tool choice through Bedrock's `bedrock-mantle` endpoint, the IAM
+    action names it needs, and which Claude model ids your account and region can use;
+  - whether Schwab's movers and quotes reflect pre-market trading at 08:00 New York time,
+    and what `securityStatus` reads then (anything but "Normal" counts as halted);
+  - whether Schwab hands out a second access token while the bot's is still valid;
+  - how much of the earnings calendar, company news and profiles Finnhub's free tier covers;
+  - the token prices in the settings;
+  - the Scheduler, ECS task and dead-letter queue behaviour on real AWS.
+
+  The first thing to run is `traider research run --kind premarket --dry-run`
+  ([runbook](docs/runbook.md#research-jobs)).
 - **`pulumi up` has never been run.** The mocks prove the program is self-consistent
   and uses argument names the providers accept. They do not prove AWS accepts every
   value. Expect to fix something small on the first `pulumi preview`.
@@ -220,7 +243,21 @@ uv run ruff check . && uv run mypy
 # CSV columns: timestamp (ISO 8601 with a timezone, or Unix seconds), open, high,
 # low, close, and optionally volume and symbol.
 TRAIDER_SYMBOLS=SPY uv run traider backtest --csv bars.csv --symbol SPY
+
+# Replay research too: one JSON Lines row per pick or posture, each with a "day".
+# Pick rows use the seed file's pick fields; a posture row is
+# {"day": "2026-10-06", "posture": "trade" | "reduced" | "stand_aside"}.
+# TRAIDER_RESEARCH_TABLE only lets the configuration load with no pinned symbols; the
+# replay reads the picks file and never reads that table.
+TRAIDER_RESEARCH_TABLE=backtest uv run traider backtest --csv bars.csv --picks picks.jsonl
 ```
+
+With `--picks`, each day's rows become a research run for that day, read through the same
+gate as live: only picked symbols open positions on a day, and the day's posture applies. A
+day with pick rows and no posture row is a `trade` day; a day with no rows at all has no
+posture, so nothing opens. Bars may be for pinned symbols or any symbol in the picks, and
+`--schwab-days` downloads both. Intraday picks last until that day's close; swing picks
+carry to later days as they do live.
 
 A backtest checks that a strategy and its limits behave the way you intended. It
 does not predict live results.
@@ -233,9 +270,11 @@ buildx, uv, and a Schwab brokerage account. The Schwab API is reported to need
 thinkorswim enabled on the account. The AWS CLI must point at the same account and
 region as the stack, or commands such as the kill switch will fail or miss.
 
-> **The bot treats the whole position in every configured symbol as its own.** If the
-> account already holds shares of a symbol you list, a live bot will sell them when
+> **The bot treats the whole position in every pinned symbol as its own.** If the
+> account already holds shares of a symbol you pin, a live bot will sell them when
 > the strategy says to hold none. Use an account, or symbols, that are the bot's alone.
+> With [research](#research-and-the-universe) on, any other holding is left alone, but
+> the account must still be the bot's: see the foreign-holdings rule there.
 
 **1. Create the stack.**
 
@@ -244,8 +283,8 @@ cd infra
 pulumi login                 # Pulumi Cloud; or `pulumi login --local`
 pulumi stack init dev
 pulumi config set aws:region us-east-1
-pulumi config set --path 'traider:symbols[0]' SPY
-pulumi config set --path 'traider:symbols[1]' QQQ
+pulumi config set --path 'traider:pinnedSymbols[0]' SPY
+pulumi config set --path 'traider:pinnedSymbols[1]' QQQ
 pulumi config set traider:alertEmail you@example.com
 # The placeholder strategy holds `position_usd` worth of each symbol (500 by default)
 # and buys whole shares, so a share priced above that means it buys nothing. To see
@@ -342,11 +381,171 @@ Stack settings live in `infra/Pulumi.<stack>.yaml` and are documented in
 `TRAIDER_*` environment variables the bot reads (`src/traider/config.py`), and
 validates them with the bot's own code during `pulumi preview`.
 
+**Settings are versioned.** The first time a deployed bot starts it copies the stack's
+settings into its settings table as version 1. From then on that table is the source:
+every change is a new numbered version, the running bot applies it within about 10
+seconds, and an alert lists what changed. `traider settings show | history | apply`
+reads and writes it (see the [runbook](docs/runbook.md#restarting-changing-settings-tearing-down)).
+Pinned symbols apply live: the bot watches a newly pinned symbol at once, its feed loads
+recent bars for it and subscribes, and the strategy starts hearing it after that warm-up.
+With research off, an unpinned symbol the bot still holds stays managed until it is sold or
+the bot next restarts (every morning on the schedule); sell it first or keep it pinned. With
+research on, the bot books what it holds on pinned symbols in its
+[position ledger](#research-and-the-universe), so an unpinned holding stays managed, across
+restarts, until it is flat. A few fields (strategy,
+its parameters, option-chain span, `allow_options`) wait for the next restart. Until the bot
+has read a valid version it opens no new positions; after that, an unreadable table or a
+bad version leaves the last good settings in force. With research off, a version with no
+pinned symbols is rejected, because the bot would have nothing to trade.
+
+`traider check`, `traider backtest` and `traider research show` use the `TRAIDER_*`
+environment values, not the settings table the live bot uses. For `research show` that
+means the research settings in `TRAIDER_RESEARCH` (the stack's `researchSettings`), so it
+can disagree with the bot after a `traider settings apply` that changed `research.min_score`
+or `research.accept_partial_runs`. With no pinned symbols, `traider check` reads price
+history (and the option chain, with `allow_options` on) for SPY and says so; with pinned
+symbols it uses the first one.
+
 To run the command line on your own machine against a deployed stack, use the
-`localEnv` output as in step 5. It leaves out the trading mode and the control
-switch on purpose, so nothing you run locally with it can send a live order. Do not
+`localEnv` output as in step 5. It leaves out the trading mode, the control
+switch and the state table on purpose, so nothing you run locally with it can send a live
+order, with research on or off. (With `traider:research: true` it also carries the research
+table's name, so `traider research seed` and `show` work; they never reach Schwab.) Do not
 run `traider run` locally while the deployed bot is running: Schwab allows one
 streaming connection per sign-in and the two would keep cutting each other off.
+
+## Research and the universe
+
+Instead of a fixed symbol list, the bot can trade what **research** picked. Research is
+a table of ranked picks and a "posture" for the day that something else writes each
+morning: the [pre-market research run](#the-pre-market-research-run), or you, by hand (see
+[below](#seeding-picks-by-hand)). It is **opt-in**: set `traider:research: true`
+on the stack, which creates the table and gives the bot read-only access to it. It is off by
+default because a bot with research on but nothing writing a posture would stand aside every
+day. With research off there is no table, no ledger and none of the rules below, and the
+bot trades its pinned symbols exactly as it always did.
+
+What the bot does with it:
+
+- **The universe.** The equity symbols the bot watches, in priority order: positions it
+  opened itself, symbols with an order working, the pinned symbols, then live picks by score,
+  up to `research.max_symbols` (25 at most). The set changes during the day; a symbol only
+  leaves once it is flat with nothing working, so an exit always has quotes. Each change is
+  a `universe_changed` event. New symbols get warm-up bars from price history before the
+  strategy hears them. A symbol whose history cannot be loaded, at start-up or later, is
+  retried on every poll and holds up no other symbol; until it loads, its live bars reach
+  the strategy without the warm-up.
+- **A live pick** comes from a run that finished `ok` (a `partial` run only with
+  `research.accept_partial_runs`), has not expired, and scores at least `research.min_score`.
+  When a symbol has several, the highest score counts. A swing pick stays live on later days
+  until it expires (`research.swing_lookback_days` days back); an intraday pick ends at the
+  close.
+- **Entries need a pick, on the right side.** A `long` pick allows shares or long calls; a
+  `bearish` pick allows long puts only. The bot never shorts. Without a live pick, an entry
+  is blocked (`no_pick`).
+- **The posture** is `trade`, `reduced` or `stand_aside`. `stand_aside` blocks every new
+  entry. `reduced` multiplies `max_order_usd` and `max_position_usd` by
+  `research.reduced_factor` (0.5 by default) for entries. **No posture for today means
+  stand aside**, and so does a day's posture the bot cannot read.
+- **Intraday and swing budgets.** `max_total_exposure_usd` is split by
+  `research.intraday_share` (0.5): intraday positions may use that share, swing the rest. An
+  entry that would overrun its share is blocked (`horizon_budget`).
+- **Intraday positions are flattened.** `research.intraday_flatten_min` (15) minutes before
+  the close the bot sells the intraday positions it opened, whatever the strategy says, and
+  opens no new intraday ones. It is an ordinary sell and needs what any sell needs.
+- **Pinned symbols need no pick.** They are exempt from `no_pick` and the side rule, but
+  not from the posture, the budgets or the intraday flatten. Their horizon is `swing`
+  unless a live pick says otherwise.
+- **Exits never depend on research.** Posture and picks only stop or shrink entries.
+
+**Fail closed.** If the research table cannot be read, the bot keeps its last view for
+`research.max_stale_s` (10 minutes by default). After that there are no live picks and the
+posture is stand aside: no new positions, and an alert (`research_stale`); exits still work.
+A kept view never carries into a new trading day, so yesterday's posture does not trade
+today. If the bot cannot work out what research says about one order (a bug), that order is
+treated as having no pick and a stand-aside posture, so only an entry is blocked.
+
+**The position ledger, and why the account must be the bot's alone.** Because the bot can
+now trade any symbol, it records which positions it opened itself in the state table
+(symbols and horizon, not share counts). The entry is written before the first buy; if the
+write fails, there is no order. It is removed when the broker shows the position flat. Only
+the instance holding the lease writes it, and an instance reloads it when it wins the lease.
+If it cannot be read, no new positions open and intraday positions are not flattened, and
+you get an alert. Any holding that is neither in the ledger nor pinned is a **foreign
+holding**: the bot records `unknown_holding`, alerts once, and never trades it, sells
+included. Holdings on pinned symbols are booked in the ledger at the next account read
+(as `swing`), even ones that were there before research was switched on, so they stay the
+bot's after they are unpinned, until they are flat. It cannot tell your shares from its own in a symbol it holds, so the ledger tracks
+symbols, not lots: shares you add by hand to a symbol the bot holds are managed, and
+flattened, as the bot's. Keep the bot's account to the bot.
+
+### The pre-market research run
+
+Every weekday at 08:00 New York time a separate Fargate task, started from the bot's own
+image, runs `traider research run --kind premarket`. It is **opt-in**: set
+`traider:researchJobs: true` (which needs `traider:research: true`). The schedule is
+created **disabled**; it fires only once you also set `traider:researchScheduleEnabled: true`,
+after the steps in the [runbook](docs/runbook.md#research-jobs) (key, model access, dry
+run). In order, the run:
+
+1. reads the market from Schwab (VIX, SPY, QQQ, IWM and the sector ETFs, the day's movers,
+   daily price history) and from Finnhub's free tier (the earnings calendar, company and
+   market news, company profiles);
+2. sets the day's **posture** with fixed code rules (VIX, SPY's gap, SPY against its 50-day
+   average, dates you list), then asks Claude for a second opinion that can only make it
+   stricter. On a `stand_aside` day it stops there: no picks, nothing forced;
+3. **screens** the candidates (movers, names that just reported earnings and your optional
+   watchlist) on price, liquidity, history and asset type, and scores them;
+4. has Claude on Amazon Bedrock **study the best few**, one name at a time, with read-only
+   tools and hard limits on calls, tokens, time and money;
+5. **checks every idea in code** (a fresh quote that is not halted, a sensible stop, liquid
+   puts for bearish ideas, an expiry that clears the next earnings date and stays inside
+   the earnings calendar's reach) and writes the ranked picks.
+
+The model only advises: it can make the posture stricter, never looser, and every pick
+passes code checks. Missing or stale data means standing aside. The run never places an
+order. **It is not financial advice**: it proposes picks for the strategy you choose.
+
+The bot reads the result as it reads any research. A run that hit a budget, ran out of
+time, lost the events vendor, could not reach the model (a failed posture review, or
+failed or timed-out model calls in half the deep-dives or more) or could not write its trail finishes
+as `partial`, and by default (`research.accept_partial_runs: false`) the bot ignores a
+partial run, posture included, so it stands aside that day. A run that fails writes no posture, so the bot
+stands aside too. Every run leaves a trail (what it saw, each conversation with the model,
+every decision) in a private S3 bucket for 400 days.
+
+How it runs is the `research_jobs` block of the versioned settings: change it with
+`traider settings apply` like anything else, and the next run uses it. The most useful
+fields:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `research_jobs.enabled` | true | false: no run, so no posture, so the bot stands aside |
+| `research_jobs.watchlist` | none | names you want looked at as well (up to 50) |
+| `research_jobs.posture.stand_aside_days` | none | dates to sit out, for example FOMC days |
+| `research_jobs.screen.deep_dive_count` | 12 | how many names Claude studies |
+| `research_jobs.dive.model` | `anthropic.claude-sonnet-5-5` | the model for the deep-dives (`posture_model` for the posture review) |
+| `research_jobs.rank.max_picks` | 10 | picks per run, at most 25 |
+| `research_jobs.budget.run_usd` / `day_usd` | 3.00 / 8.00 | Bedrock spend per run and per New York day |
+| `research_jobs.budget.prices` | Sonnet 5.5 at $2 / $10 per million tokens | what the budgets are counted in |
+
+Every model in use needs a price above zero in `budget.prices`; a model without one is
+never called. A dry run (`--dry-run`) is held to `run_usd` and to what is left of today's
+`day_usd`, but what it spends is not added to the day: dry runs are not counted in the
+day budget, only in their own run budget. **The default prices are unverified**: check them against AWS's Bedrock
+price list.
+
+It needs a Finnhub key and Bedrock model access first; the
+[runbook](docs/runbook.md#research-jobs) has the steps and what each alert means.
+
+### Seeding picks by hand
+
+Without the research run, or next to it on paper, you can write research yourself.
+`traider research seed FILE` writes a run of picks and a posture for today and
+`traider research show` prints what the bot would read. Both need the stack to have
+`traider:research: true` and the `localEnv` output loaded; the file format and the
+details are in the [runbook](docs/runbook.md#seeding-research-by-hand). To replay picks
+over history, use [`traider backtest --picks`](#try-it-without-any-accounts).
 
 ## Writing a strategy
 
@@ -374,6 +573,40 @@ class MyStrategy(Strategy):
 Register it in `src/traider/strategy/__init__.py`, set `traider:strategy` to its
 name, write tests for it, backtest it, then run it on paper. `on_quote` is also
 available for decisions that cannot wait for the end of a bar.
+
+With [research](#research-and-the-universe) on, the strategy also sees what research
+says, and hears when the set of symbols changes:
+
+```python
+class MyStrategy(Strategy):
+    def on_bar(self, bar: Bar, ctx: StrategyContext) -> Sequence[Target]:
+        pick = ctx.pick(bar.symbol)  # the live Pick for this symbol, or None
+        if pick is None:
+            return []
+        # pick.side ("long" or "bearish"), pick.horizon ("intraday" or "swing"),
+        # pick.score (0 to 100), pick.invalidation. ctx.posture is "trade", "reduced"
+        # or "stand_aside" (None when research is off); ctx.picks has every live pick
+        # by symbol.
+        return [Target(bar.symbol, quantity=10, reason="why")]
+
+    def on_universe(self, symbols: Sequence[str]) -> None:
+        super().on_universe(symbols)  # self.symbols is the current universe
+```
+
+`on_universe` is optional: the default keeps `self.symbols` current. Bars only arrive for
+symbols in the universe, so a strategy should create its per-symbol state when it first
+sees one, as `sma_cross` does, and may drop it when a symbol leaves. A strategy does not
+need to check picks or the posture: the engine's risk checks enforce them on every entry
+whatever the strategy asks for. Reading them is for choosing what to want.
+
+The placeholder `sma_cross` has a `require_pick` parameter (default `false`, set under
+`traider:strategyParams`). With it on, the strategy only wants a symbol while research has a
+live `long` pick for it, and it asks for 0 of a held symbol once that pick is gone or
+expired. **That includes a held symbol when research is off or stale**: `require_pick` makes
+a research outage, or a pick running out, into a sale at the next bar. That is the
+strategy's choice and not the engine's, which never blocks an exit and never forces one
+because of research. Leave `require_pick` off if you would rather keep positions through a
+gap in research.
 
 With [options](#options) switched on, a target may name a contract instead of a
 share symbol, and the quantity is then a number of contracts:
@@ -410,6 +643,11 @@ Rough monthly cost in us-east-1, before tax and free tiers:
 | Logs, DynamoDB, Lambda, API, alerts | under $0.50 | under $0.50 |
 | **About** | **$3.50** | **$12** |
 
+The [pre-market research run](#the-pre-market-research-run), when switched on, adds
+roughly $1-2 a weekday in Bedrock tokens with the default model (an estimate, not
+measured; capped at `research_jobs.budget.day_usd` a day), so roughly $20-45 a month, plus
+well under a dollar of Fargate and S3. Finnhub's free tier costs nothing.
+
 There is no NAT gateway (about $32 a month saved): the task has a public address and
 a security group with no inbound rules and outbound HTTPS only.
 
@@ -424,7 +662,10 @@ src/traider/            the bot
   schwab/               Schwab client: OAuth, tokens, REST, stream, parsing
   state/                lease, counters and audit log (DynamoDB or in memory)
   lambdas/              sign-in endpoint and expiry watchdog
-  cli.py                run | check | login | backtest
+  universe.py           which symbols the bot watches (pinned, held, picked)
+  research/             picks, posture, the research table, the bot's view of it, and
+                        the pre-market research run (run.py) and its parts
+  cli.py                run | check | login | backtest | settings | research
 tests/                  unit tests, the fake Schwab server, whole-bot tests
 infra/                  the Pulumi program (Python) and its tests
 docs/runbook.md         operating instructions
@@ -446,6 +687,9 @@ policies name exact actions and resources.
   hours. [Options](#options) are long single calls and puts only: no spreads, no
   covered calls, no selling to open.
 - One Schwab account per stack.
+- At most 25 equity symbols are watched at once (pinned symbols and research picks
+  together); the pinned list is not the whole list when [research](#research-and-the-universe)
+  is on.
 - Bars are one minute. Quotes arrive faster and reach `on_quote`.
 - The bot starts each weekday at 09:00 and stops at 16:30 New York time unless
   `alwaysOn` is set. On market holidays it starts, sees there is no session, and

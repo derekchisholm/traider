@@ -31,7 +31,11 @@ _PASS_THROUGH = {
     "accountHash": "TRAIDER_SCHWAB_ACCOUNT_HASH",
     "logLevel": "TRAIDER_LOG_LEVEL",
 }
-_JSON = {"strategyParams": "TRAIDER_STRATEGY_PARAMS", "risk": "TRAIDER_RISK"}
+_JSON = {
+    "strategyParams": "TRAIDER_STRATEGY_PARAMS",
+    "risk": "TRAIDER_RISK",
+    "researchSettings": "TRAIDER_RESEARCH",
+}
 _BOOL = {"cancelUnknownOrders": "TRAIDER_CANCEL_UNKNOWN_ORDERS"}
 
 
@@ -39,7 +43,10 @@ _BOOL = {"cancelUnknownOrders": "TRAIDER_CANCEL_UNKNOWN_ORDERS"}
 class Settings:
     prefix: str  # e.g. traider-dev: unique per stack
     trading_mode: str
-    symbols: tuple[str, ...]
+    symbols: tuple[str, ...]  # the pinned symbols; may be empty when research is on
+    research: bool
+    research_jobs: bool  # the scheduled research runs; needs research
+    research_schedule_enabled: bool  # the schedule fires; needs research_jobs
     bot_env: dict[str, str]  # everything the bot needs that is known before deploy
     alert_email: str | None
     callback_url: str | None  # override; None means "the hosted callback"
@@ -62,25 +69,73 @@ def _time(config: pulumi.Config, key: str, default: str) -> tuple[int, int]:
     return int(match[1]), int(match[2])
 
 
-def _symbols(config: pulumi.Config) -> tuple[str, ...]:
-    raw: Any = config.get_object("symbols")
-    if raw is None:
+def trail_bucket_name(prefix: str, account: str) -> str:
+    """The research trail bucket. It carries the account id because bucket names are global."""
+    return f"{prefix}-research-trail-{account}"
+
+
+def _check_trail_bucket_name(prefix: str) -> None:
+    """Fail at load, not halfway through a deploy, when the stack's prefix cannot make a
+    valid bucket name: 3 to 63 lowercase letters, digits, dots and hyphens, starting and
+    ending with a letter or digit. The account id is always 12 digits."""
+    name = trail_bucket_name(prefix, "0" * 12)
+    valid = re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]", name) and ".." not in name
+    if not (3 <= len(name) <= 63) or not valid:
         raise ValueError(
-            "traider:symbols is required, for example: pulumi config set "
-            "--path 'traider:symbols[0]' SPY"
+            "traider:researchJobs: the research trail bucket would be named "
+            f"{trail_bucket_name(prefix, '<account id>')!r}, which S3 does not allow. "
+            "Bucket names are 3 to 63 lowercase letters, digits, dots and hyphens, so the "
+            f"project and stack name ({prefix!r}) must be lowercase and at most "
+            f"{63 - len(trail_bucket_name('', '0' * 12))} characters"
         )
+
+
+def _symbols(config: pulumi.Config, *, research: bool) -> tuple[str, ...]:
+    """The pinned symbols. ``symbols`` is the older name for ``pinnedSymbols``."""
+    pinned: Any = config.get_object("pinnedSymbols")
+    alias: Any = config.get_object("symbols")
+    if pinned is not None and alias is not None:
+        raise ValueError(
+            "traider:pinnedSymbols and traider:symbols are the same setting: set only "
+            "traider:pinnedSymbols"
+        )
+    raw = pinned if pinned is not None else alias
     if isinstance(raw, str):
         raw = raw.split(",")
-    return tuple(str(item).strip().upper() for item in raw if str(item).strip())
+    symbols = tuple(str(item).strip().upper() for item in raw or () if str(item).strip())
+    if not symbols and not research:
+        raise ValueError(
+            "traider:pinnedSymbols (or traider:symbols) needs at least one symbol unless "
+            "traider:research is on, for example: pulumi config set "
+            "--path 'traider:pinnedSymbols[0]' SPY"
+        )
+    return symbols
 
 
 def load() -> Settings:
     config = pulumi.Config()
     prefix = f"{pulumi.get_project()}-{pulumi.get_stack()}"
-    symbols = _symbols(config)
+    research = bool(config.get_bool("research"))
+    research_jobs = bool(config.get_bool("researchJobs"))
+    if research_jobs and not research:
+        raise ValueError(
+            "traider:researchJobs needs traider:research: true: the research jobs write to "
+            "the research table, which only exists with research on"
+        )
+    if research_jobs:
+        _check_trail_bucket_name(prefix)
+    research_schedule_enabled = bool(config.get_bool("researchScheduleEnabled"))
+    if research_schedule_enabled and not research_jobs:
+        raise ValueError(
+            "traider:researchScheduleEnabled needs traider:researchJobs: true: there is no "
+            "research schedule to enable without the research jobs"
+        )
+    symbols = _symbols(config, research=research)
     mode = config.get("tradingMode") or "paper"
 
-    env: dict[str, str] = {"TRAIDER_TRADING_MODE": mode, "TRAIDER_SYMBOLS": ",".join(symbols)}
+    env: dict[str, str] = {"TRAIDER_TRADING_MODE": mode}
+    if symbols:  # with research on and nothing pinned, the variable is left out
+        env["TRAIDER_SYMBOLS"] = ",".join(symbols)
     for key, name in _PASS_THROUGH.items():
         value = config.get(key)
         if value is not None and value != "":
@@ -94,12 +149,14 @@ def load() -> Settings:
         if flag is not None:
             env[name] = "true" if flag else "false"
 
-    # Check it the way the bot will. The two placeholders stand in for resources
-    # this stack creates, which the bot requires in live mode.
+    # Check it the way the bot will. The placeholders stand in for resources this stack
+    # creates: the bot requires two in live mode, and the research table is what lets it
+    # run with no pinned symbols.
+    placeholders = {"TRAIDER_CONTROL_PARAM": "/placeholder", "TRAIDER_STATE_TABLE": "placeholder"}
+    if research:
+        placeholders["TRAIDER_RESEARCH_TABLE"] = "placeholder"
     try:
-        checked = Config.from_env(
-            {**env, "TRAIDER_CONTROL_PARAM": "/placeholder", "TRAIDER_STATE_TABLE": "placeholder"}
-        )
+        checked = Config.from_env({**env, **placeholders})
         create_strategy(checked.strategy, checked.symbols, checked.strategy_params)
     except (ConfigError, ValueError) as exc:
         raise ValueError(f"the bot would reject this configuration: {exc}") from None
@@ -124,6 +181,9 @@ def load() -> Settings:
         prefix=prefix,
         trading_mode=mode,
         symbols=symbols,
+        research=research,
+        research_jobs=research_jobs,
+        research_schedule_enabled=research_schedule_enabled,
         bot_env=env,
         alert_email=alert_email,
         callback_url=config.get("schwabCallbackUrl"),

@@ -424,3 +424,310 @@ def test_configuration_never_appears_in_the_startup_summary_with_secrets(world):
     summary = json.dumps(app.describe(world.config()))
     assert APP_SECRET not in summary
     assert APP_KEY not in summary
+
+
+SETTINGS_TABLE = "traider-test-settings"
+
+
+def create_settings_table() -> None:
+    boto3.client("dynamodb").create_table(
+        TableName=SETTINGS_TABLE,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+    )
+
+
+def settings_store():
+    from traider.settings_store import DynamoSettingsStore
+
+    return DynamoSettingsStore(boto3.resource("dynamodb").Table(SETTINGS_TABLE))
+
+
+async def test_bot_seeds_the_settings_table_and_starts_on_its_values(world, aws):
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    await world.start(config)
+    latest = await settings_store().latest()
+    assert latest is not None and latest.author == "bootstrap"
+    assert world.bot.settings == latest.settings
+    assert app.describe(config, world.bot.settings)["settings"] == SETTINGS_TABLE
+
+
+async def test_bot_starts_on_the_stored_settings_and_gives_the_same_ones_to_the_engine(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    stored = Settings.from_config(config)
+    stored = stored.model_copy(
+        update={"risk": stored.risk.model_copy(update={"max_order_usd": Decimal(250)})}
+    )
+    await settings_store().write(stored, expected_version=0, author="test", note="", now=START)
+    await world.start(config)
+    assert world.bot.settings == stored
+    assert world.bot.settings.risk.max_order_usd == Decimal(250)
+    # The engine is on the same stored values, not the environment's 500.
+    assert world.bot.engine.settings == stored
+
+
+async def test_strategy_feed_and_engine_are_built_from_the_stored_settings(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)  # the environment says SPY, fast 1/slow 2
+    stored = Settings.from_config(config).model_copy(
+        update={
+            "pinned_symbols": ("QQQ",),
+            "strategy_params": {"fast": 2, "slow": 3, "position_usd": 300},
+        }
+    )
+    await settings_store().write(stored, expected_version=0, author="test", note="", now=START)
+    await world.start(config)
+    bot = world.bot
+    assert bot.feed._symbols == ("QQQ",)
+    assert bot.strategy.symbols == ("QQQ",)
+    assert (bot.strategy.fast, bot.strategy.slow) == (2, 3)
+    assert bot.engine.settings.pinned_symbols == ("QQQ",)
+    assert bot.settings == stored
+
+
+async def test_bot_builds_and_starts_on_the_environment_when_the_settings_table_is_missing(
+    world, aws
+):
+    world.sign_in()
+    config = world.config(settings_table="no-such-table")
+    await world.start(config)
+    assert world.bot.settings.pinned_symbols == ("SPY",)
+    assert world.bot.engine.settings == world.bot.settings
+    assert world.bot.engine._live_settings is not None
+    assert world.bot.engine._live_settings.loaded is False
+    assert world.bot.settings_drift == []  # nothing loaded, so nothing to compare
+
+
+async def write_differing_version(config) -> None:
+    from traider.settings import Settings
+
+    stored = Settings.from_config(config)
+    stored = stored.model_copy(
+        update={
+            "risk": stored.risk.model_copy(update={"max_order_usd": Decimal(250)}),
+            "order_timeout_s": 45.0,
+        }
+    )
+    await settings_store().write(stored, expected_version=0, author="test", note="", now=START)
+
+
+async def test_drift_is_logged_and_added_to_the_live_start_alert(world, aws, caplog):
+    create_settings_table()
+    world.sign_in()
+    config = live_config(world, settings_table=SETTINGS_TABLE)
+    await write_differing_version(config)
+    with caplog.at_level("WARNING", logger="traider.app"):
+        await world.start(config)
+    assert world.bot.settings_drift == ["order_timeout_s", "risk.max_order_usd"]
+    warning = next(r.getMessage() for r in caplog.records if "differ" in r.getMessage())
+    assert "order_timeout_s, risk.max_order_usd" in warning
+    assert "250" not in warning and "45" not in warning  # keys only, no values
+
+    await until(lambda: any(key == "startup" for key, _, _ in world.bot.alerts.sent))
+    (_, _, body) = next(a for a in world.bot.alerts.sent if a[0] == "startup")
+    assert (
+        "Settings table differs from the stack's settings in: order_timeout_s, "
+        "risk.max_order_usd (the table is in force)"
+    ) in body
+    assert "250" not in body.split("differs", 1)[1] and "45" not in body.split("differs", 1)[1]
+    assert all(key != "settings_drift" for key, _, _ in world.bot.alerts.sent)
+
+
+async def test_paper_mode_gets_the_drift_in_the_log_only(world, aws, caplog):
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    await write_differing_version(config)
+    with caplog.at_level("WARNING", logger="traider.app"):
+        await world.start(config)
+    assert world.bot.settings_drift == ["order_timeout_s", "risk.max_order_usd"]
+    assert any("differ" in r.getMessage() for r in caplog.records)
+    await asyncio.sleep(0.1)
+    assert all(key not in ("startup", "settings_drift") for key, _, _ in world.bot.alerts.sent)
+
+
+async def test_a_table_that_matches_the_stack_has_no_drift(world, aws):
+    create_settings_table()
+    world.sign_in()
+    await world.start(world.config(settings_table=SETTINGS_TABLE))  # seeds from the stack
+    assert world.bot.settings_drift == []
+
+
+async def test_no_settings_table_means_no_drift_to_report(world, aws):
+    world.sign_in()
+    await world.start(world.config())
+    assert world.bot.settings_drift == []
+
+
+RESEARCH_TABLE = "traider-test-research"
+
+
+def create_research_table() -> None:
+    boto3.client("dynamodb").create_table(
+        TableName=RESEARCH_TABLE,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi1pk", "AttributeType": "S"},
+            {"AttributeName": "gsi1sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "gsi1",
+                "KeySchema": [
+                    {"AttributeName": "gsi1pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi1sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+
+
+async def seed_spy_pick(world, *, posture: bool = True) -> None:
+    """One ok run with a live SPY pick (and, unless told otherwise, a "trade" posture)."""
+    from datetime import date
+
+    from traider.research.models import Pick, Posture, RunMeta
+    from traider.research.store import DynamoResearchStore
+
+    create_research_table()
+    store = DynamoResearchStore(boto3.resource("dynamodb").Table(RESEARCH_TABLE))
+    now = world.clock.now()
+    await store.write_run(
+        RunMeta(
+            run_id="r1",
+            kind="manual",
+            status="ok",
+            started_at=now,
+            finished_at=now,
+            trading_day=date(2026, 10, 8),
+        ),
+        [
+            Pick.model_validate(
+                {
+                    "run_id": "r1",
+                    "rank": 1,
+                    "symbol": "SPY",
+                    "side": "long",
+                    "horizon": "intraday",
+                    "score": 90,
+                    "pre_score": 90,
+                    "thesis": "t",
+                    "invalidation": "1",
+                    "expires_at": (now + timedelta(hours=4)).isoformat(),
+                }
+            )
+        ],
+        Posture(level="trade", run_id="r1", at=now) if posture else None,
+    )
+
+
+async def test_bot_trades_a_researched_symbol_end_to_end(world, aws):
+    await seed_spy_pick(world)
+    world.sign_in()
+    config = world.config(symbols=(), research_table=RESEARCH_TABLE)
+    await world.start(config)
+    await world.ready()
+    assert world.bot.engine.universe == ("SPY",)
+    assert world.bot.feed._symbols == ("SPY",)
+    assert world.bot.strategy.symbols == ("SPY",)
+    for close in (100, 101, 102, 103):
+        await world.bar(close)
+
+    async def long():
+        return (await world.bot.broker.get_account()).position("SPY") > 0
+
+    await until(long, what="a buy of the researched symbol")
+
+
+async def test_a_pick_with_no_posture_today_is_watched_but_not_bought(world, aws):
+    await seed_spy_pick(world, posture=False)
+    world.sign_in()
+    await world.start(world.config(symbols=(), research_table=RESEARCH_TABLE))
+    await world.ready()
+    assert world.bot.engine.universe == ("SPY",)
+    for close in (100, 101, 102, 103):
+        await world.bar(close)
+    # The strategy has seen the bars and wants the position, and research has been read...
+    await until(lambda: world.bot.engine.target("SPY") is not None, what="strategy target")
+    polled = world.bot.engine._research_at
+    await until(lambda: world.bot.engine._research_at != polled, what="another research poll")
+    await asyncio.sleep(0.2)  # ...and many engine steps pass without a buy.
+    assert (await world.bot.broker.get_account()).positions == {}
+
+
+async def test_with_research_off_a_newly_pinned_symbol_reaches_the_feed(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    await world.start(config)
+    await world.ready()
+    assert world.bot.feed._symbols == ("SPY",)
+    current = await settings_store().latest()
+    pinned = current.settings.model_copy(update={"pinned_symbols": ("SPY", "QQQ")})
+    assert isinstance(pinned, Settings)
+    await settings_store().write(
+        pinned, expected_version=current.version, author="test", note="", now=START
+    )
+    await until(lambda: "QQQ" in world.bot.feed._symbols, what="the feed following the pin")
+    assert world.bot.engine.universe == ("SPY", "QQQ")
+
+
+async def test_the_live_start_alert_lists_the_universe(world, aws):
+    world.sign_in()
+    await world.start(live_config(world))
+    await until(lambda: any(key == "startup" for key, _, _ in world.bot.alerts.sent))
+    (_, _, body) = next(a for a in world.bot.alerts.sent if a[0] == "startup")
+    assert "Symbols: SPY\n" in body
+
+
+async def test_the_live_start_alert_says_research_chooses_when_nothing_is_pinned(world, aws):
+    create_research_table()
+    world.sign_in()
+    await world.start(live_config(world, symbols=(), research_table=RESEARCH_TABLE))
+    await until(lambda: any(key == "startup" for key, _, _ in world.bot.alerts.sent))
+    (_, _, body) = next(a for a in world.bot.alerts.sent if a[0] == "startup")
+    assert "Symbols: chosen by research\n" in body
+
+
+def test_the_startup_summary_says_whether_research_is_on(world):
+    assert app.describe(world.config())["research"] == "off"
+    on = world.config(symbols=(), research_table=RESEARCH_TABLE)
+    assert app.describe(on)["research"] == RESEARCH_TABLE
+
+
+async def test_a_stored_version_with_no_pinned_symbols_is_rejected_when_research_is_off(world, aws):
+    from traider.settings import Settings
+
+    create_settings_table()
+    world.sign_in()
+    config = world.config(settings_table=SETTINGS_TABLE)
+    empty = Settings.from_config(config).model_copy(update={"pinned_symbols": ()})
+    await settings_store().write(empty, expected_version=0, author="test", note="", now=START)
+    await world.start(config)
+    assert world.bot.settings.pinned_symbols == ("SPY",)
+    assert world.bot.engine._live_settings.loaded is False

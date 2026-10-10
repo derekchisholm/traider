@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 from conftest import ACCOUNT, REGION, deploy
-from traider.config import Config
+from traider.config import Config, ResearchSettings
 from traider.strategy import create_strategy
 
 SERVICE = "aws:ecs/service:Service"
@@ -292,7 +293,7 @@ def test_bot_is_wired_to_the_resources_this_stack_creates(paper):
     env = environment(paper)
     assert env["TRAIDER_SYMBOLS"] == "SPY,QQQ"
     assert env["TRAIDER_CONTROL_PARAM"] == "/traider-dev/control"
-    assert env["TRAIDER_STATE_TABLE"] == paper.one("aws:dynamodb/table:Table").inputs["name"]
+    assert env["TRAIDER_STATE_TABLE"] == paper.one(TABLE, "state").inputs["name"]
     assert env["TRAIDER_SCHWAB_APP_SECRET_ID"].startswith("arn:aws:secretsmanager:")
     assert env["TRAIDER_SCHWAB_TOKEN_SECRET_ID"].startswith("arn:aws:secretsmanager:")
     assert env["TRAIDER_SCHWAB_APP_SECRET_ID"] != env["TRAIDER_SCHWAB_TOKEN_SECRET_ID"]
@@ -412,15 +413,15 @@ def test_secret_containers_are_created_but_never_their_values(paper):
 
 
 def test_state_table_is_on_demand_with_point_in_time_recovery(paper):
-    table = paper.one("aws:dynamodb/table:Table").inputs
+    table = paper.one(TABLE, "state").inputs
     assert table["billingMode"] == "PAY_PER_REQUEST"
     assert (table["hashKey"], table["rangeKey"]) == ("pk", "sk")
     assert table["pointInTimeRecovery"] == {"enabled": True}
 
 
 def test_live_state_table_is_protected_from_deletion(live, paper):
-    assert live.one("aws:dynamodb/table:Table").inputs["deletionProtectionEnabled"] is True
-    assert not paper.one("aws:dynamodb/table:Table").inputs.get("deletionProtectionEnabled")
+    assert live.one(TABLE, "state").inputs["deletionProtectionEnabled"] is True
+    assert not paper.one(TABLE, "state").inputs.get("deletionProtectionEnabled")
 
 
 def test_alert_email_is_subscribed_when_given(paper):
@@ -460,7 +461,8 @@ def test_each_bot_permission_names_exactly_the_resource_it_is_for(paper):
         ],
         "SaveRotatedRefreshToken": paper.one(SECRET, "schwab-token").arn,
         "ReadControlSwitch": paper.one(PARAMETER, "control").arn,
-        "State": paper.one(TABLE).arn,
+        "State": paper.one(TABLE, "state").arn,
+        "Settings": paper.one(TABLE, "settings").arn,
         "Alerts": paper.one(TOPIC).arn,
     }
 
@@ -858,7 +860,7 @@ def example_config(*, everything: bool) -> dict[str, Any]:
 
 
 def test_example_configuration_deploys_as_it_is():
-    assert set(example_config(everything=False)) == {"symbols"}
+    assert set(example_config(everything=False)) == {"pinnedSymbols"}
     assert deploy(example_config(everything=False)).of(SERVICE)
 
 
@@ -873,7 +875,7 @@ def test_example_configuration_deploys_with_every_setting_switched_on():
 def test_example_configuration_shows_the_real_defaults():
     config = example_config(everything=True)
     spelled_out = deploy({k: v for k, v in config.items() if k not in NOT_DEFAULTS})
-    minimal = deploy({"symbols": config["symbols"]})
+    minimal = deploy({"pinnedSymbols": config["pinnedSymbols"]})
     # The bot ends up with the same settings whether or not they are written down ...
     written, unwritten = (Config.from_env(environment(d)) for d in (spelled_out, minimal))
     assert written.model_copy(update={"strategy_params": {}}) == unwritten
@@ -901,7 +903,8 @@ DOCS = [
 def test_every_stack_output_the_docs_tell_you_to_read_exists(doc, paper):
     named = set(re.findall(r"pulumi stack output (\w+)", doc.read_text(encoding="utf-8")))
     assert named, "the docs should use at least one stack output"
-    assert named <= set(paper.outputs)
+    researched = deploy({"research": True, "researchJobs": True, "pinnedSymbols": []})
+    assert named <= set(paper.outputs) | set(researched.outputs)
 
 
 @pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
@@ -915,3 +918,156 @@ def test_resource_names_the_docs_spell_out_match_what_the_stack_creates(paper):
     # The README shows the kill switch command with the parameter's name written out.
     readme = DOCS[0].read_text(encoding="utf-8")
     assert f"--name {paper.outputs['controlParameter']} --value halt --overwrite" in readme
+
+
+# --- versioned settings ---------------------------------------------------------------
+
+
+def test_settings_table_is_on_demand_with_point_in_time_recovery(paper):
+    table = paper.one(TABLE, "settings").inputs
+    assert table["name"] == "traider-dev-settings"
+    assert table["billingMode"] == "PAY_PER_REQUEST"
+    assert (table["hashKey"], table["rangeKey"]) == ("pk", "sk")
+    assert table["pointInTimeRecovery"] == {"enabled": True}
+
+
+def test_live_settings_table_is_protected_from_deletion(live, paper):
+    assert live.one(TABLE, "settings").inputs["deletionProtectionEnabled"] is True
+    assert not paper.one(TABLE, "settings").inputs.get("deletionProtectionEnabled")
+
+
+def test_bot_is_told_where_its_settings_live(paper):
+    assert (
+        environment(paper)["TRAIDER_SETTINGS_TABLE"] == paper.one(TABLE, "settings").inputs["name"]
+    )
+    assert paper.outputs["settingsTable"] == paper.one(TABLE, "settings").inputs["name"]
+
+
+def test_bot_can_read_and_add_settings_versions_but_not_delete_or_rewrite_them(paper):
+    (statement,) = [s for s in paper.policy("bot-task") if s["Sid"] == "Settings"]
+    assert set(statement["Action"]) == {"dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"}
+
+
+def test_local_env_lets_the_cli_edit_settings(paper):
+    assert local_env(paper)["TRAIDER_SETTINGS_TABLE"] == paper.one(TABLE, "settings").inputs["name"]
+
+
+# --- the opt-in research table ------------------------------------------------------------
+
+
+def test_research_is_off_by_default(paper):
+    assert [t for t in paper.of(TABLE) if t.name == "research"] == []
+    assert "TRAIDER_RESEARCH_TABLE" not in environment(paper)
+    assert "Research" not in {s["Sid"] for s in paper.policy("bot-task")}
+    assert "researchTable" not in paper.outputs
+    assert "TRAIDER_RESEARCH_TABLE" not in local_env(paper)
+
+
+def test_research_on_creates_an_indexed_table_the_bot_can_only_read():
+    on = deploy({"research": True, "pinnedSymbols": []})
+    table = on.one(TABLE, "research").inputs
+    assert table["name"] == "traider-dev-research"
+    assert (table["hashKey"], table["rangeKey"]) == ("pk", "sk")
+    (index,) = table["globalSecondaryIndexes"]
+    assert (index["name"], index["hashKey"], index["rangeKey"]) == ("gsi1", "gsi1pk", "gsi1sk")
+    assert index["projectionType"] == "ALL"
+    assert environment(on)["TRAIDER_RESEARCH_TABLE"] == table["name"]
+    (statement,) = [s for s in on.policy("bot-task") if s["Sid"] == "Research"]
+    assert set(statement["Action"]) == {"dynamodb:Query", "dynamodb:GetItem"}
+    assert statement["Resource"] == on.one(TABLE, "research").arn  # the table, not its index
+    assert on.outputs["researchTable"] == table["name"]
+
+
+def test_the_research_table_has_point_in_time_recovery_and_live_deletion_protection():
+    paper_on = deploy({"research": True})
+    live_on = deploy(
+        {
+            "research": True,
+            "tradingMode": "live",
+            "accountLast4": "5678",
+            "alertEmail": "ops@example.test",
+        },
+        stack="prod",
+    )
+    assert paper_on.one(TABLE, "research").inputs["pointInTimeRecovery"] == {"enabled": True}
+    assert live_on.one(TABLE, "research").inputs["deletionProtectionEnabled"] is True
+    assert not paper_on.one(TABLE, "research").inputs.get("deletionProtectionEnabled")
+
+
+def test_local_env_lets_the_cli_seed_and_show_research():
+    on = deploy({"research": True})
+    assert local_env(on)["TRAIDER_RESEARCH_TABLE"] == on.one(TABLE, "research").inputs["name"]
+
+
+def test_a_live_stack_with_research_on_still_keeps_live_trading_out_of_local_env():
+    live_on = deploy(
+        {
+            "research": True,
+            "tradingMode": "live",
+            "accountLast4": "5678",
+            "alertEmail": "ops@example.test",
+        }
+    )
+    lines = local_env(live_on)
+    assert lines["TRAIDER_RESEARCH_TABLE"] == live_on.one(TABLE, "research").inputs["name"]
+    assert "TRAIDER_TRADING_MODE" not in lines
+    assert "TRAIDER_CONTROL_PARAM" not in lines
+    assert "TRAIDER_STATE_TABLE" not in lines
+    assert Config.from_env(lines).trading_mode == "paper"
+
+
+def test_research_with_no_pinned_symbols_is_a_configuration_the_bot_accepts():
+    on = deploy({"research": True, "pinnedSymbols": []})
+    for env in (environment(on), local_env(on)):
+        checked = Config.from_env(env)
+        assert checked.symbols == ()
+        assert checked.research_table == on.one(TABLE, "research").inputs["name"]
+
+
+def test_research_with_pinned_symbols_keeps_them():
+    on = deploy({"research": True, "pinnedSymbols": ["spy"]})
+    assert Config.from_env(environment(on)).symbols == ("SPY",)
+
+
+def test_without_research_a_pinned_symbol_is_required():
+    with pytest.raises(Exception, match="symbol"):
+        deploy({"pinnedSymbols": []})
+    with pytest.raises(Exception, match="symbol"):
+        deploy({"pinnedSymbols": None})
+
+
+def test_pinned_symbols_and_symbols_cannot_both_be_set():
+    with pytest.raises(Exception, match="pinnedSymbols"):
+        deploy({"pinnedSymbols": ["SPY"], "symbols": ["QQQ"]})
+
+
+def test_pinned_symbols_is_the_same_setting_as_symbols():
+    pinned = deploy({"pinnedSymbols": ["SPY", "QQQ"]})
+    assert environment(pinned)["TRAIDER_SYMBOLS"] == "SPY,QQQ"
+
+
+def test_research_settings_reach_the_bot_as_json():
+    on = deploy({"research": True, "researchSettings": {"min_score": 75}})
+    assert json.loads(environment(on)["TRAIDER_RESEARCH"]) == {"min_score": 75}
+    assert Config.from_env(environment(on)).research.min_score == 75
+
+
+def test_a_bad_research_setting_fails_the_preview():
+    with pytest.raises(Exception, match="min_score"):
+        deploy({"research": True, "researchSettings": {"min_score": 500}})
+    with pytest.raises(Exception, match="research"):
+        deploy({"research": True, "researchSettings": {"nope": 1}})
+
+
+def test_research_settings_are_not_sent_when_none_are_given():
+    assert "TRAIDER_RESEARCH" not in environment(deploy({"research": True}))
+
+
+def test_example_configuration_shows_research_off_and_the_real_research_defaults():
+    config = example_config(everything=True)
+    assert config["research"] is False
+    defaults = {
+        name: float(value) if isinstance(value, Decimal) else value
+        for name, value in ResearchSettings().model_dump().items()
+    }
+    assert config["researchSettings"] == defaults

@@ -18,7 +18,7 @@ import os
 import signal
 import socket
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -35,6 +35,8 @@ from traider.control import ControlSource, ControlState, SsmControl, StaticContr
 from traider.engine import Engine
 from traider.feed import Feed
 from traider.marketdata import MarketData
+from traider.research.source import ResearchSource
+from traider.research.store import DynamoResearchStore
 from traider.risk import RiskManager
 from traider.schwab.client import API_BASE, SchwabClient
 from traider.schwab.hours import SchwabSessionProvider
@@ -51,6 +53,8 @@ from traider.schwab.tokens import (
     TokenStore,
 )
 from traider.session import SessionTracker
+from traider.settings import Settings, settings_diff
+from traider.settings_store import DynamoSettingsStore, LiveSettings
 from traider.state.base import StateStore
 from traider.state.dynamo import DynamoStateStore
 from traider.state.memory import MemoryStateStore
@@ -103,23 +107,26 @@ def credentials(config: Config, aws: Aws) -> CredentialsProvider:
     return StaticCredentials(None)
 
 
-def describe(config: Config) -> dict[str, Any]:
+def describe(config: Config, settings: Settings | None = None) -> dict[str, Any]:
     """What the bot is set up to do, safe to log: no keys, no secrets, no sign-in link."""
+    s = settings if settings is not None else Settings.from_config(config)
     return {
         "trading_mode": config.trading_mode,
-        "symbols": list(config.symbols),
-        "strategy": config.strategy,
-        "strategy_params": config.strategy_params,
-        "order_type": config.order_type,
-        "limit_offset_bps": str(config.limit_offset_bps),
-        "order_timeout_s": config.order_timeout_s,
-        "flatten_before_close_min": config.flatten_before_close_min,
-        "cancel_unknown_orders": config.cancel_unknown_orders,
+        "symbols": list(s.pinned_symbols),
+        "strategy": s.strategy,
+        "strategy_params": s.strategy_params,
+        "order_type": s.order_type,
+        "limit_offset_bps": str(s.limit_offset_bps),
+        "order_timeout_s": s.order_timeout_s,
+        "flatten_before_close_min": s.flatten_before_close_min,
+        "cancel_unknown_orders": s.cancel_unknown_orders,
         "feed": config.feed,
         "account": f"...{config.account_last4}" if config.account_last4 else "by hash or only one",
-        "risk": {name: str(value) for name, value in config.risk.model_dump().items()},
+        "risk": {name: str(value) for name, value in s.risk.model_dump().items()},
         "control": config.control_param or f"static:{config.control}",
         "state": config.state_table or "memory",
+        "settings": config.settings_table or "environment",
+        "research": config.research_table or "off",
         "alerts": "sns" if config.alert_topic_arn else "log only",
         "token_store": (
             "secrets manager"
@@ -134,6 +141,7 @@ def describe(config: Config) -> dict[str, Any]:
 @dataclass(slots=True)
 class Bot:
     config: Config
+    settings: Settings
     clock: Clock
     tokens: TokenManager
     client: SchwabClient
@@ -146,6 +154,9 @@ class Bot:
     engine: Engine
     feed: Feed
     sleep: Sleep
+    #: Settings (dotted names, no values) where the stack's environment and the loaded
+    #: settings table disagree. The table wins; this only exists to say so.
+    settings_drift: list[str] = field(default_factory=list)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run until ``stop`` is set. Raises if a background task dies on its own."""
@@ -174,18 +185,31 @@ class Bot:
         if crashed:
             raise RuntimeError(f"background task stopped: {', '.join(crashed)}")
 
+    def _symbols_line(self) -> str:
+        """The symbols the bot trades at start, or who chooses them."""
+        universe = self.engine.universe
+        if universe:
+            return ", ".join(universe)
+        if self.config.research_table:
+            return "chosen by research"
+        return "none"
+
     async def _announce(self) -> None:
-        summary = describe(self.config)
+        summary = describe(self.config, self.settings)
         log.info("starting: %s", summary)
         if self.config.trading_mode == "live":
-            await self.alerts.send(
-                "startup",
-                "traider started in LIVE mode",
+            body = (
                 "Real orders go out once the control switch is set to live.\n"
-                f"Symbols: {', '.join(self.config.symbols)}\n"
-                f"Strategy: {self.config.strategy} {self.config.strategy_params}\n"
-                f"Limits: {summary['risk']}",
+                f"Symbols: {self._symbols_line()}\n"
+                f"Strategy: {self.settings.strategy} {self.settings.strategy_params}\n"
+                f"Limits: {summary['risk']}"
             )
+            if self.settings_drift:
+                body += (
+                    "\nSettings table differs from the stack's settings in: "
+                    f"{', '.join(self.settings_drift)} (the table is in force)"
+                )
+            await self.alerts.send("startup", "traider started in LIVE mode", body)
 
     async def _watch_auth(self) -> None:
         """Keep the access token warm and report changes in the sign-in state."""
@@ -254,7 +278,26 @@ async def build_bot(
     client = SchwabClient(http, tokens, base_url=schwab_base_url)
     market = MarketData()
     session = SessionTracker(SchwabSessionProvider(client))
-    strategy = create_strategy(config.strategy, config.symbols, config.strategy_params)
+    settings = Settings.from_config(config)
+    live_settings: LiveSettings | None = None
+    drift: list[str] = []
+    if config.settings_table:
+        live_settings = LiveSettings(
+            DynamoSettingsStore(aws.table(config.settings_table)),
+            settings,
+            require_pinned=config.research_table is None,
+        )
+        for update in await live_settings.start(clock.now()):
+            log.warning("settings at start-up: %s %s", update.kind, update.detail)
+        if live_settings.loaded:
+            drift = list(settings_diff(settings, live_settings.current))
+            if drift:
+                log.warning(
+                    "stack settings differ from the settings table in: %s (the table wins)",
+                    ", ".join(drift),
+                )
+        settings = live_settings.current
+    strategy = create_strategy(settings.strategy, settings.pinned_symbols, settings.strategy_params)
 
     state: StateStore
     if config.state_table:
@@ -284,20 +327,6 @@ async def build_bot(
         await paper.load()
         broker = paper
 
-    engine = Engine(
-        config=config,
-        clock=clock,
-        market=market,
-        strategy=strategy,
-        risk=RiskManager(config.risk),
-        broker=broker,
-        state=state,
-        control=ControlState(source),
-        session=session,
-        alerts=alerts,
-        instance_id=f"{socket.gethostname()}-{os.getpid()}",
-        auth_seconds_left=tokens.seconds_left,
-    )
     feed = Feed(
         config=config,
         http=http,
@@ -306,10 +335,40 @@ async def build_bot(
         market=market,
         clock=clock,
         session=session,
+        settings=settings,
         sleep=sleep,
+    )
+    research: ResearchSource | None = None
+    if config.research_table:
+        # Read through the variables, not their values now: the settings can be replaced
+        # while the bot runs, and the source must see the current research settings.
+        research = ResearchSource(
+            DynamoResearchStore(aws.table(config.research_table)),
+            lambda: (live_settings.current if live_settings else settings).research,
+        )
+        # One read before the engine exists. If it fails, the source fails closed (no picks)
+        # and the engine's first step tries again and reports.
+        await research.refresh(clock.now())
+    engine = Engine(
+        config=config,
+        clock=clock,
+        market=market,
+        strategy=strategy,
+        risk=RiskManager(settings.risk),
+        broker=broker,
+        state=state,
+        control=ControlState(source),
+        session=session,
+        alerts=alerts,
+        instance_id=f"{socket.gethostname()}-{os.getpid()}",
+        auth_seconds_left=tokens.seconds_left,
+        settings=live_settings,
+        on_universe=feed.set_symbols,
+        research=research,
     )
     return Bot(
         config=config,
+        settings=settings,
         clock=clock,
         tokens=tokens,
         client=client,
@@ -322,6 +381,7 @@ async def build_bot(
         engine=engine,
         feed=feed,
         sleep=sleep,
+        settings_drift=drift,
     )
 
 

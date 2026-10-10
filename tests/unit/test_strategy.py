@@ -1,8 +1,10 @@
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 
 from tests.unit.helpers import T0, make_bar, make_quote
+from traider.research.models import Pick
 from traider.strategy import available_strategies, create_strategy
 from traider.strategy.base import StrategyContext
 from traider.strategy.sma_cross import SmaCross
@@ -120,3 +122,83 @@ def test_unknown_strategy_name_lists_what_is_available():
     with pytest.raises(ValueError, match="sma_cross"):
         create_strategy("nope", ["SPY"], {})
     assert "sma_cross" in available_strategies()
+
+
+def long_pick(symbol: str, *, side: str = "long", expires_in=timedelta(hours=5)) -> Pick:
+    return Pick.model_validate(
+        {
+            "run_id": "r1",
+            "rank": 1,
+            "symbol": symbol,
+            "side": side,
+            "horizon": "intraday",
+            "score": 80,
+            "pre_score": 80,
+            "thesis": "t",
+            "invalidation": "1",
+            "expires_at": (T0 + expires_in).isoformat(),
+        }
+    )
+
+
+def rising(strategy, symbol, ctx, n=3):
+    out = []
+    for i in range(n):
+        out = list(strategy.on_bar(make_bar(symbol, close=str(100 + i), minute=i), ctx))
+    return out
+
+
+def test_a_symbol_added_to_the_universe_gets_its_own_history():
+    strategy = SmaCross(("SPY",), {"fast": 1, "slow": 2})
+    ctx = StrategyContext(now=T0, positions={})
+    assert rising(strategy, "NVDA", ctx) == []  # not in the universe yet
+    strategy.on_universe(("SPY", "NVDA"))
+    assert rising(strategy, "NVDA", ctx)[0].symbol == "NVDA"
+
+
+def test_require_pick_enters_only_with_a_live_long_pick():
+    strategy = SmaCross(("NVDA",), {"fast": 1, "slow": 2, "require_pick": True})
+    without = StrategyContext(now=T0, positions={})
+    assert rising(strategy, "NVDA", without) == []
+    with_pick = StrategyContext(now=T0, positions={}, picks={"NVDA": long_pick("NVDA")})
+    assert rising(strategy, "NVDA", with_pick)[0].quantity > 0
+
+
+def test_require_pick_sells_a_held_symbol_whose_pick_is_gone():
+    strategy = SmaCross(("NVDA",), {"fast": 1, "slow": 2, "require_pick": True})
+    held = StrategyContext(now=T0, positions={"NVDA": 5})
+    targets = rising(strategy, "NVDA", held)
+    assert [(t.symbol, t.quantity) for t in targets] == [("NVDA", 0)]
+
+
+def test_require_pick_ignores_a_bearish_or_expired_pick():
+    strategy = SmaCross(("NVDA",), {"fast": 1, "slow": 2, "require_pick": True})
+    bearish = StrategyContext(
+        now=T0, positions={}, picks={"NVDA": long_pick("NVDA", side="bearish")}
+    )
+    expired = StrategyContext(
+        now=T0, positions={}, picks={"NVDA": long_pick("NVDA", expires_in=-timedelta(minutes=1))}
+    )
+    assert rising(strategy, "NVDA", bearish) == []
+    assert rising(strategy, "NVDA", expired) == []
+
+
+def test_require_pick_sells_a_held_symbol_whose_pick_has_expired():
+    strategy = SmaCross(("NVDA",), {"fast": 1, "slow": 2, "require_pick": True})
+    held = StrategyContext(
+        now=T0,
+        positions={"NVDA": 5},
+        picks={"NVDA": long_pick("NVDA", expires_in=-timedelta(minutes=1))},
+    )
+    targets = rising(strategy, "NVDA", held)
+    assert [(t.symbol, t.quantity) for t in targets] == [("NVDA", 0)]
+
+
+def test_a_symbol_that_leaves_and_returns_starts_its_history_again():
+    strategy = SmaCross(("SPY", "NVDA"), {"fast": 1, "slow": 2})
+    ctx = StrategyContext(now=T0, positions={})
+    rising(strategy, "NVDA", ctx)
+    strategy.on_universe(("SPY",))
+    strategy.on_universe(("SPY", "NVDA"))
+    # One bar after the return is not enough: the old closes must not count.
+    assert list(strategy.on_bar(make_bar("NVDA", close="110", minute=5), ctx)) == []

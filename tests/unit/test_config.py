@@ -2,8 +2,9 @@ import json
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
-from traider.config import Config, ConfigError
+from traider.config import Config, ConfigError, ResearchSettings
 
 BASE = {"TRAIDER_SYMBOLS": "spy, qqq"}
 LIVE = {
@@ -115,3 +116,85 @@ def test_blank_optional_values_are_treated_as_unset():
     )
     assert cfg.state_table is None
     assert cfg.flatten_before_close_min is None
+
+
+def test_settings_table_is_read_from_the_environment():
+    cfg = Config.from_env({**BASE, "TRAIDER_SETTINGS_TABLE": "traider-dev-settings"})
+    assert cfg.settings_table == "traider-dev-settings"
+
+
+def test_research_table_makes_symbols_optional():
+    cfg = Config.from_env({"TRAIDER_RESEARCH_TABLE": "traider-dev-research"})
+    assert cfg.symbols == ()
+    assert cfg.research_table == "traider-dev-research"
+
+
+def test_without_research_symbols_are_still_required():
+    with pytest.raises(ConfigError, match="TRAIDER_SYMBOLS"):
+        Config.from_env({})
+    with pytest.raises(ValidationError, match="at least one symbol"):
+        Config(symbols=())
+
+
+def test_research_settings_come_from_json():
+    cfg = Config.from_env({**BASE, "TRAIDER_RESEARCH": '{"min_score": 75, "intraday_share": 0.3}'})
+    assert cfg.research.min_score == 75
+    assert str(cfg.research.intraday_share) == "0.3"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        '{"max_symbols": 26}',
+        '{"intraday_share": 1.5}',
+        '{"reduced_factor": 0}',
+        '{"reduced_factor": 1.5}',
+        '{"intraday_share": -0.1}',
+        '{"max_stale_s": 59}',
+        '{"max_stale_s": 3601}',
+        '{"x": 1}',
+    ],
+)
+def test_bad_research_settings_are_rejected(bad):
+    with pytest.raises(ConfigError):
+        Config.from_env({**BASE, "TRAIDER_RESEARCH": bad})
+
+
+def test_research_settings_defaults_match_the_brief():
+    s = ResearchSettings()
+    assert s.poll_s == 60.0
+    assert s.max_stale_s == 600.0
+    assert s.min_score == 60
+    assert s.max_symbols == 25
+    assert s.accept_partial_runs is False
+    assert s.intraday_share == Decimal("0.5")
+    assert s.reduced_factor == Decimal("0.5")
+    assert s.intraday_flatten_min == 15
+    assert s.swing_lookback_days == 10
+
+
+def test_research_job_locations_come_from_the_environment():
+    cfg = Config.from_env(
+        {
+            **BASE,
+            "TRAIDER_RESEARCH_BUCKET": "traider-dev-research-trail",
+            "TRAIDER_FINNHUB_SECRET_ID": "arn:aws:secretsmanager:us-east-1:1:secret:finnhub",
+            "TRAIDER_FINNHUB_API_KEY": "fh-local-key-0123456789",
+        }
+    )
+    assert cfg.research_bucket == "traider-dev-research-trail"
+    assert cfg.finnhub_secret_id == "arn:aws:secretsmanager:us-east-1:1:secret:finnhub"
+    assert cfg.finnhub_api_key == "fh-local-key-0123456789"
+
+
+def test_keys_never_show_in_a_printed_config():
+    from traider.app import describe
+
+    cfg = Config(
+        symbols=("SPY",),
+        finnhub_api_key="fh-local-key-0123456789",
+        schwab_app_secret="schwab-secret-0123456789",
+    )
+    for text in (repr(cfg), str(cfg), json.dumps(describe(cfg))):
+        assert "fh-local-key-0123456789" not in text
+        assert "schwab-secret-0123456789" not in text

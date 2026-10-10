@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pulumi
 import pulumi_aws as aws
@@ -15,7 +16,7 @@ from network import Network
 from settings import Settings
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ECS_TRUST = json.dumps(
+ECS_TRUST = json.dumps(
     {
         "Version": "2012-10-17",
         "Statement": [
@@ -35,6 +36,8 @@ class Bot:
     service_name: pulumi.Output[str]
     log_group: pulumi.Output[str]
     image: pulumi.Output[str]
+    execution_role: aws.iam.Role  # the research task starts with it too
+    stopped_rule: aws.cloudwatch.EventRule  # the bot's crash alarm
 
 
 def _image(settings: Settings) -> pulumi.Output[str]:
@@ -100,7 +103,7 @@ def _image(settings: Settings) -> pulumi.Output[str]:
 
 def _alert_when_the_task_dies(
     prefix: str, tags: dict[str, str], cluster: aws.ecs.Cluster, data: Data
-) -> None:
+) -> aws.cloudwatch.EventRule:
     """Send an alert when a task crashes or cannot start. The bot cannot report its own
     death, and a deploy made outside market hours is not exercised until the next open.
     Clean stops (the evening schedule, a deploy) exit 0 and stay quiet."""
@@ -136,6 +139,22 @@ def _alert_when_the_task_dies(
             ),
         ),
     )
+    return rule
+
+
+Alarm = aws.cloudwatch.EventRule | aws.cloudwatch.MetricAlarm
+
+
+def _publisher(alarm: Alarm) -> str:
+    if isinstance(alarm, aws.cloudwatch.MetricAlarm):
+        return "cloudwatch.amazonaws.com"
+    return "events.amazonaws.com"
+
+
+def alert_topic_policy(data: Data, alarms: dict[str, Alarm]) -> None:
+    """Let EventBridge rules and CloudWatch alarms publish to the alert topic, these ones
+    only. A topic has one policy, so every alarm that publishes to it is listed here
+    (Sid -> rule or alarm)."""
     aws.sns.TopicPolicy(
         "alerts",
         arn=data.topic.arn,
@@ -144,13 +163,14 @@ def _alert_when_the_task_dies(
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        "Sid": "TaskStoppedAlarm",
+                        "Sid": sid,
                         "Effect": "Allow",
-                        "Principal": {"Service": "events.amazonaws.com"},
+                        "Principal": {"Service": _publisher(alarm)},
                         "Action": "sns:Publish",
                         "Resource": data.topic.arn,
-                        "Condition": {"ArnEquals": {"aws:SourceArn": rule.arn}},
+                        "Condition": {"ArnEquals": {"aws:SourceArn": alarm.arn}},
                     }
+                    for sid, alarm in alarms.items()
                 ],
             }
         ),
@@ -171,7 +191,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
 
     # The execution role is what ECS uses to start the task: pull the image, write logs,
     # and fetch the one parameter injected as a secret.
-    execution_role = aws.iam.Role("bot-execution", assume_role_policy=_ECS_TRUST, tags=tags)
+    execution_role = aws.iam.Role("bot-execution", assume_role_policy=ECS_TRUST, tags=tags)
     aws.iam.RolePolicyAttachment(
         "bot-execution-managed",
         role=execution_role.name,
@@ -197,53 +217,66 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
 
     # The task role is what the bot's own code can do. Each statement names exact
     # resources. Note what is missing: it cannot change the control switch.
-    task_role = aws.iam.Role("bot-task", assume_role_policy=_ECS_TRUST, tags=tags)
+    task_role = aws.iam.Role("bot-task", assume_role_policy=ECS_TRUST, tags=tags)
+    statements: list[dict[str, Any]] = [
+        {
+            "Sid": "ReadSchwabSecrets",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": [data.app_secret.arn, data.token_secret.arn],
+        },
+        {
+            "Sid": "SaveRotatedRefreshToken",
+            "Effect": "Allow",
+            "Action": "secretsmanager:PutSecretValue",
+            "Resource": data.token_secret.arn,
+        },
+        {
+            "Sid": "ReadControlSwitch",
+            "Effect": "Allow",
+            "Action": "ssm:GetParameter",
+            "Resource": data.control.arn,
+        },
+        {
+            "Sid": "State",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:DeleteItem",
+                "dynamodb:Query",
+            ],
+            "Resource": data.table.arn,
+        },
+        {
+            "Sid": "Settings",
+            "Effect": "Allow",
+            "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem"],
+            "Resource": data.settings_table.arn,
+        },
+        {
+            "Sid": "Alerts",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": data.topic.arn,
+        },
+    ]
+    if data.research_table is not None:
+        # Read only, by key. Not the index (that is for reports), and no writes: the
+        # research jobs own this table.
+        statements.append(
+            {
+                "Sid": "Research",
+                "Effect": "Allow",
+                "Action": ["dynamodb:Query", "dynamodb:GetItem"],
+                "Resource": data.research_table.arn,
+            }
+        )
     task_policy = aws.iam.RolePolicy(
         "bot-task",
         role=task_role.id,
-        policy=pulumi.Output.json_dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Sid": "ReadSchwabSecrets",
-                        "Effect": "Allow",
-                        "Action": "secretsmanager:GetSecretValue",
-                        "Resource": [data.app_secret.arn, data.token_secret.arn],
-                    },
-                    {
-                        "Sid": "SaveRotatedRefreshToken",
-                        "Effect": "Allow",
-                        "Action": "secretsmanager:PutSecretValue",
-                        "Resource": data.token_secret.arn,
-                    },
-                    {
-                        "Sid": "ReadControlSwitch",
-                        "Effect": "Allow",
-                        "Action": "ssm:GetParameter",
-                        "Resource": data.control.arn,
-                    },
-                    {
-                        "Sid": "State",
-                        "Effect": "Allow",
-                        "Action": [
-                            "dynamodb:GetItem",
-                            "dynamodb:PutItem",
-                            "dynamodb:UpdateItem",
-                            "dynamodb:DeleteItem",
-                            "dynamodb:Query",
-                        ],
-                        "Resource": data.table.arn,
-                    },
-                    {
-                        "Sid": "Alerts",
-                        "Effect": "Allow",
-                        "Action": "sns:Publish",
-                        "Resource": data.topic.arn,
-                    },
-                ],
-            }
-        ),
+        policy=pulumi.Output.json_dumps({"Version": "2012-10-17", "Statement": statements}),
     )
 
     environment: dict[str, pulumi.Input[str]] = {
@@ -252,8 +285,11 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
         "TRAIDER_SCHWAB_TOKEN_SECRET_ID": data.token_secret.arn,
         "TRAIDER_CONTROL_PARAM": data.control.name,
         "TRAIDER_STATE_TABLE": data.table.name,
+        "TRAIDER_SETTINGS_TABLE": data.settings_table.name,
         "TRAIDER_ALERT_TOPIC_ARN": data.topic.arn,
     }
+    if data.research_table is not None:
+        environment["TRAIDER_RESEARCH_TABLE"] = data.research_table.name
     container = {
         "name": "bot",
         "image": image,
@@ -303,7 +339,7 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
     )
 
     cluster = aws.ecs.Cluster("bot", name=prefix, tags=tags)
-    _alert_when_the_task_dies(prefix, tags, cluster, data)
+    stopped_rule = _alert_when_the_task_dies(prefix, tags, cluster, data)
     scheduled = not settings.always_on
     service = aws.ecs.Service(
         "bot",
@@ -360,5 +396,10 @@ def build(settings: Settings, network: Network, data: Data, reauth_param: aws.ss
                 ),
             )
     return Bot(
-        cluster_name=cluster.name, service_name=service.name, log_group=logs.name, image=image
+        cluster_name=cluster.name,
+        service_name=service.name,
+        log_group=logs.name,
+        image=image,
+        execution_role=execution_role,
+        stopped_rule=stopped_rule,
     )
