@@ -42,6 +42,13 @@ config:
   # The schedule is created disabled, so nothing runs until you turn it on, after the
   # key, model access and a dry run (needs traider:researchJobs: true).
   # traider:researchScheduleEnabled: false
+  # Two more schedules, each created disabled with its own switch; both need the
+  # research jobs on. The scorecard, weekdays at 16:30 New York, records how
+  # each recent pick did; it calls no model. The intraday runs, every 30 minutes from
+  # 10:00 to 15:00, add new names and can only tighten the day's posture; each costs at
+  # most research_jobs.budget.intraday_run_usd. See docs/runbook.md, "Research jobs".
+  # traider:researchScorecardEnabled: false
+  # traider:researchIntradayEnabled: false
 
   # Give any subset; the rest keep their defaults. Unknown names are rejected.
   # Validated always, used only when research is on.
