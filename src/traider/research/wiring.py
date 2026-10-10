@@ -4,6 +4,9 @@ Research signs in to nothing. It builds its own ``TokenManager`` on the bot's st
 Schwab sign-in: it refreshes access tokens and saves a rotated refresh token with the
 same newer-wins rule as the bot, and an expired sign-in fails the run.
 
+With a state table it reads the bot's ledger and event log (``BotState``), in the
+namespace ``TRAIDER_STATE_NAMESPACE`` names; a table without a namespace is refused.
+
 The settings are read once, here. A dry run writes its trail locally and never alerts
 over SNS. The model client is built last, so nothing that can fail afterwards leaves it
 open; whoever runs the deps closes it with ``close_llm``.
@@ -20,6 +23,7 @@ import aiohttp
 from traider import app
 from traider.alerts import Alerter, LogAlerter, SnsAlerter
 from traider.config import Config
+from traider.research.botstate import BotState, ReadOnlyState
 from traider.research.events import (
     FINNHUB_BASE,
     EventsUnavailable,
@@ -37,6 +41,7 @@ from traider.schwab.oauth import TOKEN_URL
 from traider.schwab.tokens import TokenManager
 from traider.settings import Settings
 from traider.settings_store import DynamoSettingsStore, SettingsInvalid
+from traider.state.dynamo import DynamoStateStore
 from traider.timeutil import Clock
 
 log = logging.getLogger(__name__)
@@ -76,6 +81,19 @@ async def finnhub_key(config: Config, aws: app.Aws) -> str:
         raise SetupError(str(exc)) from None
 
 
+def bot_state(config: Config, aws: app.Aws) -> BotState | None:
+    """The bot's state, to read only. None without a state table. The namespace must be
+    explicit: reading the wrong one would hide what the bot holds and trades."""
+    if not config.state_table:
+        return None
+    if not config.state_namespace:
+        raise SetupError(
+            "TRAIDER_STATE_TABLE is set without TRAIDER_STATE_NAMESPACE (paper or live): "
+            "research must be told which of the bot's namespaces to read"
+        )
+    return ReadOnlyState(DynamoStateStore(aws.table(config.state_table), config.state_namespace))
+
+
 async def close_llm(llm: LLM) -> None:
     """Close the model client if it has anything to close. Never raises."""
     close = getattr(llm, "aclose", None)
@@ -105,6 +123,7 @@ async def build_deps(
         raise SetupError("no AWS region for Bedrock: set AWS_REGION")
     aws = app.Aws(config.aws_region)
     settings = await load_settings(config, aws)
+    state = bot_state(config, aws)
     key = await finnhub_key(config, aws)
     try:
         events = FinnhubEvents(http, key, base_url=finnhub_base_url)
@@ -141,4 +160,5 @@ async def build_deps(
         alerts=alerts,
         settings=settings,
         clock=clock,
+        state=state,
     )

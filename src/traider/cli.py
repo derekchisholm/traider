@@ -40,7 +40,8 @@ from traider.broker.schwab import SchwabBroker
 from traider.config import Config, ConfigError, RiskLimits, check_symbols
 from traider.log import setup_logging
 from traider.models import Bar
-from traider.research.run import RunDeps, run_premarket
+from traider.research.run import RunDeps, RunOutcome, run_premarket
+from traider.research.scorecard_run import run_scorecard
 from traider.research.scrub import scrub
 from traider.research.seed import build_manual_run
 from traider.research.source import ResearchSource
@@ -633,7 +634,7 @@ async def research_show(source: ResearchSource, out: TextIO, *, now: datetime) -
     return 0
 
 
-RESEARCH_KINDS = ("premarket",)  # the other kinds come in C2
+RESEARCH_KINDS = ("premarket", "scorecard")
 
 DRY_RUN_NOTICE = (
     "Dry run: real calls to Schwab, Finnhub and Claude on Amazon Bedrock. The Bedrock calls "
@@ -642,7 +643,21 @@ DRY_RUN_NOTICE = (
     "written to {where}.\n\n"
 )
 
+SCORECARD_DRY_RUN_NOTICE = (
+    "Dry run: real calls to Schwab (daily bars) and reads of the research table and the "
+    "bot's event log; no model is called. Nothing is written to the research table (no "
+    "outcomes, summary or lock) and no alert is sent. The trail is written to {where}.\n\n"
+)
+
 BuildDeps = Callable[..., Awaitable[RunDeps]]
+Runner = Callable[..., Awaitable[RunOutcome]]
+
+
+def _runner(kind: str) -> Runner:
+    """Looked up when the run starts, so tests can replace a runner."""
+    if kind == "scorecard":
+        return run_scorecard
+    return run_premarket
 
 
 def _error_text(exc: BaseException) -> str:
@@ -669,11 +684,12 @@ async def research_run(
     it. Every error printed is scrubbed. The HTTP session and the model client are closed
     on every path."""
     if kind not in RESEARCH_KINDS:
-        out.write(f"unknown research kind {kind!r}; only premarket exists so far\n")
+        out.write(f"unknown research kind {kind!r}; one of {', '.join(RESEARCH_KINDS)}\n")
         return 2
     clock = SystemClock()
     if dry_run:
-        out.write(DRY_RUN_NOTICE.format(where=trail_dir))
+        notice = SCORECARD_DRY_RUN_NOTICE if kind == "scorecard" else DRY_RUN_NOTICE
+        out.write(notice.format(where=trail_dir))
         out.flush()
     async with aiohttp.ClientSession() as http:
         try:
@@ -687,9 +703,9 @@ async def research_run(
             return 1
         try:
             started = now or clock.now()
-            outcome = await run_premarket(deps, started, dry_run=dry_run, force=force)
+            outcome = await _runner(kind)(deps, started, dry_run=dry_run, force=force)
         except Exception as exc:
-            # run_premarket records its own failures; this is a bug, so fail closed.
+            # A run records its own failures; this is a bug, so fail closed.
             text = _error_text(exc)
             log.error("the research run failed: %s", text)
             out.write(f"research run failed: {text}\n")
@@ -759,7 +775,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     research_actions = research.add_subparsers(dest="action", required=True)
     run_research = research_actions.add_parser(
-        "run", help="run a research job now (what the 08:00 schedule runs)"
+        "run", help="run a research job now (what its schedule runs)"
     )
     run_research.add_argument("--kind", required=True, choices=RESEARCH_KINDS)
     run_research.add_argument(

@@ -50,6 +50,7 @@ from typing import Any, ClassVar, Final
 from pydantic import BaseModel, ConfigDict
 
 from traider.alerts import Alerter
+from traider.research.botstate import BotState
 from traider.research.cost import CostMeter
 from traider.research.dive import DiveContext, DiveResult, run_dive
 from traider.research.events import (
@@ -164,6 +165,8 @@ class RunDeps:
     settings: Settings  # read once, when the run starts
     clock: Clock = field(default_factory=SystemClock)
     monotonic: Callable[[], float] = time.monotonic
+    # The bot's ledger and event log, read-only. None without a state table.
+    state: BotState | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,7 @@ class RunOutcome:
     picks: tuple[Pick, ...] = ()
     rejected: tuple[Rejection, ...] = ()
     detail: str = ""
+    extra: Mapping[str, Any] = field(default_factory=dict)  # more JSON-ready data to print
 
     def report(self) -> dict[str, Any]:
         """For printing: what the run decided, as JSON-ready data."""
@@ -189,6 +193,7 @@ class RunOutcome:
             "cost_usd": str(self.meta.cost_usd) if self.meta else "0",
             "notes": list(self.meta.notes) if self.meta else [],
             "counts": dict(self.meta.counts) if self.meta else {},
+            **self.extra,
         }
 
 

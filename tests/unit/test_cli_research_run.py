@@ -691,3 +691,51 @@ def test_a_dry_runs_stdout_is_only_the_notice_and_the_report(monkeypatch, capsys
     assert "an info line the run logs" not in captured.out
     assert "a warning the run logs" in captured.err  # warnings go to stderr
     assert "an info line the run logs" not in captured.err
+
+
+# --- C2a: the scorecard --------------------------------------------------------------------
+
+
+async def test_the_scorecard_kind_runs_the_scorecard(tmp_path):
+    store = MemoryResearchStore()
+    build, _ = fake_build(store)
+    out = io.StringIO()
+    code = await cli.research_run(
+        CONFIG,
+        out,
+        kind="scorecard",
+        dry_run=False,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=build,
+        now=NOW,
+    )
+    assert code == 0
+    assert out.getvalue().startswith("research scorecard ok: scorecard-20261009T120000Z-")
+    assert ("SCORE#2026-10-09", "SUMMARY") in store.keys
+
+
+async def test_a_scorecard_dry_run_says_it_calls_no_model(tmp_path):
+    build, made = fake_build()
+    out = io.StringIO()
+    code = await cli.research_run(
+        CONFIG,
+        out,
+        kind="scorecard",
+        dry_run=True,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=build,
+        now=NOW,
+    )
+    assert code == 0
+    notice, _, printed = out.getvalue().partition("\n\n")
+    assert notice.startswith("Dry run: real calls to Schwab (daily bars)")
+    assert "no model is called" in notice and "cost real money" not in notice
+    assert json.loads(printed)["summary"]["picks"] == 0
+    assert made["store"].keys == set()
+
+
+def test_the_scorecard_kind_parses():
+    args = cli._parser().parse_args(["research", "run", "--kind", "scorecard", "--dry-run"])
+    assert (args.kind, args.dry_run) == ("scorecard", True)

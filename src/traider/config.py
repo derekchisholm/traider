@@ -167,6 +167,9 @@ class Config(BaseModel):
     control_param: str | None = None
     control: str = "paper"  # used only when control_param is unset
     state_table: str | None = None
+    # The bot's namespace in the state table (its trading mode). Only research reads it:
+    # the research task runs without a trading mode, so it is told which one to read.
+    state_namespace: Literal["paper", "live"] | None = None
     settings_table: str | None = None
     research_table: str | None = None
     # The research jobs' audit trail (S3) and where their Finnhub key is stored.
