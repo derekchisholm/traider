@@ -238,29 +238,40 @@ async def run_premarket(
 
 
 async def run_locked(run: RunBase, *, force: bool) -> RunOutcome:
-    """Run under the kind's lock, which lives ``max_run_s + LOCK_SPARE_S`` from the start
-    and is released on every path (it expires by itself if the release fails). A held lock
-    exits 2 and touches nothing. A dry run takes no lock and runs with ``force``."""
+    """Run under the kind's lock, then each of ``also_locks``, in that order. Every lock
+    lives ``max_run_s + LOCK_SPARE_S`` from the start and is released on every path (it
+    expires by itself if the release fails). Any lock held elsewhere exits 2 and touches
+    nothing but the locks this run took, which it gives back. A dry run takes no lock and
+    runs with ``force``."""
     if run.dry_run:
         return await run.execute(force=True)
     store = run.deps.store
+    taken: list[str] = []
     try:
-        acquired = await store.acquire_lock(
-            run.lock_name, run.run_id, run.max_run_s + LOCK_SPARE_S, run.now
-        )
-    except Exception as exc:
-        return await run.fail(exc)
-    if not acquired:
-        log.warning("another %s run holds the lock; exiting", run.kind)
-        return RunOutcome("locked", EXIT_LOCKED, run.run_id, detail="another run holds the lock")
-    try:
+        for name in (run.lock_name, *run.also_locks):
+            try:
+                acquired = await store.acquire_lock(
+                    name, run.run_id, run.max_run_s + LOCK_SPARE_S, run.now
+                )
+            except Exception as exc:
+                return await run.fail(exc)
+            if not acquired:
+                if name == run.lock_name:
+                    log.warning("another %s run holds the lock; exiting", run.kind)
+                    detail = "another run holds the lock"
+                else:
+                    log.warning("a %s run holds its lock; this %s run exits", name, run.kind)
+                    detail = f"a {name} run holds its lock"
+                return RunOutcome("locked", EXIT_LOCKED, run.run_id, detail=detail)
+            taken.append(name)
         return await run.execute(force=force)
     finally:
-        try:
-            await store.release_lock(run.lock_name, run.run_id)
-        except Exception as exc:
-            log.error("could not release the research lock (it expires by itself): %s",
-                      _describe(exc))  # fmt: skip
+        for name in reversed(taken):
+            try:
+                await store.release_lock(name, run.run_id)
+            except Exception as exc:
+                log.error("could not release the research lock (it expires by itself): %s",
+                          _describe(exc))  # fmt: skip
 
 
 class RunBase:
@@ -270,6 +281,8 @@ class RunBase:
 
     kind: ClassVar[RunKind]
     lock_name: ClassVar[str]
+    # Other kinds' locks this kind also holds for its whole run, so it never overlaps them.
+    also_locks: ClassVar[tuple[str, ...]] = ()
     title: ClassVar[str]  # how each alert's subject starts
 
     def __init__(self, deps: RunDeps, now: datetime, run_id: str, *, dry_run: bool) -> None:

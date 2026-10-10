@@ -1,7 +1,8 @@
 """The intraday run, every 30 minutes from 10:00 to 15:00 New York time on weekdays.
 
-    lock(intraday) -> session open now? -> after last_start? -> an ok posture today?
-      -> META running -> held (the bot's ledger) -> live picks of earlier days
+    lock(intraday), lock(premarket) -> session open now? -> after last_start?
+      -> an ok posture today? -> META running -> held (the bot's ledger)
+      -> live picks of earlier days
       -> collect (context quotes, SPY bars, movers, the earnings calendar)
       -> posture = stricter(the day's posture, code rules on current metrics)
       -> stand_aside? yes -> write the posture, no picks, ok
@@ -10,6 +11,10 @@
       -> deep-dives (intraday_model, intraday_run_usd) -> rank (every pick intraday)
       -> write picks + posture + META -> alert if there are picks, the posture tightened,
          or the run is partial
+
+It holds the pre-market lock as well as its own for its whole run, so a pre-market run
+and an intraday run never overlap: whichever starts second exits 2 (``locked``) and
+touches nothing. Both locks live ``intraday.max_run_s + LOCK_SPARE_S``.
 
 It never rescues a day: without an ok posture today (from the morning run, or an earlier
 intraday run) it writes nothing and exits ``skipped``. It starts from the day's posture as
@@ -56,6 +61,7 @@ from traider.research.run import (
     EMPTY_CALENDAR_WEEKDAYS,
     EXIT_OK,
     HISTORY_DAYS,
+    LOCK_NAME,
     MAX_NOTES,
     MOVER_INDEXES,
     MOVER_SORTS,
@@ -118,6 +124,10 @@ def latest_ok_posture(research: DayResearch) -> Posture | None:
 class IntradayRun(_Run):
     kind: ClassVar[RunKind] = KIND
     lock_name: ClassVar[str] = KIND
+    # The pre-market lock too, for the whole run: the two kinds never overlap. Otherwise a
+    # forced pre-market run could write stand_aside after this run read the day's posture,
+    # and this run's newer ok posture would loosen the day again.
+    also_locks: ClassVar[tuple[str, ...]] = (LOCK_NAME,)
     title: ClassVar[str] = "Research intraday"
     intraday_dives: ClassVar[bool] = True
 

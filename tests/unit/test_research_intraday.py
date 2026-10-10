@@ -16,6 +16,7 @@ from tests.fakes.research import (
     submit,
 )
 from tests.unit.test_research_run import StepClock, Trails
+from tests.unit.test_research_run import deps as premarket_deps
 from traider.alerts import LogAlerter
 from traider.config import ResearchSettings
 from traider.research.dive import INTRADAY_LINE
@@ -23,8 +24,14 @@ from traider.research.intraday import IntradayRun, latest_ok_posture, run_intrad
 from traider.research.job_settings import DEFAULT_MODEL
 from traider.research.models import Pick, Posture, PostureLevel, RunMeta
 from traider.research.rank import close_of
-from traider.research.run import LOCK_SPARE_S, RUN_BOX_MARGIN_S, RunDeps
-from traider.research.source import ResearchSource
+from traider.research.run import (
+    LOCK_SPARE_S,
+    RUN_BOX_MARGIN_S,
+    RunDeps,
+    run_locked,
+    run_premarket,
+)
+from traider.research.source import STRICTNESS, ResearchSource
 from traider.research.store import MemoryResearchStore
 from traider.settings import Settings
 from traider.state.base import LedgerEntry
@@ -298,13 +305,50 @@ async def test_switched_off_means_no_run():
         assert (await run_intraday(d, NOW)).status == "disabled"
 
 
-async def test_its_own_lock_and_only_its_own():
+@pytest.mark.parametrize("held", ["intraday", "premarket"])
+async def test_its_own_lock_or_the_premarket_one_held_means_exit_2(held):
     d = await deps()
-    await d.store.acquire_lock("intraday", "someone", 3600, NOW)
-    assert (await run_intraday(d, NOW)).exit_code == 2
+    await d.store.acquire_lock(held, "someone", 3600, NOW)
+    before = {k: d.store.raw(*k) for k in d.store.keys}
+    outcome = await run_intraday(d, NOW)
+    assert (outcome.status, outcome.exit_code) == ("locked", 2)
+    # It touched nothing: the lock it did take (if any) is given back.
+    assert {k: d.store.raw(*k) for k in d.store.keys} == before
+    assert d.alerts.sent == [] and d.llm.requests == []
+
+
+async def test_the_scorecard_lock_does_not_stop_it():
     d = await deps()
-    await d.store.acquire_lock("premarket", "someone", 3600, NOW)
+    await d.store.acquire_lock("scorecard", "someone", 3600, NOW)
     assert (await run_intraday(d, NOW)).status == "ok"
+
+
+async def test_it_holds_both_locks_for_its_whole_run_and_gives_both_back():
+    taken: list[tuple[str, float]] = []
+
+    class Watching(MemoryResearchStore):
+        async def acquire_lock(self, name, owner, ttl_s, now):
+            taken.append((name, ttl_s))
+            return await super().acquire_lock(name, owner, ttl_s, now)
+
+        async def write_run(self, meta, picks, posture):
+            if meta.kind == "intraday" and meta.status.value == "ok":
+                # The final write: both locks are still held.
+                assert {("LOCK#intraday", "LOCK"), ("LOCK#premarket", "LOCK")} <= self.keys
+            await super().write_run(meta, picks, posture)
+
+    store = Watching()
+    await morning(store)
+    d = await deps(store=store)
+    loop = asyncio.get_running_loop()
+    run = IntradayRun(d, NOW, "intraday-x", dry_run=False)
+    box_left = run.box - loop.time()
+    outcome = await run_locked(run, force=False)
+    assert outcome.status == "ok"
+    ttl = Settings().research_jobs.intraday.max_run_s + LOCK_SPARE_S
+    assert taken == [("intraday", ttl), ("premarket", ttl)]
+    assert box_left <= ttl - RUN_BOX_MARGIN_S  # the box ends before either lock expires
+    assert not {k for k in store.keys if k[0].startswith("LOCK#")}
 
 
 async def test_its_time_box_follows_intraday_max_run_s():
@@ -339,6 +383,7 @@ async def test_a_run_past_its_box_fails(monkeypatch):
     assert outcome.status == "failed"
     assert outcome.meta.error == "dive: RunDeadline: the run did not finish within 1140s"
     assert ("LOCK#intraday", "LOCK") not in d.store.keys
+    assert ("LOCK#premarket", "LOCK") not in d.store.keys
 
 
 async def test_a_dry_run_writes_nothing():
@@ -546,3 +591,86 @@ async def test_an_expired_pick_from_an_earlier_day_does_not_exclude_its_name():
     await store.write_run(yesterday, [old], None)
     outcome = await run_intraday(await deps(store=store), NOW)
     assert [p.symbol for p in outcome.picks] == ["PLTR"]
+
+
+# --- C2a final fix: premarket and intraday never overlap -----------------------------------
+
+FORCED_AT = datetime(2026, 10, 9, 14, 55, tzinfo=UTC)  # a forced pre-market run, 10:55
+
+
+class Racing(MemoryResearchStore):
+    """Runs ``during`` once, just before the final write of the first ``kind`` run, while
+    that run still holds its locks. Records the bot's posture after every write."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.during = None
+        self.levels: list[tuple[PostureLevel, PostureLevel]] = []
+
+    async def write_run(self, meta, picks, posture):
+        if meta.kind == self.kind and meta.status.value in ("ok", "partial") and self.during:
+            during, self.during = self.during, None
+            await during()
+        await super().write_run(meta, picks, posture)
+        self.levels.append(
+            (
+                (await bot_view(self, accept_partial_runs=False)).level,
+                (await bot_view(self, accept_partial_runs=True)).level,
+            )
+        )
+
+
+def never_loosens(levels) -> bool:
+    for accept in (0, 1):
+        steps = [STRICTNESS[pair[accept]] for pair in levels]
+        if steps != sorted(steps):
+            return False
+    return True
+
+
+def forced_stand_aside(store) -> RunDeps:
+    """A forced pre-market run that will say stand_aside (VIX at 40)."""
+    d = premarket_deps(store=store)
+    d.market.quote_map["$VIX"] = d.market.quote_map["$VIX"].model_copy(update={"last": 40.0})
+    return d
+
+
+async def test_a_premarket_run_started_during_an_intraday_run_exits_2():
+    # The race: the morning said trade; intraday read that at 11:00; a forced pre-market
+    # run then wrote stand_aside; intraday wrote trade after it and the bot loosened.
+    store = Racing("intraday")
+    await morning(store, "trade")
+    outcomes = []
+
+    async def premarket():
+        outcomes.append(await run_premarket(forced_stand_aside(store), FORCED_AT, force=True))
+
+    store.during = premarket
+    outcome = await run_intraday(await deps(store=store), NOW)
+    assert outcome.status == "ok"
+    ((status, code),) = [(o.status, o.exit_code) for o in outcomes]
+    assert (status, code) == ("locked", 2)
+    assert not [k for k in store.keys if k[0].startswith("RUN#premarket-2026")]
+    assert never_loosens(store.levels)
+    assert not {k for k in store.keys if k[0].startswith("LOCK#")}
+
+
+async def test_an_intraday_run_started_during_a_premarket_run_exits_2():
+    store = Racing("premarket")
+    await morning(store, "trade")
+    outcomes = []
+
+    async def intraday():
+        outcomes.append(await run_intraday(await deps(store=store), NOW))
+
+    store.during = intraday
+    outcome = await run_premarket(forced_stand_aside(store), FORCED_AT, force=True)
+    assert (outcome.status, outcome.posture.level) == ("ok", PostureLevel.STAND_ASIDE)
+    ((status, code),) = [(o.status, o.exit_code) for o in outcomes]
+    assert (status, code) == ("locked", 2)
+    assert not [k for k in store.keys if k[0].startswith("RUN#intraday-")]
+    assert never_loosens(store.levels)
+    # The forced run's stand_aside is what the bot reads, not lost under a newer trade.
+    assert store.levels[-1] == (PostureLevel.STAND_ASIDE, PostureLevel.STAND_ASIDE)
+    assert not {k for k in store.keys if k[0].startswith("LOCK#")}
