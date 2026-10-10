@@ -51,6 +51,8 @@ class DayResearch:
     invalid: int = 0
     # Posture items that did not parse. Counted apart so the reader can refuse the day's posture.
     invalid_postures: int = 0
+    # Pick items that did not parse: an intraday run cannot tell which names they hold.
+    invalid_picks: int = 0
 
 
 class ResearchStore(Protocol):
@@ -215,6 +217,7 @@ def _parse_day(
     postures: list[Posture] = []
     invalid = 0
     invalid_postures = 0
+    invalid_picks = 0
     for item in sorted(items, key=lambda i: str(i["sk"])):
         sk = str(item["sk"])
         try:
@@ -227,6 +230,8 @@ def _parse_day(
             invalid += 1
             if sk.startswith("POSTURE#"):
                 invalid_postures += 1
+            elif sk.startswith("PICK#"):
+                invalid_picks += 1
     runs: dict[str, RunMeta] = {}
     for run_id, meta_item in metas.items():
         if meta_item is None:
@@ -235,7 +240,9 @@ def _parse_day(
             runs[run_id] = RunMeta.model_validate(json.loads(str(meta_item["body"])))
         except Exception:
             invalid += 1
-    return DayResearch(day, tuple(picks), tuple(postures), runs, invalid, invalid_postures)
+    return DayResearch(
+        day, tuple(picks), tuple(postures), runs, invalid, invalid_postures, invalid_picks
+    )
 
 
 def _run_ids(items: Sequence[Mapping[str, Any]]) -> set[str]:

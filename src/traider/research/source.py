@@ -3,12 +3,20 @@
 Fail closed: until a read succeeds, and once reads have failed for longer than
 ``max_stale_s``, there are no live picks and the posture is "stand aside". Exits never
 depend on any of this; it only narrows and shrinks entries.
+
+Today's posture (``todays_posture``) starts from the newest posture of an ok run; only
+when there is none, and ``accept_partial_runs`` is set, from the newest of a partial run.
+Without one, or with any unreadable posture item today, the bot stands aside. A posture
+written at or after the starting one, by a run of any status (ok, partial, running or
+failed), can only make it stricter, never looser (``strictest_since``). The intraday
+research run starts from the same rule, so neither the bot nor research ever loosens the
+day on a partial run.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Literal
@@ -19,6 +27,23 @@ from traider.research.store import DayResearch, ResearchStore
 from traider.timeutil import previous_weekday, trading_date
 
 log = logging.getLogger(__name__)
+
+STRICTNESS: Mapping[PostureLevel, int] = {
+    PostureLevel.TRADE: 0,
+    PostureLevel.REDUCED: 1,
+    PostureLevel.STAND_ASIDE: 2,
+}
+
+
+def strictest_since(start: Posture, postures: Iterable[Posture]) -> Posture:
+    """``start``, or the strictest posture written at or after it, whatever its run's
+    status: a newer posture can tighten the day but never loosen it. On a tie the earlier
+    one stands (``start`` first)."""
+    result = start
+    for p in sorted((p for p in postures if p.at >= start.at), key=lambda p: p.at):
+        if STRICTNESS[p.level] > STRICTNESS[result.level]:
+            result = p
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +71,26 @@ class ResearchView:
 class ResearchUpdate:
     kind: Literal["stale", "restored"]
     detail: str
+
+
+def todays_posture(research: DayResearch, *, accept_partial_runs: bool) -> Posture | None:
+    """The day's posture, or None (stand aside): see the module docstring. The bot calls
+    it with its ``accept_partial_runs``; the intraday run with False."""
+    if research.invalid_postures:
+        return None  # an unreadable posture may be the newest one
+
+    def newest(status: RunStatus) -> Posture | None:
+        found = [
+            p
+            for p in research.postures
+            if (run := research.runs.get(p.run_id)) is not None and run.status is status
+        ]
+        return max(found, key=lambda p: p.at) if found else None
+
+    start = newest(RunStatus.OK)
+    if start is None and accept_partial_runs:
+        start = newest(RunStatus.PARTIAL)
+    return strictest_since(start, research.postures) if start is not None else None
 
 
 def _usable(run: RunMeta | None, settings: ResearchSettings) -> bool:
@@ -133,7 +178,7 @@ class ResearchSource:
                 if current is None or key > (current.score, current.run_id, -current.rank):
                     best[p.symbol] = p
         todays = next((r for r in results if r.day == today), None)
-        postures: list[Posture] = []
+        posture: Posture | None = None
         if todays is not None:
             if todays.invalid_postures:
                 # A posture we cannot read may be the newest one. Refuse the day's posture.
@@ -142,7 +187,5 @@ class ResearchSource:
                     today,
                     todays.invalid_postures,
                 )
-            else:
-                postures = [p for p in todays.postures if _usable(runs.get(p.run_id), settings)]
-        posture = max(postures, key=lambda p: p.at) if postures else None
+            posture = todays_posture(todays, accept_partial_runs=settings.accept_partial_runs)
         return ResearchView(picks=best, posture=posture, as_of=now, stale=False)

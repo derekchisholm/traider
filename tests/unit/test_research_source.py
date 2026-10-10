@@ -152,6 +152,58 @@ async def test_the_latest_qualifying_posture_wins():
     assert src.view.level is PostureLevel.TRADE
 
 
+# --- C2a: a posture only tightens across partial runs ---------------------------------------
+
+
+async def test_a_newer_stricter_posture_holds_whatever_its_runs_status():
+    for status in ("partial", "failed", "running"):
+        store = MemoryResearchStore()
+        await store.write_run(meta("r1"), [], posture("trade", minutes=-60))
+        await store.write_run(meta("r2", status), [], posture("stand_aside", run_id="r2"))
+        for accept in (False, True):
+            src = source(store, accept_partial_runs=accept)
+            await src.refresh(NOW)
+            assert (status, accept, src.view.level) == (status, accept, PostureLevel.STAND_ASIDE)
+            assert src.view.posture.run_id == "r2"
+
+
+async def test_a_newer_looser_partial_posture_never_loosens():
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1"), [], posture("stand_aside", minutes=-60))
+    await store.write_run(meta("r2", "partial"), [], posture("trade", run_id="r2"))
+    for accept in (False, True):
+        src = source(store, accept_partial_runs=accept)
+        await src.refresh(NOW)
+        assert (accept, src.view.level) == (accept, PostureLevel.STAND_ASIDE)
+
+
+async def test_an_older_stricter_posture_than_the_newest_usable_one_does_not_hold():
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1", "partial"), [], posture("stand_aside", minutes=-60))
+    await store.write_run(meta("r2"), [], posture("trade", run_id="r2"))
+    for accept in (False, True):
+        src = source(store, accept_partial_runs=accept)
+        await src.refresh(NOW)
+        assert (accept, src.view.level) == (accept, PostureLevel.TRADE)
+
+
+async def test_an_equally_strict_newer_posture_leaves_the_usable_one_in_place():
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1"), [], posture("reduced", minutes=-60))
+    await store.write_run(meta("r2", "partial"), [], posture("reduced", run_id="r2"))
+    src = source(store)
+    await src.refresh(NOW)
+    assert (src.view.level, src.view.posture.run_id) == (PostureLevel.REDUCED, "r1")
+
+
+async def test_without_a_usable_posture_a_partial_one_is_not_enough():
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1", "partial"), [], posture("trade"))
+    src = source(store)
+    await src.refresh(NOW)
+    assert src.view.posture is None and src.view.level is PostureLevel.STAND_ASIDE
+
+
 async def test_a_failed_read_keeps_the_last_view_until_it_is_too_old():
     store = Flaky()
     await store.write_run(meta("r1"), [pick("NVDA")], posture())

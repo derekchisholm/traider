@@ -1,20 +1,27 @@
 """The intraday run, every 30 minutes from 10:00 to 15:00 New York time on weekdays.
 
     lock(intraday) -> session open now? -> after last_start? -> an ok posture today?
-      -> META running -> collect (context quotes, SPY bars, movers, the earnings calendar)
-      -> posture = stricter(today's latest ok posture, code rules on current metrics)
+      -> META running -> held (the bot's ledger) -> live picks of earlier days
+      -> collect (context quotes, SPY bars, movers, the earnings calendar)
+      -> posture = stricter(the day's posture, code rules on current metrics)
       -> stand_aside? yes -> write the posture, no picks, ok
-      -> candidates = movers - picked today - held - pinned -> screen -> top K
+      -> an unreadable pick item? yes -> write the posture, no picks, partial
+      -> candidates = movers - picked today - live picks - held - pinned -> screen -> top K
       -> deep-dives (intraday_model, intraday_run_usd) -> rank (every pick intraday)
       -> write picks + posture + META -> alert if there are picks, the posture tightened,
          or the run is partial
 
 It never rescues a day: without an ok posture today (from the morning run, or an earlier
-intraday run) it writes nothing and exits ``skipped``. Its posture can only be stricter
-than the one it starts from, and there is no model review of it. It always writes the
+intraday run) it writes nothing and exits ``skipped``. It starts from the day's posture as
+the bot reads it (``source.todays_posture``): the newest ok posture, made stricter by any
+posture written since by a run of any status. So a partial run's ``stand_aside`` holds for
+the rest of the day. Its own posture can only be stricter than that, and there is no
+model review of it. It always writes the
 posture, changed or not, so the day's record is continuous. A swing idea is made
 intraday (with a note): every pick expires at today's close. "Held" is the bot's ledger,
-read-only; without it the run fails.
+read-only; without it the run fails. A name with a live pick from an earlier day is never
+a candidate, so a swing pick is never replaced by an intraday one. A pick item it cannot
+read could be any name, so then it makes no picks at all.
 """
 
 from __future__ import annotations
@@ -63,8 +70,9 @@ from traider.research.run import (
 )
 from traider.research.screen import build_candidates
 from traider.research.scrub import LIMIT, scrub
+from traider.research.source import todays_posture
 from traider.research.store import DayResearch
-from traider.timeutil import ET, weekdays_between
+from traider.timeutil import ET, previous_weekday, weekdays_between
 
 log = logging.getLogger(__name__)
 
@@ -100,16 +108,11 @@ async def run_intraday(
 
 
 def latest_ok_posture(research: DayResearch) -> Posture | None:
-    """Today's newest posture from an ok run, or None. A day with an unreadable posture
-    item has none: that item may be the newest."""
-    if research.invalid_postures:
-        return None
-    usable = [
-        p
-        for p in research.postures
-        if (run := research.runs.get(p.run_id)) is not None and run.status is RunStatus.OK
-    ]
-    return max(usable, key=lambda p: p.at) if usable else None
+    """The posture an intraday run starts from: today's newest posture from an ok run,
+    made stricter by any posture written since (whatever its run's status), as the bot
+    reads it. None without an ok posture today, or with an unreadable posture item (it may
+    be the newest)."""
+    return todays_posture(research, accept_partial_runs=False)
 
 
 class IntradayRun(_Run):
@@ -178,8 +181,17 @@ class IntradayRun(_Run):
         held = await held_symbols(deps.state)
         picked = {p.symbol for p in research.picks}
 
+        self.stage = "live_picks"
+        # The bot's lookback for swing picks: a live one is never replaced intraday.
+        first = self.today
+        for _ in range(deps.settings.research.swing_lookback_days):
+            first = previous_weekday(first)
+        earlier = await deps.store.picks_between(first, previous_weekday(self.today))
+        live = {p.symbol for r in earlier for p in r.picks if self.now < p.expires_at}
+        unreadable = research.invalid_picks + sum(r.invalid_picks for r in earlier)
+
         self.stage = "collect"
-        snapshot = await self.collect_intraday(picked=picked, held=held)
+        snapshot = await self.collect_intraday(picked=picked, live=live, held=held)
         await self.put_trail("snapshot.json", snapshot)
 
         self.stage = "posture"
@@ -196,6 +208,15 @@ class IntradayRun(_Run):
             {"posture": posture, "from": base, "notes": [scrub(n) for n in decision.notes]},
         )
         if decision.level is PostureLevel.STAND_ASIDE:
+            self.stage = "write"
+            return await self.finish(posture, RankResult((), ()), {})
+        if unreadable:
+            # An unreadable pick could be any name, even one the bot trades on now.
+            self.counts["unreadable_picks"] = unreadable
+            self.note(
+                f"{unreadable} unreadable pick item(s) in the research table: no new picks",
+                partial=True,
+            )
             self.stage = "write"
             return await self.finish(posture, RankResult((), ()), {})
         if deps.monotonic() >= self.started + self.max_run_s:
@@ -274,7 +295,9 @@ class IntradayRun(_Run):
         ]
         return PostureDecision(level, tuple(reasons), metrics, notes=tuple(notes))
 
-    async def collect_intraday(self, *, picked: set[str], held: set[str]) -> Snapshot:
+    async def collect_intraday(
+        self, *, picked: set[str], live: set[str], held: set[str]
+    ) -> Snapshot:
         deps, jobs, today = self.deps, self.jobs, self.today
         context = (await deps.market.quotes(CONTEXT_SYMBOLS)).quotes
         spy_bars = await deps.market.daily_bars("SPY", today, HISTORY_DAYS)
@@ -300,14 +323,15 @@ class IntradayRun(_Run):
                 )
         names = list(dict.fromkeys(name for found in movers.values() for name in found))
         pinned = set(deps.settings.pinned_symbols)
-        for reason, skip in (("picked", picked), ("held", held), ("pinned", pinned)):
+        skips = (("picked", picked), ("live", live), ("held", held), ("pinned", pinned))
+        for reason, skip in skips:
             if count := sum(1 for n in names if n in skip):
                 self.counts[f"excluded_{reason}"] = count
         candidates = build_candidates(
             watchlist=(),
             earnings_names=(),
             movers=names,
-            pinned=picked | held | pinned,
+            pinned=picked | live | held | pinned,
             cap=jobs.intraday.max_candidates,
         )
         self.counts["candidates"] = len(candidates)

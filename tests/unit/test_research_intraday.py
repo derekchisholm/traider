@@ -106,8 +106,8 @@ async def deps(
     )
 
 
-async def bot_view(store, now=NOW):
-    source = ResearchSource(store, ResearchSettings)
+async def bot_view(store, now=NOW, **settings):
+    source = ResearchSource(store, lambda: ResearchSettings(**settings))
     await source.refresh(now)
     return source.view
 
@@ -469,3 +469,80 @@ def test_the_intraday_alert_text_is_never_cut_short():
     ]
     message = _summary_of([n[:300] for n in notes], picks)
     assert message.endswith(notes[-1][:300].rstrip())
+
+
+# --- C2a fix 1: postures only tighten across partial runs ----------------------------------
+
+
+@pytest.mark.parametrize("accept", [False, True])
+async def test_a_partial_stand_aside_holds_for_the_rest_of_the_day(accept):
+    store = MemoryResearchStore()
+    await morning(store, "trade")
+    aside = Posture(
+        level="stand_aside", reasons=("code: x",), run_id="intraday-a", at=MORNING.replace(hour=14)
+    )
+    await store.write_run(morning_meta("intraday-a", status="partial", kind="intraday"), [], aside)
+    assert (await bot_view(store, accept_partial_runs=accept)).level is PostureLevel.STAND_ASIDE
+    d = await deps(store=store)  # calm metrics: the code rules alone would say trade
+    outcome = await run_intraday(d, NOW)
+    assert outcome.status == "ok"
+    assert (outcome.posture.level, outcome.picks) == (PostureLevel.STAND_ASIDE, ())
+    assert outcome.posture.reasons[0] == "intraday: at least stand_aside, from intraday-a"
+    assert d.llm.requests == []
+    assert (await bot_view(store, accept_partial_runs=accept)).level is PostureLevel.STAND_ASIDE
+
+
+async def test_a_newer_looser_posture_of_a_partial_run_is_not_where_it_starts():
+    store = MemoryResearchStore()
+    await morning(store, "reduced")
+    looser = Posture(level="trade", run_id="premarket-p", at=MORNING.replace(hour=13))
+    await store.write_run(morning_meta("premarket-p", status="partial"), [], looser)
+    outcome = await run_intraday(await deps(store=store), NOW)
+    assert outcome.posture.level is PostureLevel.REDUCED
+    assert outcome.posture.reasons[0] == "intraday: at least reduced, from premarket-m"
+
+
+@pytest.mark.parametrize("day", [DAY, "2026-10-08"])
+async def test_unreadable_picks_mean_the_posture_only(day):
+    store = MemoryResearchStore()
+    await morning(store)
+    store.put_raw(f"DAY#{day}", "PICK#premarket-x#009", "{not json")
+    d = await deps(store=store)
+    outcome = await run_intraday(d, NOW)
+    assert (outcome.status, outcome.picks) == ("partial", ())
+    assert outcome.posture.level is PostureLevel.TRADE
+    assert d.llm.requests == []
+    assert "1 unreadable pick item(s) in the research table: no new picks" in outcome.meta.notes
+    assert outcome.meta.counts["unreadable_picks"] == 1
+    assert [k for k in store.keys if k[1].startswith("POSTURE#2026-10-09T15")]
+    ((event, _, _),) = d.alerts.sent
+    assert event == "research_run_partial"
+
+
+async def test_a_live_pick_from_an_earlier_day_is_never_replaced():
+    store = MemoryResearchStore()
+    await morning(store)
+    yesterday = morning_meta("premarket-y").model_copy(
+        update={"trading_day": datetime(2026, 10, 8).date()}
+    )
+    await store.write_run(yesterday, [morning_pick("PLTR", run_id="premarket-y")], None)
+    d = await deps(store=store)
+    outcome = await run_intraday(d, NOW)
+    assert (outcome.status, outcome.picks) == ("ok", ())
+    assert outcome.meta.counts["excluded_live"] == 1
+    assert "PLTR" not in d.trail.only().files["snapshot.json"]["candidates"]
+    assert d.llm.requests == []
+
+
+async def test_an_expired_pick_from_an_earlier_day_does_not_exclude_its_name():
+    store = MemoryResearchStore()
+    await morning(store)
+    yesterday = morning_meta("premarket-y").model_copy(
+        update={"trading_day": datetime(2026, 10, 8).date()}
+    )
+    old = morning_pick("PLTR", run_id="premarket-y").model_copy(
+        update={"expires_at": close_of(datetime(2026, 10, 8).date())}
+    )
+    await store.write_run(yesterday, [old], None)
+    outcome = await run_intraday(await deps(store=store), NOW)
+    assert [p.symbol for p in outcome.picks] == ["PLTR"]
