@@ -60,6 +60,7 @@ from traider.research.events import (
     NewsItem,
     Profile,
 )
+from traider.research.job_settings import DiveSettings, ScreenSettings
 from traider.research.llm import LLM
 from traider.research.market import DailyBar, MarketData, MarketQuote, QuoteBatch
 from traider.research.models import Pick, Posture, PostureLevel, RunKind, RunMeta, RunStatus
@@ -407,9 +408,10 @@ class RunBase:
         message: str,
         *,
         event: str | None = None,
+        send: bool = True,
     ) -> RunOutcome:
         """Record a finished run: the day's cost first, then ``write`` (which writes META
-        last), then the alert. A dry run does none of it."""
+        last), then the alert unless ``send`` is false. A dry run does none of it."""
         assert self.meter is not None
         assert outcome.meta is not None
         if not self.dry_run:
@@ -423,7 +425,8 @@ class RunBase:
             self.cost_added = True
             await write()
             self.written = outcome
-            await self.alert(outcome.meta.status, message, event=event)
+            if send:
+                await self.alert(outcome.meta.status, message, event=event)
         return outcome
 
     async def fail(self, exc: BaseException) -> RunOutcome:
@@ -495,11 +498,12 @@ class RunBase:
 
 
 class _Run(RunBase):
-    """The pre-market run."""
+    """The pre-market run. The intraday run reuses its stages, through the hooks below."""
 
     kind: ClassVar[RunKind] = KIND
     lock_name: ClassVar[str] = LOCK_NAME
     title: ClassVar[str] = "Research"
+    intraday_dives: ClassVar[bool] = False  # tells the model it is an intraday idea
 
     def __init__(self, deps: RunDeps, now: datetime, run_id: str, *, dry_run: bool) -> None:
         super().__init__(deps, now, run_id, dry_run=dry_run)
@@ -511,6 +515,19 @@ class _Run(RunBase):
     def models(self) -> tuple[str, ...]:
         dive = self.jobs.dive
         return tuple(dict.fromkeys((dive.posture_model, dive.model)))
+
+    def screen_settings(self) -> ScreenSettings:
+        return self.jobs.screen
+
+    def dive_settings(self) -> DiveSettings:
+        return self.jobs.dive
+
+    def alert_wanted(self, status: RunStatus, posture: Posture, picks: Sequence[Pick]) -> bool:
+        return True
+
+    def summary(self, posture: Posture, picks: Sequence[Pick], meta: RunMeta) -> str:
+        """The alert text, from code-made values and scrubbed notes only."""
+        return _summary(self.kind, self.today, posture, picks, meta)
 
     # --------------------------------------------------------------------- flow
 
@@ -699,7 +716,7 @@ class _Run(RunBase):
         list[ScreenRow], dict[str, MarketQuote], dict[str, list[DailyBar]], dict[str, Profile]
     ]:
         deps, jobs, today = self.deps, self.jobs, self.today
-        settings = jobs.screen
+        settings = self.screen_settings()
         symbols = snapshot.candidates
         batch = await deps.market.quotes(symbols) if symbols else QuoteBatch({})
         if batch.skipped:
@@ -832,10 +849,11 @@ class _Run(RunBase):
         bars: Mapping[str, list[DailyBar]],
         profiles: Mapping[str, Profile],
     ) -> list[DiveResult]:
-        deps, jobs = self.deps, self.jobs
+        deps = self.deps
         assert self.meter is not None
         meter = self.meter
-        gate = asyncio.Semaphore(jobs.dive.dive_concurrency)
+        settings = self.dive_settings()
+        gate = asyncio.Semaphore(settings.dive_concurrency)
         deadline = self.started + self.max_run_s
         context = {
             "posture": decision.level.value,
@@ -859,6 +877,7 @@ class _Run(RunBase):
                     earnings_ok=snapshot.earnings_ok,
                     profile=profiles.get(row.symbol),
                     market_context=context,
+                    intraday=self.intraday_dives,
                 )
                 # Cancelled by the hard stop, run_dive charges the call in flight and
                 # re-raises; the task then ends cancelled.
@@ -868,9 +887,9 @@ class _Run(RunBase):
                     events=deps.events,
                     llm=deps.llm,
                     meter=meter,
-                    settings=jobs.dive,
+                    settings=settings,
                 )
-                await self.put_trail(f"dives/{row.symbol}.json", result.trail(jobs.dive.model))
+                await self.put_trail(f"dives/{row.symbol}.json", result.trail(settings.model))
                 return result
 
         tasks: list[asyncio.Task[DiveResult | None]] = []
@@ -1006,7 +1025,10 @@ class _Run(RunBase):
             await self.deps.store.write_run(meta, ranked.picks, posture)
 
         return await self.commit(
-            outcome, write, _summary(self.kind, self.today, posture, ranked.picks, meta)
+            outcome,
+            write,
+            self.summary(posture, ranked.picks, meta),
+            send=self.alert_wanted(status, posture, ranked.picks),
         )
 
 

@@ -40,6 +40,7 @@ from traider.broker.schwab import SchwabBroker
 from traider.config import Config, ConfigError, RiskLimits, check_symbols
 from traider.log import setup_logging
 from traider.models import Bar
+from traider.research.intraday import run_intraday
 from traider.research.run import RunDeps, RunOutcome, run_premarket
 from traider.research.scorecard_run import run_scorecard
 from traider.research.scrub import scrub
@@ -634,13 +635,22 @@ async def research_show(source: ResearchSource, out: TextIO, *, now: datetime) -
     return 0
 
 
-RESEARCH_KINDS = ("premarket", "scorecard")
+RESEARCH_KINDS = ("premarket", "intraday", "scorecard")
 
 DRY_RUN_NOTICE = (
     "Dry run: real calls to Schwab, Finnhub and Claude on Amazon Bedrock. The Bedrock calls "
     "cost real money (about $1-2 a run with the default model). Nothing is written to the "
     "research table (no picks, posture, cost or lock) and no alert is sent. The trail is "
     "written to {where}.\n\n"
+)
+
+INTRADAY_DRY_RUN_NOTICE = (
+    "Dry run: real calls to Schwab, Finnhub and Claude on Amazon Bedrock, and reads of the "
+    "research table and the bot's ledger. The Bedrock calls cost real money (at most "
+    "research_jobs.budget.intraday_run_usd, $0.75 by default). It needs the session open "
+    "and an ok posture today, and ignores research_jobs.intraday.last_start. Nothing is "
+    "written to the research table (no picks, posture, cost or lock) and no alert is sent. "
+    "The trail is written to {where}.\n\n"
 )
 
 SCORECARD_DRY_RUN_NOTICE = (
@@ -655,7 +665,7 @@ Runner = Callable[..., Awaitable[RunOutcome]]
 
 def _runners() -> dict[str, Runner]:
     """Each kind's runner. Built when the run starts, so tests can replace a runner."""
-    return {"premarket": run_premarket, "scorecard": run_scorecard}
+    return {"premarket": run_premarket, "intraday": run_intraday, "scorecard": run_scorecard}
 
 
 def _runner(kind: str) -> Runner:
@@ -693,13 +703,14 @@ async def research_run(
         return 2
     clock = SystemClock()
     if dry_run:
-        notice = SCORECARD_DRY_RUN_NOTICE if kind == "scorecard" else DRY_RUN_NOTICE
+        notices = {"scorecard": SCORECARD_DRY_RUN_NOTICE, "intraday": INTRADAY_DRY_RUN_NOTICE}
+        notice = notices.get(kind, DRY_RUN_NOTICE)
         out.write(notice.format(where=trail_dir))
         out.flush()
     async with aiohttp.ClientSession() as http:
         try:
             deps = await build(
-                config, http, dry_run=dry_run, trail_dir=Path(trail_dir), clock=clock
+                config, http, kind=kind, dry_run=dry_run, trail_dir=Path(trail_dir), clock=clock
             )
         except Exception as exc:
             text = _error_text(exc)
@@ -791,7 +802,10 @@ def _parser() -> argparse.ArgumentParser:
         "(they cost money); the scorecard calls no model",
     )
     run_research.add_argument(
-        "--force", action="store_true", help="run even if today's run already finished"
+        "--force",
+        action="store_true",
+        help="run even if today's run already finished; for intraday, start after "
+        "research_jobs.intraday.last_start",
     )
     run_research.add_argument(
         "--trail-dir",

@@ -51,6 +51,8 @@ DEFAULT_TRAIL_DIR = "./research-trail"
 # quota (about 120 a minute). Research takes a third of it, which leaves the bot room if
 # both run at once; a run then takes a few minutes of Schwab calls.
 RESEARCH_SCHWAB_MAX_PER_MINUTE = 40
+# The intraday runs happen while the bot trades: they take a sixth of the quota.
+INTRADAY_SCHWAB_MAX_PER_MINUTE = 20
 
 
 class SetupError(Exception):
@@ -109,6 +111,7 @@ async def build_deps(
     config: Config,
     http: aiohttp.ClientSession,
     *,
+    kind: str = "premarket",
     dry_run: bool,
     trail_dir: Path,
     clock: Clock,
@@ -124,6 +127,11 @@ async def build_deps(
     aws = app.Aws(config.aws_region)
     settings = await load_settings(config, aws)
     state = bot_state(config, aws)
+    if kind == "intraday" and state is None:
+        raise SetupError(
+            "an intraday run needs the bot's state table to know what it holds: set "
+            "TRAIDER_STATE_TABLE and TRAIDER_STATE_NAMESPACE"
+        )
     key = await finnhub_key(config, aws)
     try:
         events = FinnhubEvents(http, key, base_url=finnhub_base_url)
@@ -135,9 +143,10 @@ async def build_deps(
         clock=clock,
         token_url=token_url,
     )
-    client = SchwabClient(
-        http, tokens, base_url=schwab_base_url, max_per_minute=RESEARCH_SCHWAB_MAX_PER_MINUTE
+    per_minute = (
+        INTRADAY_SCHWAB_MAX_PER_MINUTE if kind == "intraday" else RESEARCH_SCHWAB_MAX_PER_MINUTE
     )
+    client = SchwabClient(http, tokens, base_url=schwab_base_url, max_per_minute=per_minute)
 
     def trail(prefix: str) -> Trail:
         if dry_run or not config.research_bucket:
