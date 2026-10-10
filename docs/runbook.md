@@ -423,6 +423,12 @@ uv run --env-file .env traider research run --kind premarket
 uv run --env-file .env traider research run --kind premarket --force
 ```
 
+**Not while the bot trades.** Research signs in as the same Schwab app as the bot, so
+they share Schwab's per-app request quota. Do not start a run without `--dry-run` while a
+live bot is trading (and keep dry runs out of market hours too: they make the same calls).
+Research holds itself to 40 Schwab requests a minute, so a run spends a few minutes on
+Schwab calls alone; the scheduled run at 08:00 finishes well before the open.
+
 **A start that failed.** Read the dead-letter queue, then empty it. The queue is
 `<prefix>-research-schedule-dlq`, and the `researchCluster` output is `<prefix>-research`:
 

@@ -42,6 +42,10 @@ from traider.timeutil import Clock
 log = logging.getLogger(__name__)
 
 DEFAULT_TRAIL_DIR = "./research-trail"
+# Research and the bot sign in as the same Schwab app, so they share its per-app request
+# quota (about 120 a minute). Research takes a third of it, which leaves the bot room if
+# both run at once; a run then takes a few minutes of Schwab calls.
+RESEARCH_SCHWAB_MAX_PER_MINUTE = 40
 
 
 class SetupError(Exception):
@@ -112,7 +116,9 @@ async def build_deps(
         clock=clock,
         token_url=token_url,
     )
-    client = SchwabClient(http, tokens, base_url=schwab_base_url)
+    client = SchwabClient(
+        http, tokens, base_url=schwab_base_url, max_per_minute=RESEARCH_SCHWAB_MAX_PER_MINUTE
+    )
 
     def trail(prefix: str) -> Trail:
         if dry_run or not config.research_bucket:

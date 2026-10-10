@@ -26,7 +26,7 @@ from traider.research.market import SchwabMarketData
 from traider.research.run import RunDeps, RunOutcome
 from traider.research.store import DynamoResearchStore, MemoryResearchStore
 from traider.research.trail import LocalTrail, MemoryTrail, S3Trail
-from traider.research.wiring import SetupError, build_deps
+from traider.research.wiring import RESEARCH_SCHWAB_MAX_PER_MINUTE, SetupError, build_deps
 from traider.schwab.oauth import REFRESH_TOKEN_LIFETIME_S
 from traider.schwab.tokens import Grant
 from traider.settings import Settings
@@ -338,6 +338,8 @@ async def test_the_wiring_builds_real_adapters_from_the_configuration(aws_stack,
         assert isinstance(deps.trail("runs/x/"), LocalTrail)  # no bucket configured
         assert deps.settings == Settings.from_config(stack_config(aws_stack))
         assert API_KEY not in repr(deps.events)
+        # Research shares Schwab's per-app quota with the bot: it takes a small share.
+        assert deps.market._client._limiter._max == RESEARCH_SCHWAB_MAX_PER_MINUTE == 40
 
 
 async def test_a_dry_run_keeps_its_trail_local_and_sends_no_alert(aws_stack, tmp_path):
