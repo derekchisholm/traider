@@ -131,7 +131,7 @@ def test_the_c2a_defaults_are_the_specs():
         ({"intraday": {"last_start": "15:00+00:00"}}, "without a timezone"),
         ({"intraday": {"deep_dive_count": 11}}, "deep_dive_count"),
         ({"intraday": {"max_run_s": 1201}}, "max_run_s"),
-        ({"scorecard": {"lookback_days": 4}}, "lookback_days"),
+        ({"scorecard": {"lookback_days": 29}}, "lookback_days"),
         ({"scorecard": {"lookback_days": 61}}, "lookback_days"),
         ({"scorecard": {"surprise": 1}}, "surprise"),
     ],

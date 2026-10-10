@@ -3,13 +3,21 @@
 Every return is a percentage from the entry (the pick day's open), signed by the pick's
 side: a long gains when the price rises, a bearish pick (long puts) when it falls.
 
-    ret_<h>d          close of the h-th trading day from the pick day (1 = the pick day)
+    ret_<h>d          close of the h-th trading bar from the pick day (1 = the pick day)
     ret_0d            intraday picks only: the pick day's close
     mfe_pct, mae_pct  the best and the worst signed move inside the live window
     hit_invalidation  long: a low at or below the invalidation; bearish: a high at or above
     expired_return    the close of the expiry day (the last bar of the window once it closed)
 
-The live window runs from the pick day to the expiry day, capped at today. An outcome is
+Horizons count bars, not calendar days, and holidays are not known here. So a missing bar
+must never be bridged: usable data ends at the first bar that is unusable (a non-finite or
+non-positive price) or that follows a gap of more than ``MAX_GAP_DAYS`` calendar days (a
+weekend plus a holiday stays under it). Whatever lies beyond stays None and the outcome
+stays pending or partial. A single missing mid-week bar looks like a holiday and cannot be
+told apart without a market calendar.
+
+The live window runs from the pick day to the expiry day, capped at today (an expiry before
+the pick day counts as the pick day itself). An outcome is
 ``pending`` without an entry, ``final`` once the 20-day return and the expiry are both
 known (or the pick is 30 weekdays old), and ``partial`` in between.
 """
@@ -41,6 +49,7 @@ HORIZONS: Final = (1, 5, 20)
 FINAL_AFTER_WEEKDAYS: Final = 30
 BUCKETS: Final = ((60, 69), (70, 79), (80, 89), (90, 100))
 DIGITS: Final = 4
+MAX_GAP_DAYS: Final = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +94,12 @@ def score_pick(
     outside the pick day to today are ignored, and so is everything from the first bar
     with an unusable price."""
     in_range = sorted((b for b in bars if pick_day <= b.day <= today), key=lambda b: b.day)
-    # A bar with a non-finite or non-positive price is unusable. Nothing is guessed in its
-    # place, and since a horizon counts bars by position, nothing after it is used either.
-    series = []
+    # A bar with a non-finite or non-positive price is unusable, and so is any bar after a
+    # gap of more than MAX_GAP_DAYS days. Nothing is guessed in their place, and since a
+    # horizon counts bars by position, nothing after them is used either.
+    series: list[DailyBar] = []
     for b in in_range:
-        if not _usable(b):
+        if not _usable(b) or (series and (b.day - series[-1].day).days > MAX_GAP_DAYS):
             break
         series.append(b)
     old = weekdays_between(pick_day, today) >= FINAL_AFTER_WEEKDAYS
@@ -123,7 +133,7 @@ def score_pick(
                 matured.add(name)
     if pick.horizon is Horizon.INTRADAY:
         fields["ret_0d"] = signed_pct(entry, series[0].close, side)
-    expiry = trading_date(pick.expires_at)
+    expiry = max(trading_date(pick.expires_at), pick_day)
     window = [b for b in series if b.day <= expiry]
     moves = [signed_pct(entry, price, side) for b in window for price in (b.high, b.low)]
     invalidation = float(pick.invalidation)
@@ -169,6 +179,7 @@ def traded_from_logs(
     """Whether the bot submitted a buy in ``symbol`` while the pick was live, from its
     event log, one list per trading day. A day missing from ``logs`` or read as None was
     unreadable: then the answer is None unless a buy was found on another day."""
+    end = max(end, start)  # an end before the start is just the start
     unknown = False
     for day in weekdays_from(trading_date(start), trading_date(end)):
         events = logs.get(day)
@@ -231,11 +242,15 @@ def summarize(
     )
 
 
+def _picks(n: int) -> str:
+    return f"{n} pick" if n == 1 else f"{n} picks"
+
+
 def _stats_text(stats: HorizonStats, horizon: str) -> str:
     if not stats.matured or stats.mean_pct is None:
         return f"no picks matured {horizon}"
     return (
-        f"{stats.matured} picks matured {horizon}, hit {stats.hits}/{stats.matured}, "
+        f"{_picks(stats.matured)} matured {horizon}, hit {stats.hits}/{stats.matured}, "
         f"mean {stats.mean_pct:+.1f}%"
     )
 
@@ -244,5 +259,5 @@ def summary_text(summary: ScoreSummary) -> str:
     """The alert: short and plain. Counts and numbers only, no symbols or model text."""
     return (
         f"traider scorecard {summary.day.isoformat()}: {_stats_text(summary.ret_1d, '1d')}; "
-        f"{_stats_text(summary.ret_5d, '5d')}; {summary.picks} picks in the window"
+        f"{_stats_text(summary.ret_5d, '5d')}; {_picks(summary.picks)} in the window"
     )

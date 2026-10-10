@@ -168,7 +168,7 @@ class ScorecardSettings(_Group):
 
     enabled: bool = True
     # Picks from this many weekdays back are scored.
-    lookback_days: Annotated[int, Field(ge=5, le=60)] = 30
+    lookback_days: Annotated[int, Field(ge=30, le=60)] = 30
 
 
 class ResearchJobSettings(_Group):

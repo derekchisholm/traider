@@ -1,7 +1,7 @@
 """The scorecard's maths, on fixed bar series: returns signed by side, excursions, the
 invalidation, status transitions, "traded" from the event log, and the summary."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -175,6 +175,35 @@ def test_a_bad_later_bar_is_not_guessed_and_nothing_after_it_is_used(junk):
     assert o.status is OutcomeStatus.PARTIAL
 
 
+def test_an_expiry_before_the_pick_day_means_the_pick_day_itself():
+    o = score(pick(expires=date(2026, 10, 2))).outcome
+    assert (o.mfe_pct, o.mae_pct) == (3.0, -1.0)  # Monday's bar alone
+    assert o.expired_return == 2.0  # Monday's close
+    assert o.hit_invalidation is False
+
+
+def test_a_long_invalidation_equal_to_the_low_is_hit():
+    assert score(pick(invalidation="94")).outcome.hit_invalidation is True
+    assert score(pick(invalidation="93.99")).outcome.hit_invalidation is False
+
+
+def test_a_gap_of_missing_bars_ends_the_usable_data():
+    # Wednesday to Friday are missing: Tuesday to the 12th is a six-day gap. The 12th's bar
+    # must not become the "5th" bar, and the expiry (Friday) is not known.
+    bars = [WEEK[0], WEEK[1], WEEK[5]]
+    o = score(pick(), bars=bars).outcome
+    assert (o.ret_1d, o.ret_5d, o.expired_return) == (2.0, None, None)
+    assert (o.mfe_pct, o.mae_pct) == (4.0, -2.0)
+    assert o.status is OutcomeStatus.PARTIAL
+
+
+def test_a_weekend_and_a_holiday_are_not_a_gap():
+    # Friday to Tuesday (a Monday holiday) is four days: the bars still count.
+    bars = [WEEK[0], bar(date(2026, 10, 9), 100, 101, 99, 103), bar(date(2026, 10, 13), 1, 2, 1, 2)]
+    o = score(pick(expires=date(2026, 10, 13)), bars=bars, today=date(2026, 10, 13)).outcome
+    assert o.ret_5d is None and o.expired_return == -98.0  # three bars: the 3rd is the 13th
+
+
 def test_a_hand_made_pick_without_features_still_scores():
     o = score(pick(features={})).outcome
     assert (o.llm_score, o.price_at_pick, o.ret_1d) == (None, None, 2.0)
@@ -220,6 +249,12 @@ def test_anything_else_does_not(event):
     assert traded_from_logs({MON: [event], TUE: []}, "NVDA", START, END) is False
 
 
+def test_an_end_before_the_start_is_the_start():
+    event = submitted("NVDA", at=START.isoformat())
+    logs = {MON: [event], TUE: []}
+    assert traded_from_logs(logs, "NVDA", START, START - timedelta(days=1)) is True
+
+
 def test_an_unreadable_day_makes_it_unknown_unless_a_buy_was_found():
     assert traded_from_logs({MON: [], TUE: None}, "NVDA", START, END) is None
     assert traded_from_logs({MON: []}, "NVDA", START, END) is None  # TUE never read
@@ -259,6 +294,16 @@ def test_the_summary_counts_hits_means_and_buckets():
     assert summary_text(summary) == (
         "traider scorecard 2026-10-05: 3 picks matured 1d, hit 2/3, mean +0.7%; "
         "no picks matured 5d; 4 picks in the window"
+    )
+
+
+def test_the_alert_says_one_pick_in_the_singular():
+    summary = summarize(
+        [score(pick(), today=MON)], day=MON, run_id="scorecard-x", kinds={}, now=NOW
+    )
+    assert summary_text(summary) == (
+        "traider scorecard 2026-10-05: 1 pick matured 1d, hit 1/1, mean +2.0%; "
+        "no picks matured 5d; 1 pick in the window"
     )
 
 
