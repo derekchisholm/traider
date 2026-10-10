@@ -163,6 +163,7 @@ class Engine:
         # Research picks and the day's posture. None: research is off and the old rules hold.
         self._research = research
         self._research_at: datetime | None = None
+        self._no_posture_day: date | None = None  # the day research_no_posture was reported
         # The positions the bot opened itself. Only used with research on: then the bot
         # trades what it opened (and pinned symbols) and leaves every other holding alone.
         self._ledger: dict[str, LedgerEntry] = {}
@@ -350,6 +351,7 @@ class Engine:
         interval = self.ACCOUNT_RETRY_S if self._account_dirty else self.ACCOUNT_REFRESH_S
         if _due(self._account_attempt_at, now, interval):
             await self._refresh_account(now)
+        await self._check_posture(now)
 
     async def _update_permissions(self, now: datetime) -> None:
         mode = self._control.mode(now)
@@ -438,6 +440,35 @@ class Engine:
                 "The research table is readable again. New positions follow the live picks "
                 "and the day's posture.",
             )
+
+    async def _check_posture(self, now: datetime) -> None:
+        """Once per trading day, ``research.posture_alert_after_open_min`` after the open:
+        with research on and the session open, say so if research, read since then, has
+        no usable posture for today. The bot stands aside either way; this makes it loud.
+        A posture research set to ``stand_aside`` is not missing, and staleness has its
+        own alert."""
+        research = self._research
+        today = trading_date(now)
+        if research is None or self._no_posture_day == today:
+            return
+        session = self._session.view(now)
+        if not session.is_open or session.minutes_since_open is None:
+            return
+        delay = self._settings.research.posture_alert_after_open_min
+        if session.minutes_since_open < delay:
+            return
+        view = research.view
+        alert_from = now - timedelta(minutes=session.minutes_since_open - delay)
+        if view.as_of is None or view.as_of < alert_from or not view.posture_missing:
+            return  # not read since the alert time yet, or nothing is missing
+        self._no_posture_day = today
+        await self._event("research_no_posture", {"day": today.isoformat()}, now)
+        await self._alerts.send(
+            "research_no_posture",
+            "No research posture today",
+            "No usable research posture for today; the bot is standing aside. Check the "
+            "pre-market run (alerts, META, the DLQ).",
+        )
 
     async def _settings_unreadable(self, update: SettingsUpdate, now: datetime) -> None:
         """Say so, once, when the settings have stayed unreadable for a while."""

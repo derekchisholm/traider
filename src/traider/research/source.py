@@ -59,6 +59,14 @@ class ResearchView:
             return PostureLevel.STAND_ASIDE
         return self.posture.level
 
+    @property
+    def posture_missing(self) -> bool:
+        """Research was read and ``todays_posture`` found no usable posture for today (none
+        from an ok run, or an unreadable posture item): the bot stands aside for want of
+        one. Not the same as research choosing ``stand_aside``, and false while research is
+        stale or has never been read (``research_stale`` covers those)."""
+        return self.as_of is not None and not self.stale and self.posture is None
+
     def pick(self, symbol: str, now: datetime) -> Pick | None:
         found = self.picks.get(symbol)
         return found if found is not None and now < found.expires_at else None
