@@ -5,7 +5,7 @@ Fail closed: until a read succeeds, and once reads have failed for longer than
 depend on any of this; it only narrows and shrinks entries.
 
 Today's posture (``todays_posture``) starts from the newest posture of an ok run; only
-when there is none, and ``accept_partial_runs`` is set, from the newest of a partial run.
+when there is none, and ``accept_partial_runs`` is set, from the earliest of a partial run.
 Without one, or with any unreadable posture item today, the bot stands aside. A posture
 written at or after the starting one, by a run of any status (ok, partial, running or
 failed), can only make it stricter, never looser (``strictest_since``). The intraday
@@ -79,17 +79,19 @@ def todays_posture(research: DayResearch, *, accept_partial_runs: bool) -> Postu
     if research.invalid_postures:
         return None  # an unreadable posture may be the newest one
 
-    def newest(status: RunStatus) -> Posture | None:
-        found = [
+    def of(status: RunStatus) -> list[Posture]:
+        return [
             p
             for p in research.postures
             if (run := research.runs.get(p.run_id)) is not None and run.status is status
         ]
-        return max(found, key=lambda p: p.at) if found else None
 
-    start = newest(RunStatus.OK)
-    if start is None and accept_partial_runs:
-        start = newest(RunStatus.PARTIAL)
+    ok, partial = of(RunStatus.OK), of(RunStatus.PARTIAL)
+    start = max(ok, key=lambda p: p.at) if ok else None
+    if start is None and accept_partial_runs and partial:
+        # The earliest: every partial posture after it then counts, so two partial runs
+        # never loosen each other.
+        start = min(partial, key=lambda p: p.at)
     return strictest_since(start, research.postures) if start is not None else None
 
 

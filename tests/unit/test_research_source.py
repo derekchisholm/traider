@@ -196,6 +196,15 @@ async def test_an_equally_strict_newer_posture_leaves_the_usable_one_in_place():
     assert (src.view.level, src.view.posture.run_id) == (PostureLevel.REDUCED, "r1")
 
 
+async def test_two_partial_runs_never_loosen_each_other():
+    store = MemoryResearchStore()
+    await store.write_run(meta("r1", "partial"), [], posture("stand_aside", minutes=-60))
+    await store.write_run(meta("r2", "partial"), [], posture("trade", run_id="r2"))
+    src = source(store, accept_partial_runs=True)
+    await src.refresh(NOW)
+    assert (src.view.level, src.view.posture.run_id) == (PostureLevel.STAND_ASIDE, "r1")
+
+
 async def test_without_a_usable_posture_a_partial_one_is_not_enough():
     store = MemoryResearchStore()
     await store.write_run(meta("r1", "partial"), [], posture("trade"))
