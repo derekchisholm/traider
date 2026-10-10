@@ -108,6 +108,9 @@ class ResearchSettings(BaseModel):
     intraday_flatten_min: Annotated[int, Field(ge=1, le=120)] = 15
     # How many earlier trading days to look back for swing picks that have not expired.
     swing_lookback_days: Annotated[int, Field(ge=1, le=30)] = 10
+    # This many minutes after the open, with no usable posture for today, the bot says so
+    # once (research_no_posture). It stands aside either way.
+    posture_alert_after_open_min: Annotated[int, Field(ge=1, le=120)] = 5
 
 
 def check_symbols(value: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:

@@ -1,6 +1,6 @@
 """The research jobs' settings: defaults from the spec, and the rules between fields."""
 
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 
 import pytest
@@ -105,4 +105,63 @@ def test_research_jobs_round_trip_through_the_settings_json():
 def test_settings_written_before_research_jobs_existed_still_load():
     body = Settings().model_dump(mode="json")
     del body["research_jobs"]
+    assert Settings.model_validate(body).research_jobs == ResearchJobSettings()
+
+
+# --- C2a: intraday runs and the scorecard ------------------------------------------------
+
+
+def test_the_c2a_defaults_are_the_specs():
+    s = ResearchJobSettings()
+    assert s.dive.intraday_model == DEFAULT_MODEL
+    assert s.budget.intraday_run_usd == Decimal("0.75")
+    i = s.intraday
+    assert (i.enabled, i.last_start, i.max_candidates) == (True, time(15, 0), 30)
+    assert (i.deep_dive_count, i.max_run_s) == (3, 600.0)
+    assert (s.scorecard.enabled, s.scorecard.lookback_days) == (True, 30)
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"budget": {"intraday_run_usd": "9"}}, "intraday_run_usd"),
+        ({"dive": {"intraday_model": "anthropic.claude-haiku-5"}}, "no price"),
+        ({"intraday": {"last_start": "09:30"}}, "inside the session"),
+        ({"intraday": {"last_start": "16:00"}}, "inside the session"),
+        ({"intraday": {"last_start": "15:00+00:00"}}, "without a timezone"),
+        ({"intraday": {"deep_dive_count": 11}}, "deep_dive_count"),
+        ({"intraday": {"max_run_s": 1201}}, "max_run_s"),
+        ({"scorecard": {"lookback_days": 4}}, "lookback_days"),
+        ({"scorecard": {"lookback_days": 61}}, "lookback_days"),
+        ({"scorecard": {"surprise": 1}}, "surprise"),
+    ],
+)
+def test_inconsistent_c2a_settings_are_rejected(fields, message):
+    with pytest.raises(ValidationError, match=message):
+        jobs(**fields)
+
+
+def test_a_cheaper_intraday_model_needs_its_price():
+    haiku = "anthropic.claude-haiku-5"
+    s = jobs(
+        dive={"intraday_model": haiku},
+        budget={
+            "prices": {
+                haiku: {"in_per_mtok": "1", "out_per_mtok": "5"},
+                DEFAULT_MODEL: {"in_per_mtok": "2", "out_per_mtok": "10"},
+            }
+        },
+    )
+    assert s.dive.intraday_model == haiku
+
+
+def test_c2a_settings_round_trip_and_older_versions_still_load():
+    settings = Settings(research_jobs={"intraday": {"last_start": "14:30"}})
+    again = Settings.model_validate_json(settings.model_dump_json())
+    assert again.research_jobs.intraday.last_start == time(14, 30)
+    body = Settings().model_dump(mode="json")
+    for name in ("intraday", "scorecard"):
+        del body["research_jobs"][name]
+    del body["research_jobs"]["dive"]["intraday_model"]
+    del body["research_jobs"]["budget"]["intraday_run_usd"]
     assert Settings.model_validate(body).research_jobs == ResearchJobSettings()

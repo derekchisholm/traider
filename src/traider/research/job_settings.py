@@ -7,7 +7,7 @@ like everything else. Each research run reads the current version once, when it 
 from __future__ import annotations
 
 import math
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 from typing import Annotated, Self
 
@@ -86,6 +86,9 @@ class ScreenSettings(_Group):
 class DiveSettings(_Group):
     model: Annotated[str, Field(min_length=1, max_length=200)] = DEFAULT_MODEL
     posture_model: Annotated[str, Field(min_length=1, max_length=200)] = DEFAULT_MODEL
+    # The intraday runs' deep-dives. A smaller model is the owner's choice, once it has a
+    # price in budget.prices.
+    intraday_model: Annotated[str, Field(min_length=1, max_length=200)] = DEFAULT_MODEL
     max_tool_calls: Annotated[int, Field(ge=0, le=20)] = 6
     max_turns: Annotated[int, Field(ge=1, le=20)] = 8
     max_tokens: Annotated[int, Field(ge=256, le=8000)] = 2000
@@ -126,13 +129,46 @@ def _default_prices() -> dict[str, ModelPrice]:
 class BudgetSettings(_Group):
     run_usd: Usd = Decimal("3.00")
     day_usd: Usd = Decimal("8.00")
+    # One intraday run. Counts toward day_usd like every other run.
+    intraday_run_usd: Usd = Decimal("0.75")
     prices: dict[str, ModelPrice] = Field(default_factory=_default_prices)
 
     @model_validator(mode="after")
     def _run_within_day(self) -> Self:
         if self.run_usd > self.day_usd:
             raise ValueError("run_usd cannot exceed day_usd")
+        if self.intraday_run_usd > self.day_usd:
+            raise ValueError("intraday_run_usd cannot exceed day_usd")
         return self
+
+
+class IntradaySettings(_Group):
+    """The runs every 30 minutes during the session (C2a)."""
+
+    enabled: bool = True
+    # New York time. A start later than this (plus a few minutes for the task to start)
+    # does nothing, so the last run ends well before the bot's intraday flatten.
+    last_start: time = time(15, 0)
+    max_candidates: Annotated[int, Field(ge=1, le=100)] = 30
+    deep_dive_count: Annotated[int, Field(ge=1, le=10)] = 3
+    max_run_s: Annotated[float, Field(ge=60, le=1200)] = 600.0
+
+    @field_validator("last_start")
+    @classmethod
+    def _in_the_session(cls, value: time) -> time:
+        if value.tzinfo is not None:
+            raise ValueError("last_start is a New York wall-clock time, without a timezone")
+        if not time(9, 30) < value < time(16, 0):
+            raise ValueError("last_start must be inside the session, after 09:30 and before 16:00")
+        return value
+
+
+class ScorecardSettings(_Group):
+    """The daily scorecard after the close (C2a)."""
+
+    enabled: bool = True
+    # Picks from this many weekdays back are scored.
+    lookback_days: Annotated[int, Field(ge=5, le=60)] = 30
 
 
 class ResearchJobSettings(_Group):
@@ -146,6 +182,8 @@ class ResearchJobSettings(_Group):
     dive: DiveSettings = Field(default_factory=DiveSettings)
     rank: RankSettings = Field(default_factory=RankSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
+    intraday: IntradaySettings = Field(default_factory=IntradaySettings)
+    scorecard: ScorecardSettings = Field(default_factory=ScorecardSettings)
 
     @field_validator("watchlist")
     @classmethod
@@ -161,7 +199,7 @@ class ResearchJobSettings(_Group):
     @model_validator(mode="after")
     def _models_have_prices(self) -> Self:
         # Without a price the cost of a call cannot be bounded.
-        for model in (self.dive.model, self.dive.posture_model):
+        for model in (self.dive.model, self.dive.posture_model, self.dive.intraday_model):
             if model not in self.budget.prices:
                 raise ValueError(f"model {model!r} has no price in budget.prices")
         return self

@@ -55,6 +55,7 @@ config:
   #   reduced_factor: 0.5        # on a reduced day, order and position caps are multiplied by this
   #   intraday_flatten_min: 15   # intraday positions are sold this many minutes before the close
   #   swing_lookback_days: 10    # earlier trading days to look back for swing picks that have not expired
+  #   posture_alert_after_open_min: 5  # no usable posture this long after the open: one alert
 
   # The shipped strategy is a placeholder (a moving-average cross) that exists to
   # exercise the plumbing. It is not a recommendation. Write your own in
