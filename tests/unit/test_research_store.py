@@ -7,7 +7,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from traider.research.models import Pick, Posture, RunMeta
+from traider.research.models import Pick, PickOutcome, Posture, RunMeta, ScoreSummary
 from traider.research.store import DynamoResearchStore, MemoryResearchStore, ResearchWriter
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
@@ -401,3 +401,113 @@ async def test_meta_items_are_indexed_by_day_and_kind_for_the_jobs(store):
     await store.write_run(job_meta("premarket-a"), [pick(run_id="premarket-a")], None)
     item = store._table.get_item(Key={"pk": "RUN#premarket-a", "sk": "META"})["Item"]
     assert (item["gsi1pk"], item["gsi1sk"]) == (f"RUNDAY#{DAY}", "premarket#premarket-a")
+
+
+# --- C2a: the scorecard's items ------------------------------------------------------------
+
+
+def outcome(run_id="r1", rank=1, **overrides) -> PickOutcome:
+    fields = {
+        "run_id": run_id,
+        "rank": rank,
+        "symbol": "NVDA",
+        "side": "long",
+        "horizon": "intraday",
+        "score": 80,
+        "pre_score": 70,
+        "pick_day": DAY,
+        "run_status": "ok",
+        "status": "pending",
+        "updated_at": T1.isoformat(),
+    }
+    return PickOutcome.model_validate(fields | overrides)
+
+
+async def test_outcomes_read_back_by_key_and_missing_ones_are_absent(store):
+    first, second = outcome(rank=1), outcome(rank=2, status="final", ret_1d=2.5)
+    await store.put_outcome(first)
+    await store.put_outcome(second)
+    found = await store.outcomes([first.key, second.key, "PICK#nobody#001", first.key])
+    assert found == {first.key: first, second.key: second}
+    assert await store.outcomes([]) == {}
+
+
+async def test_an_outcome_is_overwritten_not_duplicated(store):
+    await store.put_outcome(outcome())
+    await store.put_outcome(outcome(status="partial", ret_1d=-1.0))
+    (found,) = (await store.outcomes(["PICK#r1#001"])).values()
+    assert (found.status.value, found.ret_1d) == ("partial", -1.0)
+
+
+async def test_an_unreadable_outcome_or_one_under_the_wrong_key_is_absent(store):
+    put_raw(store, "PICK#r1#001", "OUTCOME", "{not json")
+    put_raw(store, "PICK#r1#002", "OUTCOME", outcome(rank=3).model_dump_json())
+    assert await store.outcomes(["PICK#r1#001", "PICK#r1#002"]) == {}
+
+
+async def test_outcomes_read_more_than_one_batch(store):
+    many = [outcome(rank=rank) for rank in range(1, 251)]
+    for item in many:
+        await store.put_outcome(item)
+    found = await store.outcomes([o.key for o in many])
+    assert sorted(found) == sorted(o.key for o in many)
+
+
+async def test_dynamo_asks_again_for_unprocessed_keys(store):
+    if isinstance(store, MemoryResearchStore):
+        pytest.skip("unprocessed keys are a DynamoDB feature")
+    await store.put_outcome(outcome(rank=1))
+    await store.put_outcome(outcome(rank=2))
+    client = store._table.meta.client
+    real = client.batch_get_item
+    calls = []
+
+    def flaky(**kwargs):
+        calls.append(kwargs)
+        response = real(**kwargs)
+        if len(calls) == 1:  # the first answer leaves the second key for later
+            keys = kwargs["RequestItems"][TABLE]["Keys"]
+            response["Responses"][TABLE] = [
+                i for i in response["Responses"][TABLE] if i["pk"] == keys[0]["pk"]
+            ]
+            response["UnprocessedKeys"] = {TABLE: {"Keys": keys[1:], "ConsistentRead": True}}
+        return response
+
+    client.batch_get_item = flaky
+    found = await store.outcomes(["PICK#r1#001", "PICK#r1#002"])
+    assert sorted(found) == ["PICK#r1#001", "PICK#r1#002"]
+    assert [len(c["RequestItems"][TABLE]["Keys"]) for c in calls] == [2, 1]
+    assert all(c["RequestItems"][TABLE]["ConsistentRead"] for c in calls)
+
+
+async def test_outcome_items_never_show_up_in_the_bots_day_read(store):
+    await store.put_outcome(outcome())
+    day = await store.day(DAY)
+    assert (day.picks, day.postures, day.invalid) == ((), (), 0)
+
+
+async def test_picks_between_reads_each_weekday_with_its_runs(store):
+    await store.write_run(meta("r1", day="2026-10-08"), [pick(run_id="r1")], posture("trade", "r1"))
+    await store.write_run(meta("r2", day=DAY), [pick("AMD", run_id="r2")], None)
+    days = await store.picks_between(date(2026, 10, 2), date(2026, 10, 9))
+    # Friday 10-02 to Friday 10-09: six weekdays, the weekend left out.
+    assert [d.day for d in days] == [
+        "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09",
+    ]  # fmt: skip
+    by_day = {d.day: d for d in days}
+    assert [p.symbol for p in by_day["2026-10-08"].picks] == ["NVDA"]
+    assert set(by_day["2026-10-08"].runs) == {"r1"}
+    assert [p.symbol for p in by_day[DAY].picks] == ["AMD"]
+    assert await store.picks_between(date(2026, 10, 10), date(2026, 10, 11)) == []
+
+
+async def test_a_summary_is_stored_under_its_day_and_only_there(store):
+    summary = ScoreSummary(day=date(2026, 10, 9), run_id="scorecard-x", picks=3, updated_at=T1)
+    await store.put_score_summary(DAY, summary)
+    if isinstance(store, MemoryResearchStore):
+        body = store.raw(f"SCORE#{DAY}", "SUMMARY")["body"]
+    else:
+        body = store._table.get_item(Key={"pk": f"SCORE#{DAY}", "sk": "SUMMARY"})["Item"]["body"]
+    assert ScoreSummary.model_validate_json(body) == summary
+    with pytest.raises(ValueError, match="cannot be stored under"):
+        await store.put_score_summary("2026-10-08", summary)

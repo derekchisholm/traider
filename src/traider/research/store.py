@@ -5,6 +5,8 @@
     DAY#<date>    / POSTURE#<iso time>         the day's posture as of that time
     COST#<date>   / TOTAL                      what the research jobs spent that day
     LOCK#<name>   / LOCK                       one research run of a kind at a time
+    PICK#<run_id>#<rank:03d> / OUTCOME         how that pick did (the scorecard)
+    SCORE#<date>  / SUMMARY                    the scorecard's summary for that day
 
 META items carry ``gsi1pk = RUNDAY#<date>`` and ``gsi1sk = <kind>#<run_id>`` so the jobs
 can find a day's runs. The bot never queries the index.
@@ -21,13 +23,21 @@ import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
 from botocore.exceptions import ClientError
 
-from traider.research.models import Pick, Posture, RunKind, RunMeta
+from traider.research.models import (
+    Pick,
+    PickOutcome,
+    Posture,
+    RunKind,
+    RunMeta,
+    ScoreSummary,
+)
+from traider.timeutil import weekdays_from
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +81,56 @@ class ResearchWriter(Protocol):
     async def acquire_lock(self, name: str, owner: str, ttl_s: float, now: datetime) -> bool: ...
 
     async def release_lock(self, name: str, owner: str) -> None: ...
+
+    async def day(self, day: str) -> DayResearch: ...
+
+    async def picks_between(self, start: date, end: date) -> list[DayResearch]:
+        """Each weekday's research from ``start`` to ``end``, both included, oldest first."""
+        ...
+
+    async def outcomes(self, keys: Sequence[str]) -> dict[str, PickOutcome]:
+        """The stored outcomes for these ``PICK#...`` keys. Missing or unreadable: absent."""
+        ...
+
+    async def put_outcome(self, outcome: PickOutcome) -> None: ...
+
+    async def put_score_summary(self, day: str, summary: ScoreSummary) -> None: ...
+
+
+BATCH_GET_MAX = 100  # DynamoDB's limit per BatchGetItem request
+BATCH_GET_ROUNDS = 5  # unprocessed keys are asked for again at most this often
+BATCH_GET_BACKOFF_S = 0.1  # doubled before each new ask
+
+
+def _outcome_item(outcome: PickOutcome) -> dict[str, Any]:
+    return {
+        "pk": outcome.key,
+        "sk": "OUTCOME",
+        "body": json.dumps(outcome.model_dump(mode="json")),
+    }
+
+
+def _summary_item(day: str, summary: ScoreSummary) -> dict[str, Any]:
+    if summary.day.isoformat() != day:
+        raise ValueError(f"a summary for {summary.day} cannot be stored under {day}")
+    return {
+        "pk": f"SCORE#{day}",
+        "sk": "SUMMARY",
+        "body": json.dumps(summary.model_dump(mode="json")),
+    }
+
+
+def _parse_outcomes(items: Sequence[Mapping[str, Any]]) -> dict[str, PickOutcome]:
+    found: dict[str, PickOutcome] = {}
+    for item in items:
+        try:
+            outcome = PickOutcome.model_validate(json.loads(str(item["body"])))
+        except Exception:
+            log.warning("skipping an unreadable pick outcome %s", item.get("pk"))
+            continue
+        if outcome.key == item.get("pk"):  # an outcome stored under another pick's key: skip
+            found[outcome.key] = outcome
+    return found
 
 
 def _meta_item(meta: RunMeta) -> dict[str, Any]:
@@ -258,6 +318,21 @@ class MemoryResearchStore:
         metas = {run_id: self._items.get((f"RUN#{run_id}", "META")) for run_id in _run_ids(items)}
         return _parse_day(day, items, metas)
 
+    async def picks_between(self, start: date, end: date) -> list[DayResearch]:
+        return [await self.day(d.isoformat()) for d in weekdays_from(start, end)]
+
+    async def outcomes(self, keys: Sequence[str]) -> dict[str, PickOutcome]:
+        items = [item for key in dict.fromkeys(keys) if (item := self._items.get((key, "OUTCOME")))]
+        return _parse_outcomes(items)
+
+    async def put_outcome(self, outcome: PickOutcome) -> None:
+        item = _outcome_item(outcome)
+        self._items[(item["pk"], item["sk"])] = item
+
+    async def put_score_summary(self, day: str, summary: ScoreSummary) -> None:
+        item = _summary_item(day, summary)
+        self._items[(item["pk"], item["sk"])] = item
+
 
 class DynamoResearchStore:
     def __init__(self, table: Any) -> None:
@@ -372,3 +447,42 @@ class DynamoResearchStore:
             )
             metas[run_id] = response.get("Item")
         return _parse_day(day, items, metas)
+
+    async def picks_between(self, start: date, end: date) -> list[DayResearch]:
+        return [await self.day(d.isoformat()) for d in weekdays_from(start, end)]
+
+    async def outcomes(self, keys: Sequence[str]) -> dict[str, PickOutcome]:
+        """BatchGetItem, 100 keys a request, consistent reads. The table's client takes and
+        returns plain values. Keys DynamoDB leaves unprocessed are asked for again after a
+        growing pause; any still missing after that are absent, so the scorecard scores
+        those picks again (an overwrite, never a loss)."""
+        unique = list(dict.fromkeys(keys))
+        items: list[dict[str, Any]] = []
+        client = self._table.meta.client
+        name = self._table.name
+        for start in range(0, len(unique), BATCH_GET_MAX):
+            wanted: list[dict[str, Any]] = [
+                {"pk": key, "sk": "OUTCOME"} for key in unique[start : start + BATCH_GET_MAX]
+            ]
+            for attempt in range(BATCH_GET_ROUNDS):
+                if attempt:
+                    await asyncio.sleep(BATCH_GET_BACKOFF_S * 2 ** (attempt - 1))
+                response = await self._call(
+                    client.batch_get_item,
+                    RequestItems={name: {"Keys": wanted, "ConsistentRead": True}},
+                )
+                items.extend(response.get("Responses", {}).get(name, []))
+                wanted = response.get("UnprocessedKeys", {}).get(name, {}).get("Keys", [])
+                if not wanted:
+                    break
+            else:
+                log.warning(
+                    "%d pick outcome(s) stayed unprocessed; scoring them again", len(wanted)
+                )
+        return _parse_outcomes(items)
+
+    async def put_outcome(self, outcome: PickOutcome) -> None:
+        await self._call(self._table.put_item, Item=_outcome_item(outcome))
+
+    async def put_score_summary(self, day: str, summary: ScoreSummary) -> None:
+        await self._call(self._table.put_item, Item=_summary_item(day, summary))
