@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
 import aiohttp
+import pytest
 
 from traider.schwab.stream import SchwabStream
 from traider.schwab.tokens import MemoryTokenStore, StaticCredentials, TokenManager
@@ -419,3 +421,42 @@ async def test_a_failure_to_close_the_socket_is_logged(caplog):
     with caplog.at_level("WARNING", logger="traider.schwab.stream"):
         await stream._close_on_change(BrokenSocket())
     assert "socket is gone" in caplog.text
+
+
+# --- the fake streamer behaves like Schwab ---------------------------------------------------
+# Schwab only streams market data to a socket that has logged in. A fake that also streamed to
+# a socket it was refusing let the bot see a bar on a refused stream, out of order with the
+# polled ones, which made the stream-fallback test in test_bot.py flaky.
+
+
+def login(token: str) -> str:
+    request = {
+        "service": "ADMIN",
+        "command": "LOGIN",
+        "requestid": "0",
+        "parameters": {"Authorization": token},
+    }
+    return json.dumps({"requests": [request]})
+
+
+async def test_the_fake_streams_nothing_to_a_socket_that_has_not_logged_in(schwab):
+    async with aiohttp.ClientSession() as session, session.ws_connect(schwab.ws_url) as ws:
+        await until(lambda: len(schwab.sockets) == 1)
+        await schwab.push_quote("SPY", 512.30, 512.34)
+        await schwab.push_bar("SPY", 1, 1, 1, 1, 100, start_ms=0)
+        await schwab.push_raw("{}")
+        with pytest.raises(TimeoutError):
+            await ws.receive(timeout=0.1)
+
+
+async def test_the_fake_can_push_while_it_is_closing_a_refused_socket(schwab):
+    async with (
+        aiohttp.ClientSession() as session,
+        session.ws_connect(schwab.ws_url, autoclose=False) as ws,
+    ):
+        await ws.send_str(login("not-a-token"))
+        reply = json.loads((await ws.receive(timeout=3)).data)
+        assert reply["response"][0]["content"]["code"] == 3
+        # The server has sent its close frame; with no answer from us it stays mid-close.
+        assert (await ws.receive(timeout=3)).type is aiohttp.WSMsgType.CLOSE
+        await schwab.push_quote("SPY", 512.30, 512.34)  # must not write to the closing socket
