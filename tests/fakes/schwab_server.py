@@ -183,7 +183,8 @@ class FakeSchwab:
         self.requests: list[dict[str, Any]] = []
         self._faults: list[dict[str, Any]] = []
         # Streaming
-        self.sockets: list[web.WebSocketResponse] = []
+        self.sockets: list[web.WebSocketResponse] = []  # every open connection
+        self._logged_in: set[web.WebSocketResponse] = set()  # the ones market data goes to
         self.stream_logins = 0
         self.stream_requests: list[dict[str, Any]] = []
         self.stream_login_code = 0
@@ -867,9 +868,14 @@ class FakeSchwab:
                         stray = {**response, "requestid": "not-yours", "content": {"code": 11}}
                         await ws.send_str(json.dumps({"response": [stray]}))
                     await ws.send_str(json.dumps({"response": [response]}))
+                    if logged_in:
+                        self._logged_in.add(ws)
+                    else:
+                        self._logged_in.discard(ws)
                     if item["service"] == "ADMIN" and not logged_in:
                         await ws.close()
         finally:
+            self._logged_in.discard(ws)
             if ws in self.sockets:
                 self.sockets.remove(ws)
         return ws
@@ -912,9 +918,7 @@ class FakeSchwab:
         return reply
 
     async def _broadcast(self, payload: dict[str, Any]) -> None:
-        for ws in list(self.sockets):
-            await ws.send_str(json.dumps(payload))
-        await asyncio.sleep(0)
+        await self.push_raw(json.dumps(payload))
 
     async def push_level_one(self, symbol: str, **fields: Any) -> None:
         """Send a LEVELONE_EQUITIES update. Field numbers are given as f1=..., f2=..."""
@@ -1002,7 +1006,9 @@ class FakeSchwab:
         await self._broadcast({"notify": [{"heartbeat": str(int(self.now() * 1000))}]})
 
     async def push_raw(self, text: str) -> None:
-        for ws in list(self.sockets):
+        """Send a frame to every logged-in socket. Like Schwab, never to one that has not
+        logged in, and so never to one being closed after a refused login."""
+        for ws in [ws for ws in self.sockets if ws in self._logged_in]:
             await ws.send_str(text)
         await asyncio.sleep(0)
 
