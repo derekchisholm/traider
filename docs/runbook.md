@@ -183,8 +183,8 @@ once every 15 minutes.
 | Scorecard DATE: partial | As above, but daily bars were unreadable for half the symbols or more, or the bot's event log for half the days or more (the alert ends with the reasons). Picks without bars keep their last outcome (or stay `pending`), and `traded` stays unknown where the log was unreadable; all are scored again tomorrow. | Nothing, unless it repeats (check the research logs). Nothing the bot reads depends on the scorecard. |
 | Scorecard DATE: failed | The scorecard stopped at the stage it names. Nothing the bot reads changes. Outcomes already written stand and are scored again next time. | Read the research logs; an expired Schwab sign-in is the usual cause. Run it again by hand if you want today's records (below). |
 | Research intraday DATE: ok | An intraday run added picks or made the posture stricter (the alert gives both). Quiet runs send nothing. | Nothing. |
-| Research intraday DATE: partial | An intraday run did not finish what it planned: a budget or deadline, Finnhub's calendar, model calls, or a pick item it could not read (then it made no picks). By default the bot ignores a partial run's picks, but its posture can still only make the day stricter, and that reaches the bot. | Read the notes; nothing to redo, the next run is 30 minutes later. |
-| Research intraday DATE: failed | The run stopped at the stage it names. A failed intraday run writes nothing: the posture and picks already in force stay in force. A run that cannot read the bot's ledger fails at `held` (it will not pick what it cannot tell is held). Can repeat at every firing: up to 12 alerts a day. | Read the research logs. For `held`, check the state table, `TRAIDER_STATE_NAMESPACE` and the research task role. To stop the noise, set `traider:researchIntradayEnabled false` and `pulumi up`. |
+| Research intraday DATE: partial | An intraday run did not finish what it planned: a budget or deadline, Finnhub's calendar (failed, or empty over 5 or more weekdays), model calls, or a pick item it could not read (then it made no picks). By default the bot ignores a partial run's picks, but its posture can still only make the day stricter, and that reaches the bot. | Read the notes; nothing to redo, the next run is 30 minutes later. |
+| Research intraday DATE: failed | The run stopped at the stage it names. A failed intraday run writes no posture or picks (it does write a failed META and its cost): the posture and picks already in force stay in force. A run that cannot read the bot's ledger fails at `held` (it will not pick what it cannot tell is held). Can repeat at every firing: up to 12 alerts a day. | Read the research logs. For `held`, check the state table, `TRAIDER_STATE_NAMESPACE` and the research task role. To stop the noise, set `traider:researchIntradayEnabled false` and `pulumi up`. |
 | The research run stopped with an error | From AWS, not from the run: a research task exited with an error (it failed, it could not start, or another run of its kind held the lock). The alert names the task family: `<prefix>-research` is the pre-market run, `-scorecard` and `-intraday` the others. Only a missed pre-market run leaves the bot standing aside; a scorecard failure affects nothing the bot reads, and an intraday failure leaves the posture and picks already in force. | Read the research logs (below). A run that cannot even start (no Finnhub key stored or readable, invalid or unreadable settings, no research table or no AWS region) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
 | Alarm: the scheduler could not start the research run | The scheduler gave up on starting a task (two retries within 10 minutes) and put the request in the dead-letter queue, which all three schedules share. No task ran, so the alert above cannot fire. If it was the pre-market schedule, the bot stands aside today; a missed scorecard affects nothing the bot reads, and a missed intraday run leaves the posture and picks in force. | Read the message (its attributes name the schedule; not verified), then **purge the queue after every message** (below). If you do not, the alarm stays in ALARM and later failures, a missed pre-market run included, send no new alert. Intraday starts can fail at every firing, up to 12 times a day. |
 | No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) The pre-market run's alert, from its schedule only. No summary means the run did not finish, or never ran: the schedule is not enabled (`traider:researchScheduleEnabled`, off by default), the start failed, or the run is stuck. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
@@ -416,8 +416,10 @@ in this order:
 1. **Deploy with both switches off** (the default): `pulumi up`. This also gives the research
    task read access to the bot's state table (`Query` only, limited with
    `dynamodb:LeadingKeys` to `POS#<mode>` and `LOG#<mode>#*`) and sets `TRAIDER_STATE_TABLE`
-   and `TRAIDER_STATE_NAMESPACE` (the stack's trading mode) in its environment. Both are
-   needed together: without them every kind fails at setup. Whether the role is limited as
+   and `TRAIDER_STATE_NAMESPACE` (the stack's trading mode) in its environment. A table
+   without a namespace fails every kind; the intraday kind needs both; with neither, the
+   pre-market run and the scorecard run, and the scorecard reports `traded` as unknown.
+   Whether the role is limited as
    intended is **not verified**; check it before you enable anything. From `infra/`:
 
    ```sh
@@ -434,7 +436,7 @@ in this order:
    done
    ```
 
-   Expect `allowed`, `allowed`, then `implicitDeny` (give the key every time: a missing
+   (This command has not been run.) Expect `allowed`, `allowed`, then `implicitDeny` (give the key every time: a missing
    `LeadingKeys` value would pass the condition). If the simulator does not model
    `LeadingKeys`, that is not proof either way.
 2. **Dry-run each**, from the repository root with the `localEnv` output loaded. The scorecard
@@ -470,7 +472,7 @@ minutes' grace for the task to start) exits at once, so 15:30 always does.
 **What the intraday runs may do.** Only add intraday picks (flat by the close) and only
 make the day's posture stricter. They need an `ok` posture for today: without one a run
 exits `skipped` and writes nothing, so a lost morning stays a stand-aside day. They start
-from the day's posture as the bot reads it, they fetch Finnhub's earnings calendar on every
+from the day's posture as the bot reads it (always with `research.accept_partial_runs` off), they fetch Finnhub's earnings calendar on every
 run, and they leave out names already picked today, held (the bot's ledger), pinned or with
 any pick that has not expired. A swing idea is made intraday. An alert comes only when a
 run adds picks, tightens the posture or finishes `partial`; a quiet run still writes its
@@ -498,7 +500,9 @@ pre-market run (for example `--force`): it is authoritative.
 **Time and money limits.** Past `research_jobs.max_run_s` (20 minutes) before the screen,
 the run writes the posture and no picks, as `partial`. Past it during the deep-dives, no
 new dive starts and unfinished ones are cut short, as `partial`. A run still going 9
-minutes after `research_jobs.max_run_s` fails. The cost meter stops all model calls once a call overruns
+minutes after `research_jobs.max_run_s` fails. The intraday runs have their own, shorter box,
+`research_jobs.intraday.max_run_s` (600 seconds), with the same rules; the scorecard uses
+`research_jobs.max_run_s`. The cost meter stops all model calls once a call overruns
 its reservation or a budget would be exceeded, and estimates include a 1000-token allowance
 for tools.
 
@@ -550,7 +554,7 @@ features and why it was dropped), `dives/<symbol>.json` (each conversation with 
 and `result.json` (assessments, why each was refused, the picks; for the scorecard, the
 outcomes and the summary). An intraday run's `posture.json` also holds the posture it
 started from. The scorecard's records are in the research table: one
-`PICK#<run id>#<rank>` / `OUTCOME` item per pick and one `SCORE#<date>` / `SUMMARY` item per
+`PICK#<run_id>#<rank:03d>` / `OUTCOME` item per pick and one `SCORE#<date>` / `SUMMARY` item per
 day.
 
 ```sh

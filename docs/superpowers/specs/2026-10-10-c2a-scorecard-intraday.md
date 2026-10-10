@@ -24,8 +24,9 @@ C2b (later) covers the earnings watch after the close, the weekly watchlist and 
 | Scorecard schedule | `cron(30 16 ? * MON-FRI *)` New York | After the close. Uses daily bars, so an exact time is not needed. |
 | Intraday schedule | `cron(0/30 10-15 ? * MON-FRI *)` New York. The runner skips starts after `intraday.last_start` (15:00). | Runs 10:00 to 15:00. Leaves time before the bot's intraday flatten. |
 | Schedules start disabled | One toggle per kind: `traider:researchScorecardEnabled` and `traider:researchIntradayEnabled`, default false. | Same rollout as C1. |
+| Intraday failure | A failed intraday run writes no posture or picks, but does write a failed META and its cost. | The posture and picks in force stay. |
 | Intraday needs a morning run | An intraday run only proceeds when today already has an `ok` posture (see "Today's posture" below). Otherwise it exits `skipped` and writes nothing. | A failed morning means standing aside all day. Intraday must not rescue the day on code rules alone. |
-| Intraday posture | The new level is `stricter(today's posture as the bot reads it, code rules on current metrics)`. There is no model review. The run writes the posture again even when unchanged, so the time-stamped record is continuous. | Lets a VIX spike tighten the day mid-session. It can never loosen the morning call. |
+| Intraday posture | The new level is `stricter(today's posture as the bot reads it (always with `accept_partial_runs` off), code rules on current metrics)`. There is no model review. The run writes the posture again even when unchanged, so the time-stamped record is continuous. | Lets a VIX spike tighten the day mid-session. It can never loosen the morning call. |
 | Intraday picks | Only names not already picked today, not held (ledger), not pinned and without any unexpired pick from any run. Horizon forced to `intraday`, expiring at today's close. At most `intraday.deep_dive_count` (3) dives. If the posture is `stand_aside`: no dives, no picks. | Delta only, and cheap. |
 | Intraday model | `dive.intraday_model`, defaulting to the same model as the morning run. A smaller model is the owner's choice, once it has a price entry. | No model is used without a price. |
 | Intraday budget | `budget.intraday_run_usd` (default 0.75). It counts toward the shared `budget.day_usd`. | Bounds the per-run spend. |
@@ -147,7 +148,7 @@ Under the existing `traider:researchJobs` flag, no new bucket or secret. Additio
 | Two more Scheduler schedules, with the same DLQ (shared by all three), retries and maximum event age as C1 | Each starts `DISABLED` unless its toggle is true. Each toggle requires `researchJobs`. |
 | Two more task definitions (`{prefix}-research-scorecard`, `{prefix}-research-intraday`), identical to the pre-market one but for the command | Each schedule starts only its own. No container overrides. |
 | Task role: `dynamodb:Query` only on the state table, limited by `dynamodb:LeadingKeys` to `POS#<mode>` and `LOG#<mode>#*` | For the ledger and the event log. Check it with `aws iam simulate-principal-policy` before enabling (runbook, step 5). |
-| Task env: `TRAIDER_STATE_TABLE` and `TRAIDER_STATE_NAMESPACE`, set together | The namespace is the stack's trading mode; the task has no `TRAIDER_TRADING_MODE`. Without both, every kind fails at setup. |
+| Task env: `TRAIDER_STATE_TABLE` and `TRAIDER_STATE_NAMESPACE`, set together | The namespace is the stack's trading mode; the task has no `TRAIDER_TRADING_MODE`. A table without a namespace fails every kind; intraday needs both; with neither, premarket and scorecard run, and the scorecard reports `traded` as unknown. |
 | Scheduler role | May pass the same two roles and run the three task families |
 | Dead-letter queue | Shared by the three schedules. It must be purged after every message, or the alarm stays in ALARM and later failures send no alert. Intraday failures can alert up to 12 times a day. |
 
@@ -210,7 +211,7 @@ All offline, reusing the C1 fakes (`FakeMarketData`, `FakeEvents`, `ScriptedLLM`
 ## Decisions made while planning and building C2a
 
 * **Shared run scaffolding.** `research/run.py` gains `RunBase` (META, trail, cost meter and day cost, alerts, failure handling, time box) and `run_locked` (the lock per kind). The pre-market run is one kind (`_Run`); `scorecard_run.py` and `intraday.py` hold the others. The pre-market run's behaviour does not change.
-* **Intraday earnings.** Each intraday run makes one Finnhub calendar call (it does not reuse the morning's snapshot): no S3 read permission and no parsing of stored files. A failed or empty calendar makes the run `partial`.
+* **Intraday earnings.** Each intraday run makes one Finnhub calendar call (it does not reuse the morning's snapshot): no S3 read permission and no parsing of stored files. A failed calendar, or an empty one over a span of 5 weekdays or more, makes the run `partial`.
 * **`last_start` has 5 minutes' grace** (`START_GRACE_S`): a Fargate task takes a minute or two to start. The 15:30 firing of `cron(0/30 10-15 …)` is always skipped.
 * **"An ok posture today"** means today's posture as the bot reads it with `accept_partial_runs` off: the newest `ok` posture made stricter by any later one. An unreadable posture item means none (fail closed). The bot's ledger is required: without a state table the run cannot start, and a failed ledger read fails the run.
 * **Unreadable picks.** An intraday run that cannot read a pick item writes its posture and no picks, as `partial`.

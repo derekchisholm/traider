@@ -578,7 +578,8 @@ choose the strategy.
   nothing. A run:
   - needs an `ok` posture for today first; without one it exits `skipped` and writes
     nothing (it never rescues a day the morning run lost);
-  - starts from the day's posture as the bot reads it, and can only make it stricter on
+  - starts from the day's posture as the bot reads it (always with
+    `research.accept_partial_runs` off), and can only make it stricter on
     the code rules (a VIX spike, say), with no model review. It always writes its posture;
   - reads the market and the Finnhub earnings calendar (one call a run), then looks at the
     day's movers, leaving out names already picked today, held by the bot (its ledger,
@@ -598,6 +599,7 @@ choose the strategy.
 | `research_jobs.intraday.last_start` | 15:00 | New York time; a later start does nothing |
 | `research_jobs.intraday.deep_dive_count` | 3 | names studied per run |
 | `research_jobs.intraday.max_candidates` | 30 | candidates screened per run |
+| `research_jobs.intraday.max_run_s` | 600 | seconds an intraday run may take (the scorecard uses `research_jobs.max_run_s`) |
 | `research_jobs.dive.intraday_model` | `anthropic.claude-sonnet-5-5` | the intraday dives' model; it needs a price in `research_jobs.budget.prices` |
 | `research_jobs.budget.intraday_run_usd` | 0.75 | Bedrock spend per intraday run, within `day_usd` |
 
@@ -723,7 +725,8 @@ roughly $1-2 a weekday in Bedrock tokens with the default model (an estimate, no
 measured; capped at `research_jobs.budget.day_usd` a day), so roughly $20-45 a month, plus
 well under a dollar of Fargate and S3. Finnhub's free tier costs nothing. The intraday
 runs, when switched on, cost up to `research_jobs.budget.intraday_run_usd` ($0.75) each, 11
-a day at most, and all runs share the same `day_usd` cap. The scorecard calls no model.
+a day at most. That spend is unmeasured; it is capped per run and counts toward
+`research_jobs.budget.day_usd`, which all runs share. The scorecard calls no model.
 
 There is no NAT gateway (about $32 a month saved): the task has a public address and
 a security group with no inbound rules and outbound HTTPS only.
