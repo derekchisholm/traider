@@ -36,7 +36,7 @@ flowchart LR
         secrets["Secrets Manager<br/>app key, Schwab sign-in"]
         state[("DynamoDB<br/>lease, counters, audit log")]
         research[("DynamoDB<br/>research picks<br/>(opt-in)")]
-        jobs["Fargate task, weekdays 08:00<br/>research run (opt-in)"]
+        jobs["Fargate tasks, weekdays<br/>research runs: 08:00, intraday, 16:30 (opt-in)"]
         alerts["SNS<br/>alerts"]
         signin["HTTP API + Lambda<br/>Schwab sign-in"]
         watchdog["Lambda, daily<br/>sign-in expiry check"]
@@ -203,8 +203,9 @@ Not verified. Treat each as something to watch on first contact:
 - **Research has only run against fakes.** The research table, the position ledger and the
   research rules were tested with in-memory stores, a fake DynamoDB (moto) and the fake
   Schwab server. They have not met a real DynamoDB table or a real account.
-- **The pre-market research run has never called a real service.** It was tested end to
-  end against a fake Schwab, a fake Finnhub, a scripted model and moto. Not verified:
+- **The research runs have never called a real service** (the pre-market run, the
+  scorecard and the intraday runs). They were tested end to end against a fake Schwab, a
+  fake Finnhub, a scripted model and moto. Not verified:
   - tool use and forced tool choice through Bedrock's `bedrock-mantle` endpoint, the IAM
     action names it needs, and which Claude model ids your account and region can use;
   - whether Schwab's movers and quotes reflect pre-market trading at 08:00 New York time,
@@ -212,7 +213,12 @@ Not verified. Treat each as something to watch on first contact:
   - whether Schwab hands out a second access token while the bot's is still valid;
   - how much of the earnings calendar, company news and profiles Finnhub's free tier covers;
   - the token prices in the settings;
-  - the Scheduler, ECS task and dead-letter queue behaviour on real AWS.
+  - Schwab's movers during the session (the intraday runs), and whether the day's daily bar
+    is there at 16:30 (the scorecard);
+  - that the research task's `dynamodb:LeadingKeys` condition on the state table is enforced
+    as written (it should limit the task to the bot's ledger and event log);
+  - that the namespace the research task is given matches the bot's;
+  - the Scheduler, EventBridge, ECS task and dead-letter queue behaviour on real AWS.
 
   The first thing to run is `traider research run --kind premarket --dry-run`
   ([runbook](docs/runbook.md#research-jobs)).
@@ -540,6 +546,73 @@ price list.
 It needs a Finnhub key and Bedrock model access first; the
 [runbook](docs/runbook.md#research-jobs) has the steps and what each alert means.
 
+### The scorecard and the intraday runs
+
+Two more schedules start the same image, each with its own task definition and each created
+**disabled** behind its own switch (both need `traider:researchJobs: true`). The bot does
+not need either; it trades without them. Not financial advice: they measure and extend the research, and you still
+choose the strategy.
+
+- **The scorecard** (`traider:researchScorecardEnabled`), weekdays at 16:30 New York time:
+  `traider research run --kind scorecard`. It scores every pick of an `ok` or `partial` run
+  from the last `research_jobs.scorecard.lookback_days` weekdays (30; 30 to 60), from
+  Schwab daily bars, and calls no model:
+  - the entry is the pick day's open; `ret_1d`, `ret_5d` and `ret_20d` are the move to the
+    close of the 1st, 5th and 20th daily bar counting the pick day as the 1st, in percent
+    and signed by side (a bearish pick gains when the price falls); an intraday pick also
+    gets `ret_0d`, the pick day's move;
+  - the best and worst move while the pick was live (`mfe_pct`, `mae_pct`), whether the
+    invalidation price was reached, and the return at the expiry day's close;
+  - `traded`: whether the bot submitted a buy of the symbol (or an option on it) while the
+    pick was live, from the bot's event log (unknown if the log is unreadable);
+  - a pick is `final` once its 20-day return and its expiry are known (or after 30 weekdays);
+    `final` picks are not scored again. A value once known is never replaced by an unknown
+    one, and a status never goes backwards.
+
+  One `SCORE#<day>` summary per day (the hit rate and mean of the 1- and 5-day returns that
+  became known that day, and the mean 1-day return per score bucket) goes to the research
+  table and to a short alert. The web app (B) will report from these records.
+- **The intraday runs** (`traider:researchIntradayEnabled`), every 30 minutes from 10:00
+  (`traider research run --kind intraday`); a start after
+  `research_jobs.intraday.last_start` (15:00, plus 5 minutes for the task to start) does
+  nothing. A run:
+  - needs an `ok` posture for today first; without one it exits `skipped` and writes
+    nothing (it never rescues a day the morning run lost);
+  - starts from the day's posture as the bot reads it, and can only make it stricter on
+    the code rules (a VIX spike, say), with no model review. It always writes its posture;
+  - reads the market and the Finnhub earnings calendar (one call a run), then looks at the
+    day's movers, leaving out names already picked today, held by the bot (its ledger,
+    read-only), pinned, or with any pick that has not expired yet;
+  - studies at most `research_jobs.intraday.deep_dive_count` (3) names with
+    `research_jobs.dive.intraday_model`, within `research_jobs.budget.intraday_run_usd`
+    ($0.75); every pick is intraday, flat by today's close (a swing idea is made intraday);
+  - holds itself to 20 Schwab requests a minute, because the bot is trading;
+  - alerts only when it adds picks, tightens the posture or finishes `partial`. If it
+    cannot read a pick item, it makes no picks and finishes `partial`.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `research_jobs.scorecard.enabled` | true | false: no scorecard |
+| `research_jobs.scorecard.lookback_days` | 30 | weekdays of picks to score (30 to 60) |
+| `research_jobs.intraday.enabled` | true | false: no intraday runs |
+| `research_jobs.intraday.last_start` | 15:00 | New York time; a later start does nothing |
+| `research_jobs.intraday.deep_dive_count` | 3 | names studied per run |
+| `research_jobs.intraday.max_candidates` | 30 | candidates screened per run |
+| `research_jobs.dive.intraday_model` | `anthropic.claude-sonnet-5-5` | the intraday dives' model; it needs a price in `research_jobs.budget.prices` |
+| `research_jobs.budget.intraday_run_usd` | 0.75 | Bedrock spend per intraday run, within `day_usd` |
+
+**What the bot reads.** Today's posture is the strictest of: the newest `ok` posture (with
+`research.accept_partial_runs` and no `ok` one, the earliest `partial` posture), and every
+readable posture written at or after it today, whatever its run's status. So a partial
+intraday tightening reaches the bot and no run can loosen the day. The exception is a newer
+`ok` pre-market run (for example `--force`), which is authoritative.
+
+**Missing posture.** With research on, if a few minutes after the open
+(`research.posture_alert_after_open_min`, 5) the bot has read research and there is still no
+usable posture for today, it records `research_no_posture` and alerts once per process per
+trading day: it is standing aside all day, and the pre-market run failed, did not run or
+finished `partial`. It does not fire when research is stale (`research_stale` covers that).
+
 ### Seeding picks by hand
 
 Without the research run, or next to it on paper, you can write research yourself.
@@ -648,7 +721,9 @@ Rough monthly cost in us-east-1, before tax and free tiers:
 The [pre-market research run](#the-pre-market-research-run), when switched on, adds
 roughly $1-2 a weekday in Bedrock tokens with the default model (an estimate, not
 measured; capped at `research_jobs.budget.day_usd` a day), so roughly $20-45 a month, plus
-well under a dollar of Fargate and S3. Finnhub's free tier costs nothing.
+well under a dollar of Fargate and S3. Finnhub's free tier costs nothing. The intraday
+runs, when switched on, cost up to `research_jobs.budget.intraday_run_usd` ($0.75) each, 11
+a day at most, and all runs share the same `day_usd` cap. The scorecard calls no model.
 
 There is no NAT gateway (about $32 a month saved): the task has a public address and
 a security group with no inbound rules and outbound HTTPS only.
@@ -666,7 +741,8 @@ src/traider/            the bot
   lambdas/              sign-in endpoint and expiry watchdog
   universe.py           which symbols the bot watches (pinned, held, picked)
   research/             picks, posture, the research table, the bot's view of it, and
-                        the pre-market research run (run.py) and its parts
+                        the research runs (run.py: pre-market and what every run shares;
+                        intraday.py; scorecard_run.py) and their parts
   cli.py                run | check | login | backtest | settings | research
 tests/                  unit tests, the fake Schwab server, whole-bot tests
 infra/                  the Pulumi program (Python) and its tests
