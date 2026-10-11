@@ -8,12 +8,16 @@ from pydantic import ValidationError
 
 from traider.research.models import (
     Horizon,
+    OutcomeStatus,
     Pick,
+    PickOutcome,
     PickSide,
     Posture,
     PostureLevel,
     RunMeta,
     RunStatus,
+    ScoreSummary,
+    outcome_key,
 )
 
 T0 = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
@@ -204,3 +208,62 @@ def test_bad_run_accounting_is_rejected(bad):
     }
     with pytest.raises(ValidationError):
         RunMeta.model_validate(base | bad)
+
+
+# --- C2a: pick outcomes and the scorecard summary -----------------------------------------
+
+
+def outcome(**overrides) -> PickOutcome:
+    fields = {
+        "run_id": "premarket-20261009T120000Z-ab12",
+        "rank": 3,
+        "symbol": "NVDA",
+        "side": "long",
+        "horizon": "swing",
+        "score": 84,
+        "pre_score": 89,
+        "llm_score": 82,
+        "pick_day": "2026-10-09",
+        "run_status": "ok",
+        "entry": 104.0,
+        "ret_1d": 1.25,
+        "status": "partial",
+        "updated_at": "2026-10-09T20:30:00+00:00",
+    }
+    return PickOutcome.model_validate(fields | overrides)
+
+
+def test_an_outcome_parses_and_knows_its_key():
+    o = outcome()
+    assert (o.status, o.key) == (OutcomeStatus.PARTIAL, "PICK#premarket-20261009T120000Z-ab12#003")
+    assert outcome_key("r1", 12) == "PICK#r1#012"
+    assert (o.ret_5d, o.traded, o.hit_invalidation) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"surprise": 1},
+        {"ret_1d": float("nan")},
+        {"mfe_pct": float("inf")},
+        {"entry": 0},
+        {"run_status": "failed"},
+        {"run_status": "running"},
+        {"status": "done"},
+        {"updated_at": "2026-10-09T20:30:00"},
+        {"symbol": "nvda"},
+        {"llm_score": 101},
+    ],
+)
+def test_a_bad_outcome_is_rejected(overrides):
+    with pytest.raises(ValidationError):
+        outcome(**overrides)
+
+
+def test_a_summary_parses_with_defaults():
+    s = ScoreSummary.model_validate(
+        {"day": "2026-10-09", "run_id": "scorecard-x", "picks": 0, "updated_at": T0.isoformat()}
+    )
+    assert (s.ret_1d.matured, s.ret_1d.mean_pct, s.buckets) == (0, None, ())
+    with pytest.raises(ValidationError):
+        ScoreSummary.model_validate(s.model_dump() | {"picks": -1})

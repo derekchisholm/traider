@@ -171,6 +171,15 @@ def test_research_settings_defaults_match_the_brief():
     assert s.reduced_factor == Decimal("0.5")
     assert s.intraday_flatten_min == 15
     assert s.swing_lookback_days == 10
+    assert s.posture_alert_after_open_min == 5
+
+
+@pytest.mark.parametrize("minutes", [0, 121])
+def test_the_missing_posture_alert_delay_is_bounded(minutes):
+    with pytest.raises(ConfigError, match="posture_alert_after_open_min"):
+        Config.from_env(
+            {**BASE, "TRAIDER_RESEARCH": json.dumps({"posture_alert_after_open_min": minutes})}
+        )
 
 
 def test_research_job_locations_come_from_the_environment():

@@ -26,6 +26,11 @@ whatever time is left in the box.
 
 Every text that reaches META or an alert (errors, notes) goes through ``scrub`` first:
 vendor errors and model-written text can carry secrets or injected words.
+
+``RunBase`` holds what every run kind shares: the lock (``run_locked``), META, the trail,
+the cost meter and the day's cost, alerts, failure handling, the time box and the exit
+codes. ``_Run`` is the pre-market kind; the scorecard and the intraday runs are kinds in
+their own modules.
 """
 
 from __future__ import annotations
@@ -36,15 +41,16 @@ import secrets
 import time
 import traceback
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any, ClassVar, Final
 
 from pydantic import BaseModel, ConfigDict
 
 from traider.alerts import Alerter
+from traider.research.botstate import BotState
 from traider.research.cost import CostMeter
 from traider.research.dive import DiveContext, DiveResult, run_dive
 from traider.research.events import (
@@ -54,9 +60,10 @@ from traider.research.events import (
     NewsItem,
     Profile,
 )
+from traider.research.job_settings import DiveSettings, ScreenSettings
 from traider.research.llm import LLM
 from traider.research.market import DailyBar, MarketData, MarketQuote, QuoteBatch
-from traider.research.models import Pick, Posture, PostureLevel, RunMeta, RunStatus
+from traider.research.models import Pick, Posture, PostureLevel, RunKind, RunMeta, RunStatus
 from traider.research.posture import (
     REASON_MAX_CHARS,
     PostureDecision,
@@ -159,6 +166,8 @@ class RunDeps:
     settings: Settings  # read once, when the run starts
     clock: Clock = field(default_factory=SystemClock)
     monotonic: Callable[[], float] = time.monotonic
+    # The bot's ledger and event log, read-only. None without a state table.
+    state: BotState | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +180,7 @@ class RunOutcome:
     picks: tuple[Pick, ...] = ()
     rejected: tuple[Rejection, ...] = ()
     detail: str = ""
+    extra: Mapping[str, Any] = field(default_factory=dict)  # more JSON-ready data to print
 
     def report(self) -> dict[str, Any]:
         """For printing: what the run decided, as JSON-ready data."""
@@ -184,11 +194,12 @@ class RunOutcome:
             "cost_usd": str(self.meta.cost_usd) if self.meta else "0",
             "notes": list(self.meta.notes) if self.meta else [],
             "counts": dict(self.meta.counts) if self.meta else {},
+            **self.extra,
         }
 
 
-def new_run_id(now: datetime) -> str:
-    return f"{KIND}-{now.astimezone(UTC):%Y%m%dT%H%M%SZ}-{secrets.token_hex(2)}"
+def new_run_id(now: datetime, kind: str = KIND) -> str:
+    return f"{kind}-{now.astimezone(UTC):%Y%m%dT%H%M%SZ}-{secrets.token_hex(2)}"
 
 
 def _describe(exc: BaseException) -> str:
@@ -223,29 +234,57 @@ async def run_premarket(
     if not jobs.enabled:
         log.info("research jobs are switched off (research_jobs.enabled); nothing to do")
         return RunOutcome("disabled", EXIT_OK, run_id, detail="research_jobs.enabled is false")
-    run = _Run(deps, now, run_id, dry_run=dry_run)
-    if dry_run:
+    return await run_locked(_Run(deps, now, run_id, dry_run=dry_run), force=force)
+
+
+async def run_locked(run: RunBase, *, force: bool) -> RunOutcome:
+    """Run under the kind's lock, then each of ``also_locks``, in that order. Every lock
+    lives ``max_run_s + LOCK_SPARE_S`` from the start and is released on every path (it
+    expires by itself if the release fails). Any lock held elsewhere exits 2 and touches
+    nothing but the locks this run took, which it gives back. A dry run takes no lock and
+    runs with ``force``."""
+    if run.dry_run:
         return await run.execute(force=True)
+    store = run.deps.store
+    taken: list[str] = []
     try:
-        acquired = await deps.store.acquire_lock(
-            LOCK_NAME, run_id, jobs.max_run_s + LOCK_SPARE_S, now
-        )
-    except Exception as exc:
-        return await run.fail(exc)
-    if not acquired:
-        log.warning("another %s run holds the lock; exiting", KIND)
-        return RunOutcome("locked", EXIT_LOCKED, run_id, detail="another run holds the lock")
-    try:
+        for name in (run.lock_name, *run.also_locks):
+            try:
+                acquired = await store.acquire_lock(
+                    name, run.run_id, run.max_run_s + LOCK_SPARE_S, run.now
+                )
+            except Exception as exc:
+                return await run.fail(exc)
+            if not acquired:
+                if name == run.lock_name:
+                    log.warning("another %s run holds the lock; exiting", run.kind)
+                    detail = "another run holds the lock"
+                else:
+                    log.warning("a %s run holds its lock; this %s run exits", name, run.kind)
+                    detail = f"a {name} run holds its lock"
+                return RunOutcome("locked", EXIT_LOCKED, run.run_id, detail=detail)
+            taken.append(name)
         return await run.execute(force=force)
     finally:
-        try:
-            await deps.store.release_lock(LOCK_NAME, run_id)
-        except Exception as exc:
-            log.error("could not release the research lock (it expires by itself): %s",
-                      _describe(exc))  # fmt: skip
+        for name in reversed(taken):
+            try:
+                await store.release_lock(name, run.run_id)
+            except Exception as exc:
+                log.error("could not release the research lock (it expires by itself): %s",
+                          _describe(exc))  # fmt: skip
 
 
-class _Run:
+class RunBase:
+    """What every run kind shares: META, the trail, the cost meter and the day's cost,
+    alerts, failure handling and the time box. A kind sets ``kind``, ``lock_name`` and
+    ``title``, may change ``time_limit`` and ``models``, and implements ``_execute``."""
+
+    kind: ClassVar[RunKind]
+    lock_name: ClassVar[str]
+    # Other kinds' locks this kind also holds for its whole run, so it never overlaps them.
+    also_locks: ClassVar[tuple[str, ...]] = ()
+    title: ClassVar[str]  # how each alert's subject starts
+
     def __init__(self, deps: RunDeps, now: datetime, run_id: str, *, dry_run: bool) -> None:
         self.deps = deps
         self.now = now
@@ -254,9 +293,10 @@ class _Run:
         self.dry_run = dry_run
         self.jobs = deps.settings.research_jobs
         self.started = deps.monotonic()
+        self.max_run_s = self.time_limit()
         # Both from the same start as the lock's lifetime (the lock is taken right after).
-        self.hard_stop = _dive_deadline(self.jobs.max_run_s)
-        self.box = _run_deadline(self.jobs.max_run_s)
+        self.hard_stop = _dive_deadline(self.max_run_s)
+        self.box = _run_deadline(self.max_run_s)
         self.stage = "start"
         self.notes: list[str] = []
         self.partial = False
@@ -270,10 +310,14 @@ class _Run:
         # Set once write_run has returned: META, picks and posture are in the table and a
         # later failure must not overwrite them.
         self.written: RunOutcome | None = None
-        # The earnings calendar's window. Nothing is known about earnings after
-        # ``calendar_end``, so no swing pick outlives its close.
-        self.calendar_start = previous_weekday(self.today)
-        self.calendar_end = weekdays_after(self.today, self.jobs.collect.earnings_lookahead_days)
+
+    def time_limit(self) -> float:
+        """The soft deadline, ``max_run_s``. The lock and the time box follow from it."""
+        return self.jobs.max_run_s
+
+    def models(self) -> tuple[str, ...]:
+        """The models this kind may call, for META."""
+        return ()
 
     # ------------------------------------------------------------------ helpers
 
@@ -286,15 +330,14 @@ class _Run:
 
     def meta(self, status: RunStatus, *, error: str = "", finished: bool = True) -> RunMeta:
         meter = self.meter
-        dive = self.jobs.dive
         return RunMeta(
             run_id=self.run_id,
-            kind=KIND,
+            kind=self.kind,
             status=status,
             started_at=self.now,
             finished_at=self.deps.clock.now() if finished else None,
             trading_day=self.today,
-            models=tuple(dict.fromkeys((dive.posture_model, dive.model))),
+            models=self.models(),
             cost_usd=meter.spent_usd if meter else Decimal(0),
             # The key prefix only: a bucket name carries the account id.
             s3_prefix=trail_prefix(self.today, self.run_id) if self.trail else "",
@@ -329,10 +372,177 @@ class _Run:
         except TimeoutError as exc:
             if not box.expired():
                 return await self.fail(exc)
-            limit = self.jobs.max_run_s + LOCK_SPARE_S - RUN_BOX_MARGIN_S
+            limit = self.max_run_s + LOCK_SPARE_S - RUN_BOX_MARGIN_S
             return await self.fail(RunDeadline(f"the run did not finish within {limit:.0f}s"))
         except Exception as exc:
             return await self.fail(exc)
+
+    async def _execute(self, *, force: bool) -> RunOutcome:
+        raise NotImplementedError
+
+    async def done_today(self) -> RunMeta | None:
+        """The latest ok or partial run of this kind today, for skip-if-done."""
+        self.stage = "skip_check"
+        done = [
+            m
+            for m in await self.deps.store.runs_for_day(self.today.isoformat(), self.kind)
+            if m.status in (RunStatus.OK, RunStatus.PARTIAL)
+        ]
+        return done[-1] if done else None
+
+    async def begin(self, run_usd: Decimal) -> None:
+        """Start the cost meter (held to ``run_usd`` and to what is left of the day's
+        budget) and the trail, and write the running META (not on a dry run)."""
+        self.stage = "start"
+        budget = self.jobs.budget
+        spent_today = await self.deps.store.day_cost(self.today.isoformat())
+        self.meter = CostMeter(
+            budget.prices, run_usd=run_usd, day_remaining_usd=budget.day_usd - spent_today
+        )
+        self.trail = self.deps.trail(trail_prefix(self.today, self.run_id))
+        if not self.dry_run:
+            await self.deps.store.put_meta(self.meta(RunStatus.RUNNING, finished=False))
+
+    # ------------------------------------------------------------------- finish
+
+    def _budget_notes(self) -> None:
+        """Any budget stop makes the run partial, however it showed up."""
+        assert self.meter is not None
+        if self.meter.overrun:
+            self.note("budget: a model call cost more than its reservation", partial=True)
+        if self.meter.exhausted and not self.budget_noted:
+            self.note("budget reached: the cost meter stopped further calls", partial=True)
+            self.budget_noted = True
+
+    async def commit(
+        self,
+        outcome: RunOutcome,
+        write: Callable[[], Awaitable[None]],
+        message: str,
+        *,
+        event: str | None = None,
+        send: bool = True,
+    ) -> RunOutcome:
+        """Record a finished run: the day's cost first, then ``write`` (which writes META
+        last), then the alert unless ``send`` is false. A dry run does none of it."""
+        assert self.meter is not None
+        assert outcome.meta is not None
+        if not self.dry_run:
+            # The cost first: a write that fails afterwards must not hide what was spent.
+            # Shielded, so the time box cannot cut the add off halfway; fail() waits for
+            # one still under way. Never under-counted: an add that raised is tried again.
+            self.cost_task = asyncio.ensure_future(
+                self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
+            )
+            await asyncio.shield(self.cost_task)
+            self.cost_added = True
+            await write()
+            self.written = outcome
+            if send:
+                await self.alert(outcome.meta.status, message, event=event)
+        return outcome
+
+    async def fail(self, exc: BaseException) -> RunOutcome:
+        leaves = _leaves(exc)
+        cause = leaves[0]
+        error = scrub(f"{self.stage}: {type(cause).__name__}: {cause}")
+        # Every failure is logged, scrubbed; the first goes to META. Frames only: the
+        # exception's own text may carry vendor words.
+        for leaf in leaves:
+            frames = "".join(traceback.format_tb(leaf.__traceback__))
+            log.error("research run %s failed in %s: %s\n%s", self.run_id, self.stage,
+                      _describe(leaf), frames)  # fmt: skip
+        if self.written is not None:
+            # The result is in the table: META, picks and posture stand as written.
+            written = self.written
+            log.error("research run %s failed after its result was written as %s; "
+                      "it stands", self.run_id, written.status)  # fmt: skip
+            await self.alert(
+                RunStatus.FAILED,
+                f"traider research {self.kind} {self.today.isoformat()}: the run was written as "
+                f"{written.status}, then failed: {error}. The written result stands.",
+            )
+            return replace(written, detail=error)
+        meta = self.meta(RunStatus.FAILED, error=error)
+        if not self.dry_run:
+            await self._settle_cost()
+            if self.meter is not None and not self.cost_added and self.meter.spent > 0:
+                try:
+                    await self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
+                except Exception as add_exc:
+                    log.error("could not add the failed run's cost to the day: %s",
+                              _describe(add_exc))  # fmt: skip
+            try:
+                await self.deps.store.put_meta(meta)
+            except Exception as put_exc:
+                log.error("could not record the failed run: %s", _describe(put_exc))
+            await self.alert(
+                RunStatus.FAILED,
+                f"traider research {self.kind} {self.today.isoformat()} failed: {error}",
+            )
+        return RunOutcome("failed", EXIT_FAILED, self.run_id, meta=meta, detail=error)
+
+    async def _settle_cost(self) -> None:
+        """Wait for a cost add the time box interrupted, at most until half the margin
+        before the lock expires is gone. If it finished, the cost is in; if it raised or
+        is still going, fail() adds it (again): over-counting only makes budgets stricter."""
+        task = self.cost_task
+        if task is None or self.cost_added:
+            return
+        if not task.done():
+            wait = self.box + RUN_BOX_MARGIN_S / 2 - asyncio.get_running_loop().time()
+            await asyncio.wait({task}, timeout=max(wait, 0.0))  # never cancels the add
+        if not task.done():
+            log.error("the day's cost add did not finish in time; adding it again")
+            return
+        if task.cancelled():
+            return
+        if (exc := task.exception()) is not None:
+            log.error("could not add the run's cost to the day: %s", _describe(exc))
+            return
+        self.cost_added = True
+
+    async def alert(self, status: RunStatus, message: str, *, event: str | None = None) -> None:
+        subject = f"{self.title} {self.today.isoformat()}: {status.value}"
+        try:
+            await self.deps.alerts.send(event or f"research_run_{status.value}", subject, message)
+        except Exception as exc:
+            log.error("could not send the research alert: %s", _describe(exc))
+
+
+class _Run(RunBase):
+    """The pre-market run. The intraday run reuses its stages, through the hooks below."""
+
+    kind: ClassVar[RunKind] = KIND
+    lock_name: ClassVar[str] = LOCK_NAME
+    title: ClassVar[str] = "Research"
+    intraday_dives: ClassVar[bool] = False  # tells the model it is an intraday idea
+
+    def __init__(self, deps: RunDeps, now: datetime, run_id: str, *, dry_run: bool) -> None:
+        super().__init__(deps, now, run_id, dry_run=dry_run)
+        # The earnings calendar's window. Nothing is known about earnings after
+        # ``calendar_end``, so no swing pick outlives its close.
+        self.calendar_start = previous_weekday(self.today)
+        self.calendar_end = weekdays_after(self.today, self.jobs.collect.earnings_lookahead_days)
+
+    def models(self) -> tuple[str, ...]:
+        dive = self.jobs.dive
+        return tuple(dict.fromkeys((dive.posture_model, dive.model)))
+
+    def screen_settings(self) -> ScreenSettings:
+        return self.jobs.screen
+
+    def dive_settings(self) -> DiveSettings:
+        return self.jobs.dive
+
+    def alert_wanted(self, status: RunStatus, posture: Posture, picks: Sequence[Pick]) -> bool:
+        return True
+
+    def summary(self, posture: Posture, picks: Sequence[Pick], meta: RunMeta) -> str:
+        """The alert text, from code-made values and scrubbed notes only."""
+        return _summary(self.kind, self.today, posture, picks, meta)
+
+    # --------------------------------------------------------------------- flow
 
     async def _execute(self, *, force: bool) -> RunOutcome:
         deps, day = self.deps, self.today.isoformat()
@@ -342,26 +552,13 @@ class _Run:
             log.info("no regular session on %s; nothing to research", day)
             return RunOutcome("closed", EXIT_OK, self.run_id, detail=f"market closed on {day}")
         if not force:
-            self.stage = "skip_check"
-            done = [
-                m
-                for m in await deps.store.runs_for_day(day, KIND)
-                if m.status in (RunStatus.OK, RunStatus.PARTIAL)
-            ]
-            if done:
-                log.info("%s already has a %s run (%s); skipping", day, KIND, done[-1].run_id)
+            done = await self.done_today()
+            if done is not None:
+                log.info("%s already has a %s run (%s); skipping", day, self.kind, done.run_id)
                 return RunOutcome(
-                    "skipped", EXIT_OK, self.run_id, detail=f"already done by {done[-1].run_id}"
+                    "skipped", EXIT_OK, self.run_id, detail=f"already done by {done.run_id}"
                 )
-        self.stage = "start"
-        budget = self.jobs.budget
-        spent_today = await deps.store.day_cost(day)
-        self.meter = CostMeter(
-            budget.prices, run_usd=budget.run_usd, day_remaining_usd=budget.day_usd - spent_today
-        )
-        self.trail = deps.trail(trail_prefix(self.today, self.run_id))
-        if not self.dry_run:
-            await deps.store.put_meta(self.meta(RunStatus.RUNNING, finished=False))
+        await self.begin(self.jobs.budget.run_usd)
 
         self.stage = "collect"
         snapshot = await self.collect()
@@ -383,7 +580,7 @@ class _Run:
         if decision.level is PostureLevel.STAND_ASIDE:
             self.stage = "write"
             return await self.finish(posture, RankResult((), ()), {})
-        if deps.monotonic() >= self.started + self.jobs.max_run_s:
+        if deps.monotonic() >= self.started + self.max_run_s:
             self.note("deadline passed before the screen: no deep-dives", partial=True)
             self.stage = "write"
             return await self.finish(posture, RankResult((), ()), {})
@@ -532,7 +729,7 @@ class _Run:
         list[ScreenRow], dict[str, MarketQuote], dict[str, list[DailyBar]], dict[str, Profile]
     ]:
         deps, jobs, today = self.deps, self.jobs, self.today
-        settings = jobs.screen
+        settings = self.screen_settings()
         symbols = snapshot.candidates
         batch = await deps.market.quotes(symbols) if symbols else QuoteBatch({})
         if batch.skipped:
@@ -665,11 +862,12 @@ class _Run:
         bars: Mapping[str, list[DailyBar]],
         profiles: Mapping[str, Profile],
     ) -> list[DiveResult]:
-        deps, jobs = self.deps, self.jobs
+        deps = self.deps
         assert self.meter is not None
         meter = self.meter
-        gate = asyncio.Semaphore(jobs.dive.dive_concurrency)
-        deadline = self.started + jobs.max_run_s
+        settings = self.dive_settings()
+        gate = asyncio.Semaphore(settings.dive_concurrency)
+        deadline = self.started + self.max_run_s
         context = {
             "posture": decision.level.value,
             "metrics": decision.metrics.as_dict(),
@@ -692,6 +890,7 @@ class _Run:
                     earnings_ok=snapshot.earnings_ok,
                     profile=profiles.get(row.symbol),
                     market_context=context,
+                    intraday=self.intraday_dives,
                 )
                 # Cancelled by the hard stop, run_dive charges the call in flight and
                 # re-raises; the task then ends cancelled.
@@ -701,9 +900,9 @@ class _Run:
                     events=deps.events,
                     llm=deps.llm,
                     meter=meter,
-                    settings=jobs.dive,
+                    settings=settings,
                 )
-                await self.put_trail(f"dives/{row.symbol}.json", result.trail(jobs.dive.model))
+                await self.put_trail(f"dives/{row.symbol}.json", result.trail(settings.model))
                 return result
 
         tasks: list[asyncio.Task[DiveResult | None]] = []
@@ -803,15 +1002,6 @@ class _Run:
 
     # ------------------------------------------------------------------- finish
 
-    def _budget_notes(self) -> None:
-        """Any budget stop makes the run partial, however it showed up."""
-        assert self.meter is not None
-        if self.meter.overrun:
-            self.note("budget: a model call cost more than its reservation", partial=True)
-        if self.meter.exhausted and not self.budget_noted:
-            self.note("budget reached: the cost meter stopped further calls", partial=True)
-            self.budget_noted = True
-
     async def finish(
         self, posture: Posture, ranked: RankResult, assessments: Mapping[str, Any]
     ) -> RunOutcome:
@@ -843,86 +1033,16 @@ class _Run:
             picks=ranked.picks,
             rejected=ranked.rejected,
         )
-        if not self.dry_run:
-            # The cost first: a write that fails afterwards must not hide what was spent.
-            # Shielded, so the time box cannot cut the add off halfway; fail() waits for
-            # one still under way. Never under-counted: an add that raised is tried again.
-            self.cost_task = asyncio.ensure_future(
-                self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
-            )
-            await asyncio.shield(self.cost_task)
-            self.cost_added = True
+
+        async def write() -> None:
             await self.deps.store.write_run(meta, ranked.picks, posture)
-            self.written = outcome
-            await self.alert(status, _summary(self.today, posture, ranked.picks, meta))
-        return outcome
 
-    async def fail(self, exc: BaseException) -> RunOutcome:
-        leaves = _leaves(exc)
-        cause = leaves[0]
-        error = scrub(f"{self.stage}: {type(cause).__name__}: {cause}")
-        # Every failure is logged, scrubbed; the first goes to META. Frames only: the
-        # exception's own text may carry vendor words.
-        for leaf in leaves:
-            frames = "".join(traceback.format_tb(leaf.__traceback__))
-            log.error("research run %s failed in %s: %s\n%s", self.run_id, self.stage,
-                      _describe(leaf), frames)  # fmt: skip
-        if self.written is not None:
-            # The result is in the table: META, picks and posture stand as written.
-            written = self.written
-            log.error("research run %s failed after its result was written as %s; "
-                      "it stands", self.run_id, written.status)  # fmt: skip
-            await self.alert(
-                RunStatus.FAILED,
-                f"traider research {KIND} {self.today.isoformat()}: the run was written as "
-                f"{written.status}, then failed: {error}. The written result stands.",
-            )
-            return replace(written, detail=error)
-        meta = self.meta(RunStatus.FAILED, error=error)
-        if not self.dry_run:
-            await self._settle_cost()
-            if self.meter is not None and not self.cost_added and self.meter.spent > 0:
-                try:
-                    await self.deps.store.add_day_cost(self.today.isoformat(), self.meter.spent_usd)
-                except Exception as add_exc:
-                    log.error("could not add the failed run's cost to the day: %s",
-                              _describe(add_exc))  # fmt: skip
-            try:
-                await self.deps.store.put_meta(meta)
-            except Exception as put_exc:
-                log.error("could not record the failed run: %s", _describe(put_exc))
-            await self.alert(
-                RunStatus.FAILED,
-                f"traider research {KIND} {self.today.isoformat()} failed: {error}",
-            )
-        return RunOutcome("failed", EXIT_FAILED, self.run_id, meta=meta, detail=error)
-
-    async def _settle_cost(self) -> None:
-        """Wait for a cost add the time box interrupted, at most until half the margin
-        before the lock expires is gone. If it finished, the cost is in; if it raised or
-        is still going, fail() adds it (again): over-counting only makes budgets stricter."""
-        task = self.cost_task
-        if task is None or self.cost_added:
-            return
-        if not task.done():
-            wait = self.box + RUN_BOX_MARGIN_S / 2 - asyncio.get_running_loop().time()
-            await asyncio.wait({task}, timeout=max(wait, 0.0))  # never cancels the add
-        if not task.done():
-            log.error("the day's cost add did not finish in time; adding it again")
-            return
-        if task.cancelled():
-            return
-        if (exc := task.exception()) is not None:
-            log.error("could not add the run's cost to the day: %s", _describe(exc))
-            return
-        self.cost_added = True
-
-    async def alert(self, status: RunStatus, message: str) -> None:
-        subject = f"Research {self.today.isoformat()}: {status.value}"
-        try:
-            await self.deps.alerts.send(f"research_run_{status.value}", subject, message)
-        except Exception as exc:
-            log.error("could not send the research alert: %s", _describe(exc))
+        return await self.commit(
+            outcome,
+            write,
+            self.summary(posture, ranked.picks, meta),
+            send=self.alert_wanted(status, posture, ranked.picks),
+        )
 
 
 def _sector_gaps(context: Mapping[str, MarketQuote]) -> dict[str, float]:
@@ -948,7 +1068,7 @@ def _events_for(events: Sequence[EarningsEvent], symbol: str) -> tuple[EarningsE
     return tuple(e for e in events if e.symbol == symbol)
 
 
-def _summary(day: date, posture: Posture, picks: Sequence[Pick], meta: RunMeta) -> str:
+def _summary(kind: str, day: date, posture: Posture, picks: Sequence[Pick], meta: RunMeta) -> str:
     """The alert text. Notes are already scrubbed; posture reasons (model-written) are
     left out on purpose."""
     vix = posture.metrics.get("vix")
@@ -958,7 +1078,7 @@ def _summary(day: date, posture: Posture, picks: Sequence[Pick], meta: RunMeta) 
         for p in picks
     )
     text = (
-        f"traider research {KIND} {day.isoformat()}: posture {level}; {len(picks)} picks"
+        f"traider research {kind} {day.isoformat()}: posture {level}; {len(picks)} picks"
         f"{': ' + listed if listed else ''}; cost ${meta.cost_usd:.2f}"
     )
     if meta.status is RunStatus.PARTIAL and meta.notes:

@@ -40,7 +40,8 @@ def fake_build(store=None, llm=None):
     market, events = market_day()
     made = {"store": store or MemoryResearchStore(), "llm": llm or golden_llm()}
 
-    async def build(config, http, *, dry_run, trail_dir, clock):
+    async def build(config, http, *, kind, dry_run, trail_dir, clock):
+        made["kind"] = kind
         made["dry_run"] = dry_run
         made["deps"] = RunDeps(
             store=made["store"],
@@ -57,13 +58,15 @@ def fake_build(store=None, llm=None):
     return build, made
 
 
-def test_the_command_exists_and_takes_only_premarket(capsys):
+def test_the_command_exists_and_takes_the_three_kinds(capsys):
     with pytest.raises(SystemExit) as exit_:
         cli.main(["research", "run", "--help"])
     assert exit_.value.code == 0
     assert "--dry-run" in capsys.readouterr().out
+    for kind in ("premarket", "intraday", "scorecard"):
+        assert cli._parser().parse_args(["research", "run", "--kind", kind]).kind == kind
     with pytest.raises(SystemExit) as exit_:
-        cli.main(["research", "run", "--kind", "intraday"])
+        cli.main(["research", "run", "--kind", "weekly"])
     assert exit_.value.code == 2
 
 
@@ -691,3 +694,202 @@ def test_a_dry_runs_stdout_is_only_the_notice_and_the_report(monkeypatch, capsys
     assert "an info line the run logs" not in captured.out
     assert "a warning the run logs" in captured.err  # warnings go to stderr
     assert "an info line the run logs" not in captured.err
+
+
+# --- C2a: the scorecard --------------------------------------------------------------------
+
+
+async def test_the_scorecard_kind_runs_the_scorecard(tmp_path):
+    store = MemoryResearchStore()
+    build, _ = fake_build(store)
+    out = io.StringIO()
+    code = await cli.research_run(
+        CONFIG,
+        out,
+        kind="scorecard",
+        dry_run=False,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=build,
+        now=NOW,
+    )
+    assert code == 0
+    assert out.getvalue().startswith("research scorecard ok: scorecard-20261009T120000Z-")
+    assert ("SCORE#2026-10-09", "SUMMARY") in store.keys
+
+
+async def test_a_scorecard_dry_run_says_it_calls_no_model(tmp_path):
+    build, made = fake_build()
+    out = io.StringIO()
+    code = await cli.research_run(
+        CONFIG,
+        out,
+        kind="scorecard",
+        dry_run=True,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=build,
+        now=NOW,
+    )
+    assert code == 0
+    notice, _, printed = out.getvalue().partition("\n\n")
+    assert notice.startswith("Dry run: real calls to Schwab (daily bars)")
+    assert "no model is called" in notice and "cost real money" not in notice
+    assert json.loads(printed)["summary"]["picks"] == 0
+    assert made["store"].keys == set()
+
+
+def test_the_scorecard_kind_parses():
+    args = cli._parser().parse_args(["research", "run", "--kind", "scorecard", "--dry-run"])
+    assert (args.kind, args.dry_run) == ("scorecard", True)
+
+
+async def test_the_wiring_refuses_a_state_table_without_a_namespace(aws_stack, tmp_path):
+    import aiohttp
+
+    from tests.unit.test_state import TABLE as STATE_TABLE
+    from tests.unit.test_state import make_table as make_state_table
+
+    make_state_table()
+    async with aiohttp.ClientSession() as http:
+        with pytest.raises(SetupError, match="TRAIDER_STATE_NAMESPACE"):
+            await build_deps(
+                stack_config(aws_stack, state_table=STATE_TABLE),
+                http,
+                dry_run=False,
+                trail_dir=tmp_path,
+                clock=ManualClock(NOW),
+                llm=golden_llm(),
+            )
+
+
+async def test_the_wiring_reads_the_bots_state_in_the_namespace_it_names(aws_stack, tmp_path):
+    import aiohttp
+
+    from tests.unit.test_state import TABLE as STATE_TABLE
+    from tests.unit.test_state import make_table as make_state_table
+    from traider.research.botstate import held_symbols
+    from traider.state.base import LedgerEntry
+    from traider.state.dynamo import DynamoStateStore
+
+    table = make_state_table()
+    for namespace, symbol in (("live", "NVDA"), ("paper", "AMD")):
+        state = DynamoStateStore(table, namespace)
+        await state.put_ledger(LedgerEntry(symbol, horizon="swing", side="long", opened_at=NOW))
+        await state.log_event("order_submitted", {"symbol": symbol}, NOW)
+    async with aiohttp.ClientSession() as http:
+        built = {
+            name: await build_deps(
+                stack_config(aws_stack, **extra),
+                http,
+                dry_run=False,
+                trail_dir=tmp_path,
+                clock=ManualClock(NOW),
+                llm=golden_llm(),
+            )
+            for name, extra in (
+                ("live", {"state_table": STATE_TABLE, "state_namespace": "live"}),
+                ("premarket", {}),
+            )
+        }
+    live = built["live"].state
+    assert live is not None
+    assert await held_symbols(live) == {"NVDA"}
+    (event,) = await live.events(NOW.date().isoformat())
+    assert event["data"] == {"symbol": "NVDA"}
+    # Without a state table, the pre-market build is as before: no bot state.
+    assert built["premarket"].state is None
+    assert isinstance(built["premarket"].store, DynamoResearchStore)
+
+
+def test_each_kind_has_exactly_one_runner():
+    from traider.research.intraday import run_intraday
+    from traider.research.scorecard_run import run_scorecard
+
+    assert set(cli._runners()) == set(cli.RESEARCH_KINDS)
+    assert cli._runner("premarket") is cli.run_premarket
+    assert cli._runner("intraday") is run_intraday
+    assert cli._runner("scorecard") is run_scorecard
+    with pytest.raises(ValueError, match="no runner for research kind 'weekly'"):
+        cli._runner("weekly")
+
+
+def test_the_dry_run_help_fits_every_kind(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["research", "run", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "write nothing to the research table" in text
+    assert "premarket and intraday make real Bedrock calls" in text
+    assert "the scorecard calls no model" in text
+
+
+# --- C2a: intraday -------------------------------------------------------------------------
+
+
+async def test_an_intraday_dry_run_says_what_it_costs_and_tells_the_wiring_its_kind(tmp_path):
+    build, made = fake_build()
+    out = io.StringIO()
+    code = await cli.research_run(
+        CONFIG,
+        out,
+        kind="intraday",
+        dry_run=True,
+        force=False,
+        trail_dir=str(tmp_path),
+        build=build,
+        now=NOW,
+    )
+    assert code == 0
+    assert made["kind"] == "intraday"
+    notice, _, printed = out.getvalue().partition("\n\n")
+    assert notice.startswith("Dry run: real calls to Schwab, Finnhub and Claude")
+    assert "intraday_run_usd" in notice and "an ok posture today" in notice
+    assert json.loads(printed)["status"] == "closed"  # 08:00 New York: before the session
+
+
+async def test_without_the_bots_state_table_an_intraday_run_cannot_start(aws_stack, tmp_path):
+    import aiohttp
+
+    async with aiohttp.ClientSession() as http:
+        with pytest.raises(SetupError, match="TRAIDER_STATE_TABLE and TRAIDER_STATE_NAMESPACE"):
+            await build_deps(
+                stack_config(aws_stack),
+                http,
+                kind="intraday",
+                dry_run=False,
+                trail_dir=tmp_path,
+                clock=ManualClock(NOW),
+                llm=golden_llm(),
+            )
+
+
+async def test_the_intraday_wiring_reads_the_bots_state_at_a_lower_rate(aws_stack, tmp_path):
+    import aiohttp
+
+    from tests.unit.test_state import TABLE as STATE_TABLE
+    from tests.unit.test_state import make_table as make_state_table
+    from traider.research.wiring import INTRADAY_SCHWAB_MAX_PER_MINUTE
+
+    make_state_table()
+    config = stack_config(aws_stack, state_table=STATE_TABLE, state_namespace="paper")
+    async with aiohttp.ClientSession() as http:
+        deps = await build_deps(
+            config,
+            http,
+            kind="intraday",
+            dry_run=False,
+            trail_dir=tmp_path,
+            clock=ManualClock(NOW),
+            llm=golden_llm(),
+        )
+        assert deps.state is not None and await deps.state.ledger() == {}
+        assert deps.market._client._limiter._max == INTRADAY_SCHWAB_MAX_PER_MINUTE == 20
+        premarket = await build_deps(
+            config,
+            http,
+            dry_run=False,
+            trail_dir=tmp_path,
+            clock=ManualClock(NOW),
+            llm=golden_llm(),
+        )
+        assert premarket.market._client._limiter._max == RESEARCH_SCHWAB_MAX_PER_MINUTE

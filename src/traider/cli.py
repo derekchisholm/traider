@@ -40,7 +40,9 @@ from traider.broker.schwab import SchwabBroker
 from traider.config import Config, ConfigError, RiskLimits, check_symbols
 from traider.log import setup_logging
 from traider.models import Bar
-from traider.research.run import RunDeps, run_premarket
+from traider.research.intraday import run_intraday
+from traider.research.run import RunDeps, RunOutcome, run_premarket
+from traider.research.scorecard_run import run_scorecard
 from traider.research.scrub import scrub
 from traider.research.seed import build_manual_run
 from traider.research.source import ResearchSource
@@ -633,7 +635,7 @@ async def research_show(source: ResearchSource, out: TextIO, *, now: datetime) -
     return 0
 
 
-RESEARCH_KINDS = ("premarket",)  # the other kinds come in C2
+RESEARCH_KINDS = ("premarket", "intraday", "scorecard")
 
 DRY_RUN_NOTICE = (
     "Dry run: real calls to Schwab, Finnhub and Claude on Amazon Bedrock. The Bedrock calls "
@@ -642,7 +644,35 @@ DRY_RUN_NOTICE = (
     "written to {where}.\n\n"
 )
 
+INTRADAY_DRY_RUN_NOTICE = (
+    "Dry run: real calls to Schwab, Finnhub and Claude on Amazon Bedrock, and reads of the "
+    "research table and the bot's ledger. The Bedrock calls cost real money (at most "
+    "research_jobs.budget.intraday_run_usd, $0.75 by default). It needs the session open "
+    "and an ok posture today, and ignores research_jobs.intraday.last_start. Nothing is "
+    "written to the research table (no picks, posture, cost or lock) and no alert is sent. "
+    "The trail is written to {where}.\n\n"
+)
+
+SCORECARD_DRY_RUN_NOTICE = (
+    "Dry run: real calls to Schwab (daily bars) and reads of the research table and the "
+    "bot's event log; no model is called. Nothing is written to the research table (no "
+    "outcomes, summary or lock) and no alert is sent. The trail is written to {where}.\n\n"
+)
+
 BuildDeps = Callable[..., Awaitable[RunDeps]]
+Runner = Callable[..., Awaitable[RunOutcome]]
+
+
+def _runners() -> dict[str, Runner]:
+    """Each kind's runner. Built when the run starts, so tests can replace a runner."""
+    return {"premarket": run_premarket, "intraday": run_intraday, "scorecard": run_scorecard}
+
+
+def _runner(kind: str) -> Runner:
+    try:
+        return _runners()[kind]
+    except KeyError:
+        raise ValueError(f"no runner for research kind {kind!r}") from None
 
 
 def _error_text(exc: BaseException) -> str:
@@ -669,16 +699,18 @@ async def research_run(
     it. Every error printed is scrubbed. The HTTP session and the model client are closed
     on every path."""
     if kind not in RESEARCH_KINDS:
-        out.write(f"unknown research kind {kind!r}; only premarket exists so far\n")
+        out.write(f"unknown research kind {kind!r}; one of {', '.join(RESEARCH_KINDS)}\n")
         return 2
     clock = SystemClock()
     if dry_run:
-        out.write(DRY_RUN_NOTICE.format(where=trail_dir))
+        notices = {"scorecard": SCORECARD_DRY_RUN_NOTICE, "intraday": INTRADAY_DRY_RUN_NOTICE}
+        notice = notices.get(kind, DRY_RUN_NOTICE)
+        out.write(notice.format(where=trail_dir))
         out.flush()
     async with aiohttp.ClientSession() as http:
         try:
             deps = await build(
-                config, http, dry_run=dry_run, trail_dir=Path(trail_dir), clock=clock
+                config, http, kind=kind, dry_run=dry_run, trail_dir=Path(trail_dir), clock=clock
             )
         except Exception as exc:
             text = _error_text(exc)
@@ -687,9 +719,9 @@ async def research_run(
             return 1
         try:
             started = now or clock.now()
-            outcome = await run_premarket(deps, started, dry_run=dry_run, force=force)
+            outcome = await _runner(kind)(deps, started, dry_run=dry_run, force=force)
         except Exception as exc:
-            # run_premarket records its own failures; this is a bug, so fail closed.
+            # A run records its own failures; this is a bug, so fail closed.
             text = _error_text(exc)
             log.error("the research run failed: %s", text)
             out.write(f"research run failed: {text}\n")
@@ -759,17 +791,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     research_actions = research.add_subparsers(dest="action", required=True)
     run_research = research_actions.add_parser(
-        "run", help="run a research job now (what the 08:00 schedule runs)"
+        "run", help="run a research job now (what its schedule runs)"
     )
     run_research.add_argument("--kind", required=True, choices=RESEARCH_KINDS)
     run_research.add_argument(
         "--dry-run",
         action="store_true",
-        help="make every real call (Bedrock costs money) but write nothing to the research "
-        "table; print the posture and picks",
+        help="make every real call but write nothing to the research table and send no "
+        "alert; print what the run decided. premarket and intraday make real Bedrock calls "
+        "(they cost money); the scorecard calls no model",
     )
     run_research.add_argument(
-        "--force", action="store_true", help="run even if today's run already finished"
+        "--force",
+        action="store_true",
+        help="run even if today's run already finished; for intraday, start after "
+        "research_jobs.intraday.last_start",
     )
     run_research.add_argument(
         "--trail-dir",

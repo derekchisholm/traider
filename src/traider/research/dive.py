@@ -162,7 +162,11 @@ class DiveContext:
     earnings_ok: bool
     profile: Profile | None
     market_context: Mapping[str, Any]
+    # An intraday run's dive: during the session, and flat by today's close.
+    intraday: bool = False
 
+
+INTRADAY_LINE = "This is an intraday idea; it must be flat by today's close.\n"
 
 DiveOutcome = Literal[
     "submitted", "invalid", "turn_limit", "input_limit", "budget", "timeout", "llm_error"
@@ -314,12 +318,14 @@ async def run_tool(
 def _intro(ctx: DiveContext) -> str:
     q = ctx.quote
     features = json.dumps({k: round(v, 4) for k, v in ctx.features.items()}, default=str)
+    when = "during the session" if ctx.intraday else "before the open"
     return (
         f"Symbol: {ctx.symbol}\n"
-        f"Today: {ctx.today.isoformat()}, before the open.\n"
+        f"Today: {ctx.today.isoformat()}, {when}.\n"
         f"Quote: last {q.last}, previous close {q.prev_close}.\n"
         f"Screen features: {features}\n"
-        "Study it with the tools, then call submit_assessment."
+        + (INTRADAY_LINE if ctx.intraday else "")
+        + "Study it with the tools, then call submit_assessment."
     )
 
 

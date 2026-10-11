@@ -24,18 +24,45 @@ TOPIC_POLICY = "aws:sns/topicPolicy:TopicPolicy"
 LOG_GROUP = "aws:cloudwatch/logGroup:LogGroup"
 
 
+KINDS = ("premarket", "scorecard", "intraday")
+TOGGLES = {
+    "premarket": "researchScheduleEnabled",
+    "scorecard": "researchScorecardEnabled",
+    "intraday": "researchIntradayEnabled",
+}
+# Each kind has its own task definition (and family); the pre-market one keeps its name.
+TASK_NAMES = {
+    "premarket": "research",
+    "scorecard": "research-scorecard",
+    "intraday": "research-intraday",
+}
+FAMILIES = {
+    "premarket": "traider-dev-research",
+    "scorecard": "traider-dev-research-scorecard",
+    "intraday": "traider-dev-research-intraday",
+}
+
+
 @pytest.fixture(scope="module")
 def jobs():
     return deploy({"research": True, "researchJobs": True, "alertEmail": "ops@example.test"})
 
 
-def container(deployment) -> dict:
-    (definition,) = json.loads(deployment.one(TASK, "research").inputs["containerDefinitions"])
+def task(deployment, kind="premarket"):
+    return deployment.one(TASK, TASK_NAMES[kind])
+
+
+def container(deployment, kind="premarket") -> dict:
+    (definition,) = json.loads(task(deployment, kind).inputs["containerDefinitions"])
     return definition
 
 
-def environment(deployment) -> dict[str, str]:
-    return {item["name"]: item["value"] for item in container(deployment)["environment"]}
+def environment(deployment, kind="premarket") -> dict[str, str]:
+    return {item["name"]: item["value"] for item in container(deployment, kind)["environment"]}
+
+
+def schedule(deployment, kind="premarket"):
+    return deployment.one(SCHEDULE, f"research-{kind}")
 
 
 def statements(deployment, name) -> dict[str, dict]:
@@ -48,7 +75,7 @@ def statements(deployment, name) -> dict[str, dict]:
 def test_research_jobs_are_off_by_default(paper):
     assert paper.of(BUCKET) == []
     assert paper.of(SCHEDULE) == []
-    assert [t for t in paper.of(TASK) if t.name == "research"] == []
+    assert [t for t in paper.of(TASK) if t.name.startswith("research")] == []
     assert {s.name for s in paper.of(SECRET)} == {"schwab-app", "schwab-token"}
     assert "finnhubSecretArn" not in paper.outputs
 
@@ -71,21 +98,28 @@ def test_research_jobs_without_research_are_refused():
         deploy({"researchJobs": True})
 
 
-def test_the_schedule_starts_disabled(jobs):
-    assert jobs.one(SCHEDULE).inputs["state"] == "DISABLED"
+def test_every_schedule_starts_disabled(jobs):
+    assert {s.name: s.inputs["state"] for s in jobs.of(SCHEDULE)} == {
+        f"research-{kind}": "DISABLED" for kind in KINDS
+    }
 
 
-def test_the_schedule_runs_only_once_you_enable_it():
-    enabled = deploy({"research": True, "researchJobs": True, "researchScheduleEnabled": True})
-    assert enabled.one(SCHEDULE).inputs["state"] == "ENABLED"
-    disabled = deploy({"research": True, "researchJobs": True, "researchScheduleEnabled": False})
-    assert disabled.one(SCHEDULE).inputs["state"] == "DISABLED"
+@pytest.mark.parametrize("kind", KINDS)
+def test_each_schedule_runs_only_once_you_enable_it_and_only_that_one(kind):
+    enabled = deploy({"research": True, "researchJobs": True, TOGGLES[kind]: True})
+    states = {s.name: s.inputs["state"] for s in enabled.of(SCHEDULE)}
+    assert states == {
+        f"research-{other}": "ENABLED" if other == kind else "DISABLED" for other in KINDS
+    }
+    disabled = deploy({"research": True, "researchJobs": True, TOGGLES[kind]: False})
+    assert schedule(disabled, kind).inputs["state"] == "DISABLED"
 
 
+@pytest.mark.parametrize("toggle", TOGGLES.values())
 @pytest.mark.parametrize("config", [{}, {"research": True}], ids=["default", "research-only"])
-def test_enabling_the_schedule_without_the_jobs_is_refused(config):
-    with pytest.raises(Exception, match="researchScheduleEnabled needs traider:researchJobs"):
-        deploy({**config, "researchScheduleEnabled": True})
+def test_enabling_a_schedule_without_the_jobs_is_refused(config, toggle):
+    with pytest.raises(Exception, match=f"{toggle} needs traider:researchJobs"):
+        deploy({**config, toggle: True})
 
 
 # --- the trail bucket --------------------------------------------------------------------
@@ -174,6 +208,27 @@ def test_the_task_is_the_bots_image_running_the_premarket_command(jobs):
     assert logs["awslogs-group"] == "/traider/traider-dev/research"
 
 
+def test_each_kind_has_its_own_task_differing_only_in_family_and_command(jobs):
+    assert {t.name for t in jobs.of(TASK) if t.name.startswith("research")} == set(
+        TASK_NAMES.values()
+    )
+    premarket = task(jobs).inputs
+    for kind in KINDS:
+        found = task(jobs, kind).inputs
+        assert found["family"] == FAMILIES[kind]
+        definition = container(jobs, kind)
+        assert definition["name"] == "research"
+        assert definition["command"] == ["research", "run", "--kind", kind]
+        # Same image, roles, size, network mode, environment and log group as pre-market.
+        assert {k: v for k, v in definition.items() if k != "command"} == {
+            k: v for k, v in container(jobs).items() if k != "command"
+        }
+        same = {k: v for k, v in found.items() if k not in ("family", "containerDefinitions")}
+        assert same == {
+            k: v for k, v in premarket.items() if k not in ("family", "containerDefinitions")
+        }
+
+
 def test_the_task_is_told_where_everything_is_and_nothing_secret(jobs):
     env = environment(jobs)
     assert env["TRAIDER_RESEARCH_TABLE"] == jobs.one(TABLE, "research").inputs["name"]
@@ -185,8 +240,15 @@ def test_the_task_is_told_where_everything_is_and_nothing_secret(jobs):
     assert "TRAIDER_TRADING_MODE" not in env  # research never trades
     assert "TRAIDER_FINNHUB_API_KEY" not in env
     assert env["AWS_REGION"] == REGION  # Bedrock needs it; not left to Fargate
+    # The bot's state, to read: the namespace is the stack's trading mode, given apart.
+    assert env["TRAIDER_STATE_TABLE"] == jobs.one(TABLE, "state").inputs["name"]
+    assert env["TRAIDER_STATE_NAMESPACE"] == "paper"
     config = Config.from_env(env)
     assert (config.trading_mode, config.finnhub_api_key) == ("paper", None)
+    assert (config.state_table, config.state_namespace) == (
+        jobs.one(TABLE, "state").inputs["name"],
+        "paper",
+    )
 
 
 def test_a_live_stacks_research_task_still_starts():
@@ -200,7 +262,9 @@ def test_a_live_stacks_research_task_still_starts():
         },
         stack="prod",
     )
-    assert Config.from_env(environment(live)).research_table == "traider-prod-research"
+    config = Config.from_env(environment(live))
+    assert config.research_table == "traider-prod-research"
+    assert (config.trading_mode, config.state_namespace) == ("paper", "live")
 
 
 ACCOUNT_IDS = ("TRAIDER_SCHWAB_ACCOUNT_HASH", "TRAIDER_SCHWAB_ACCOUNT_LAST4")
@@ -259,6 +323,7 @@ def test_the_research_role_names_exactly_the_resources_it_uses(jobs):
         "Research": research,
         "ResearchRunsByDay": f"{research}/index/gsi1",
         "ReadSettings": jobs.one(TABLE, "settings").arn,
+        "ReadBotState": jobs.one(TABLE, "state").arn,
         "Trail": f"{jobs.one(BUCKET).arn}/*",
         "Alerts": jobs.one(TOPIC).arn,
         "BedrockMantle": "*",
@@ -272,6 +337,7 @@ def test_the_research_role_has_exactly_these_actions(jobs):
         "SaveRotatedRefreshToken": "secretsmanager:PutSecretValue",
         "Research": [
             "dynamodb:GetItem",
+            "dynamodb:BatchGetItem",
             "dynamodb:PutItem",
             "dynamodb:UpdateItem",
             "dynamodb:DeleteItem",
@@ -279,6 +345,7 @@ def test_the_research_role_has_exactly_these_actions(jobs):
         ],
         "ResearchRunsByDay": "dynamodb:Query",
         "ReadSettings": ["dynamodb:Query", "dynamodb:GetItem"],
+        "ReadBotState": "dynamodb:Query",
         "Trail": "s3:PutObject",
         "Alerts": "sns:Publish",
         "BedrockMantle": [
@@ -296,8 +363,8 @@ def _listed(value) -> list[str]:
 def test_wildcards_appear_only_where_they_must(jobs):
     """A resource with a "*" is allowed only as one of these, and no action has one."""
     allowed = {
-        # every revision of the research task family, for the scheduler
-        f"arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/traider-dev-research:*",
+        # every revision of each research task family, for the scheduler
+        *(f"arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/{f}:*" for f in FAMILIES.values()),
         # the objects in the trail bucket
         f"{jobs.one(BUCKET).arn}/*",
         # a log group's streams
@@ -340,13 +407,13 @@ def test_only_this_accounts_scheduler_may_assume_its_role(jobs):
     assert statement["Condition"] == {"StringEquals": {"aws:SourceAccount": ACCOUNT}}
 
 
-def test_the_scheduler_may_start_only_this_task_and_pass_only_its_roles(jobs):
+def test_the_scheduler_may_start_only_these_tasks_and_pass_only_their_roles(jobs):
     found = statements(jobs, "research-scheduler")
     run = found["StartResearchTask"]
     assert run["Action"] == "ecs:RunTask"
-    assert run["Resource"] == (
-        f"arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/traider-dev-research:*"
-    )
+    assert run["Resource"] == [
+        f"arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/{FAMILIES[kind]}:*" for kind in KINDS
+    ]
     assert run["Condition"] == {"ArnEquals": {"ecs:cluster": jobs.one(CLUSTER, "research").arn}}
     passing = found["PassResearchRoles"]
     assert passing["Action"] == "iam:PassRole"
@@ -369,11 +436,12 @@ def test_the_scheduler_may_start_only_this_task_and_pass_only_its_roles(jobs):
 
 
 def test_it_runs_weekdays_at_8_new_york_time_on_time_and_retries_a_failed_start_briefly(jobs):
-    schedule = jobs.one(SCHEDULE).inputs
-    assert schedule["scheduleExpression"] == "cron(0 8 ? * MON-FRI *)"
-    assert schedule["scheduleExpressionTimezone"] == "America/New_York"
-    assert schedule["flexibleTimeWindow"] == {"mode": "OFF"}
-    target = schedule["target"]
+    found = schedule(jobs).inputs
+    assert found["name"] == "traider-dev-research-premarket"
+    assert found["scheduleExpression"] == "cron(0 8 ? * MON-FRI *)"
+    assert found["scheduleExpressionTimezone"] == "America/New_York"
+    assert found["flexibleTimeWindow"] == {"mode": "OFF"}
+    target = found["target"]
     assert target["retryPolicy"] == {"maximumRetryAttempts": 2, "maximumEventAgeInSeconds": 600}
     assert target["arn"] == jobs.one(CLUSTER, "research").arn
     assert target["roleArn"] == jobs.one(ROLE, "research-scheduler").arn
@@ -382,12 +450,48 @@ def test_it_runs_weekdays_at_8_new_york_time_on_time_and_retries_a_failed_start_
     assert (ecs["launchType"], ecs["taskCount"]) == ("FARGATE", 1)
 
 
-def test_it_runs_on_the_bots_network(jobs):
+@pytest.mark.parametrize(
+    ("kind", "expression"),
+    [("scorecard", "cron(30 16 ? * MON-FRI *)"), ("intraday", "cron(0/30 10-15 ? * MON-FRI *)")],
+)
+def test_the_other_kinds_run_on_their_own_times_with_their_own_task(jobs, kind, expression):
+    found = schedule(jobs, kind).inputs
+    assert found["name"] == f"traider-dev-research-{kind}"
+    assert found["scheduleExpression"] == expression
+    assert found["scheduleExpressionTimezone"] == "America/New_York"
+    assert found["flexibleTimeWindow"] == {"mode": "OFF"}
+    target = found["target"]
+    assert target["ecsParameters"]["taskDefinitionArn"] == task(jobs, kind).arn
+    # Everything else is the pre-market schedule's: cluster, role, launch type, network,
+    # retries and the dead-letter queue.
+    premarket = schedule(jobs).inputs["target"]
+
+    def without_task(t):
+        return {**t, "ecsParameters": {**t["ecsParameters"], "taskDefinitionArn": None}}
+
+    assert without_task(target) == without_task(premarket)
+
+
+def test_each_schedule_starts_a_task_that_runs_exactly_its_own_kind(jobs):
+    """No schedule relies on a container override, which Scheduler could drop: the task
+    each one starts runs that kind's command and no other."""
+    by_arn = {t.arn: t for t in jobs.of(TASK)}
+    for kind in KINDS:
+        target = schedule(jobs, kind).inputs["target"]
+        assert "input" not in target, kind
+        started = by_arn[target["ecsParameters"]["taskDefinitionArn"]]
+        (definition,) = json.loads(started.inputs["containerDefinitions"])
+        assert definition["command"] == ["research", "run", "--kind", kind]
+        assert started.inputs["family"] == FAMILIES[kind]
+
+
+def test_every_schedule_runs_on_the_bots_network(jobs):
     service = jobs.one("aws:ecs/service:Service").inputs["networkConfiguration"]
-    network = jobs.one(SCHEDULE).inputs["target"]["ecsParameters"]["networkConfiguration"]
-    assert network["subnets"] == service["subnets"]
-    assert network["securityGroups"] == service["securityGroups"]
-    assert network["assignPublicIp"] is True
+    for kind in KINDS:
+        network = schedule(jobs, kind).inputs["target"]["ecsParameters"]["networkConfiguration"]
+        assert network["subnets"] == service["subnets"]
+        assert network["securityGroups"] == service["securityGroups"]
+        assert network["assignPublicIp"] is True
 
 
 def test_it_has_its_own_cluster_so_the_bots_crash_alarm_stays_quiet(jobs):
@@ -404,7 +508,7 @@ def test_a_research_task_that_fails_raises_an_alert(jobs):
     rule = jobs.one(RULE, "research-failed")
     detail = json.loads(rule.inputs["eventPattern"])["detail"]
     assert detail["clusterArn"] == [jobs.one(CLUSTER, "research").arn]
-    assert detail["group"] == ["family:traider-dev-research"]
+    assert detail["group"] == [f"family:{FAMILIES[kind]}" for kind in KINDS]
     assert detail["lastStatus"] == ["STOPPED"]
     assert detail["$or"] == [
         {"stopCode": ["TaskFailedToStart"]},
@@ -412,7 +516,11 @@ def test_a_research_task_that_fails_raises_an_alert(jobs):
     ]
     target = jobs.one("aws:cloudwatch/eventTarget:EventTarget", "research-failed").inputs
     assert target["arn"] == jobs.one(TOPIC).arn
-    assert "[traider] The research run" in target["inputTransformer"]["inputTemplate"]
+    transformer = target["inputTransformer"]
+    assert "[traider] The research run" in transformer["inputTemplate"]
+    # It says which kind failed: the family names it.
+    assert transformer["inputPaths"]["group"] == "$.detail.group"
+    assert "<group>" in transformer["inputTemplate"]
 
 
 def test_a_start_the_scheduler_gives_up_on_lands_in_a_dead_letter_queue(jobs):
@@ -420,8 +528,10 @@ def test_a_start_the_scheduler_gives_up_on_lands_in_a_dead_letter_queue(jobs):
     assert queue.inputs["name"] == "traider-dev-research-schedule-dlq"
     assert queue.inputs["sqsManagedSseEnabled"] is True
     assert queue.inputs["messageRetentionSeconds"] == 14 * 24 * 3600
-    target = jobs.one(SCHEDULE).inputs["target"]
-    assert target["deadLetterConfig"] == {"arn": queue.arn}
+    assert len(jobs.of(QUEUE)) == 1  # one queue for every schedule
+    for kind in KINDS:
+        target = schedule(jobs, kind).inputs["target"]
+        assert target["deadLetterConfig"] == {"arn": queue.arn}
 
 
 def test_a_dead_letter_raises_an_alert(jobs):
@@ -479,3 +589,37 @@ def test_local_env_lets_you_dry_run_research_and_still_cannot_trade(jobs):
     assert "TRAIDER_RESEARCH_BUCKET" not in lines  # a local run keeps its trail locally
     assert "TRAIDER_TRADING_MODE" not in lines
     assert "TRAIDER_CONTROL_PARAM" not in lines
+
+
+# --- C2a: reading the bot's state ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("mode", "stack"), [("paper", "dev"), ("live", "prod")])
+def test_research_may_only_query_the_bots_ledger_and_event_log(mode, stack):
+    config = {"research": True, "researchJobs": True, "alertEmail": "ops@example.test"}
+    if mode == "live":
+        config |= {"tradingMode": "live", "accountLast4": "5678"}
+    deployment = deploy(config, stack=stack)
+    read = statements(deployment, "research-task")["ReadBotState"]
+    assert (read["Action"], read["Resource"]) == (
+        "dynamodb:Query",
+        deployment.one(TABLE, "state").arn,
+    )
+    assert read["Condition"] == {
+        "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [f"POS#{mode}", f"LOG#{mode}#*"]}
+    }
+    # The namespace the bot itself writes under: its trading mode, the same for every kind.
+    bot_env = {
+        item["name"]: item["value"]
+        for item in json.loads(deployment.one(TASK, "bot").inputs["containerDefinitions"])[0][
+            "environment"
+        ]
+    }
+    assert bot_env["TRAIDER_TRADING_MODE"] == mode
+    for kind in KINDS:
+        env = environment(deployment, kind)
+        assert env["TRAIDER_STATE_NAMESPACE"] == mode, kind
+        assert env["TRAIDER_STATE_TABLE"] == bot_env["TRAIDER_STATE_TABLE"], kind
+    # Nothing else in the research role touches the state table.
+    others = [s for s in deployment.policy("research-task") if s["Sid"] != "ReadBotState"]
+    assert deployment.one(TABLE, "state").arn not in json.dumps(others)

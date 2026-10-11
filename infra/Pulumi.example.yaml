@@ -42,6 +42,13 @@ config:
   # The schedule is created disabled, so nothing runs until you turn it on, after the
   # key, model access and a dry run (needs traider:researchJobs: true).
   # traider:researchScheduleEnabled: false
+  # Two more schedules, each created disabled with its own switch; both need the
+  # research jobs on. The scorecard, weekdays at 16:30 New York, records how
+  # each recent pick did; it calls no model. The intraday runs, every 30 minutes from
+  # 10:00 to 15:00, add new names and can only tighten the day's posture; each costs at
+  # most research_jobs.budget.intraday_run_usd. See docs/runbook.md, "Research jobs".
+  # traider:researchScorecardEnabled: false
+  # traider:researchIntradayEnabled: false
 
   # Give any subset; the rest keep their defaults. Unknown names are rejected.
   # Validated always, used only when research is on.
@@ -55,6 +62,7 @@ config:
   #   reduced_factor: 0.5        # on a reduced day, order and position caps are multiplied by this
   #   intraday_flatten_min: 15   # intraday positions are sold this many minutes before the close
   #   swing_lookback_days: 10    # earlier trading days to look back for swing picks that have not expired
+  #   posture_alert_after_open_min: 5  # no usable posture this long after the open: one alert
 
   # The shipped strategy is a placeholder (a moving-average cross) that exists to
   # exercise the plumbing. It is not a recommendation. Write your own in

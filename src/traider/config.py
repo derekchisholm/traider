@@ -108,6 +108,9 @@ class ResearchSettings(BaseModel):
     intraday_flatten_min: Annotated[int, Field(ge=1, le=120)] = 15
     # How many earlier trading days to look back for swing picks that have not expired.
     swing_lookback_days: Annotated[int, Field(ge=1, le=30)] = 10
+    # This many minutes after the open, with no usable posture for today, the bot says so
+    # once (research_no_posture). It stands aside either way.
+    posture_alert_after_open_min: Annotated[int, Field(ge=1, le=120)] = 5
 
 
 def check_symbols(value: tuple[str, ...], *, allow_empty: bool = False) -> tuple[str, ...]:
@@ -164,6 +167,9 @@ class Config(BaseModel):
     control_param: str | None = None
     control: str = "paper"  # used only when control_param is unset
     state_table: str | None = None
+    # The bot's namespace in the state table (its trading mode). Only research reads it:
+    # the research task runs without a trading mode, so it is told which one to read.
+    state_namespace: Literal["paper", "live"] | None = None
     settings_table: str | None = None
     research_table: str | None = None
     # The research jobs' audit trail (S3) and where their Finnhub key is stored.

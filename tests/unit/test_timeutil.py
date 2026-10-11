@@ -8,6 +8,7 @@ from traider.timeutil import (
     SystemClock,
     trades_without_settling,
     trading_date,
+    weekdays_from,
 )
 
 
@@ -88,3 +89,10 @@ def test_weekdays_after_refuses_a_negative_count():
 
     with pytest.raises(ValueError, match="negative"):
         weekdays_after(date(2026, 10, 9), -1)
+
+
+def test_weekdays_from_includes_both_ends_and_skips_weekends():
+    friday, tuesday = date(2026, 10, 9), date(2026, 10, 13)
+    assert weekdays_from(friday, tuesday) == [friday, date(2026, 10, 12), tuesday]
+    assert weekdays_from(date(2026, 10, 10), date(2026, 10, 11)) == []
+    assert weekdays_from(tuesday, friday) == []

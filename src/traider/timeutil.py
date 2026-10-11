@@ -97,3 +97,15 @@ def weekdays_between(start: date, end: date) -> int:
         if day.weekday() < 5:
             count += 1
     return count
+
+
+def weekdays_from(start: date, end: date) -> list[date]:
+    """The weekdays from ``start`` to ``end``, both included, oldest first. Holidays are
+    not known here."""
+    days: list[date] = []
+    day = start
+    while day <= end:
+        if day.weekday() < 5:
+            days.append(day)
+        day += timedelta(days=1)
+    return days
