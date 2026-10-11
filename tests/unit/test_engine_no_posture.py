@@ -162,3 +162,26 @@ def test_the_view_tells_a_missing_posture_from_a_chosen_stand_aside():
     assert ResearchView(as_of=now, stale=True).posture_missing is False
     chosen = Posture(level="stand_aside", run_id="r1", at=now)
     assert ResearchView(as_of=now, posture=chosen).posture_missing is False
+
+
+async def test_only_the_lease_holder_sends_it(tmp_path):
+    # Like trading, the alert is the leader's: a standby stays quiet, so one alert a day.
+    store = MemoryResearchStore()
+    h = await Harness.create(tmp_path, symbols=(), research_store=store, begin=False, start=OPEN)
+    lease = h.store.acquire_lease
+
+    async def refuse(*_args, **_kwargs):
+        return False
+
+    h.store.acquire_lease = refuse
+    await h.engine.start()
+    await h.run_for(10 * 60)  # 09:40: past the delay, research read, no posture
+    assert not h.engine.is_leader
+    assert h.research.view.posture_missing
+    assert no_posture_alerts(h) == []
+    assert await h.events("research_no_posture") == []
+    h.store.acquire_lease = lease  # it wins the lease: now it says so, once
+    await h.run_for(2 * 60)
+    assert h.engine.is_leader
+    assert len(no_posture_alerts(h)) == 1
+    assert len(await h.events("research_no_posture")) == 1

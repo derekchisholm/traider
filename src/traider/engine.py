@@ -446,10 +446,11 @@ class Engine:
         with research on and the session open, say so if research, read since then, has
         no usable posture for today. The bot stands aside either way; this makes it loud.
         A posture research set to ``stand_aside`` is not missing, and staleness has its
-        own alert."""
+        own alert. Only the lease holder checks, as only it trades: a standby that wins
+        the lease later in the day checks then."""
         research = self._research
         today = trading_date(now)
-        if research is None or self._no_posture_day == today:
+        if research is None or not self._leader or self._no_posture_day == today:
             return
         session = self._session.view(now)
         if not session.is_open or session.minutes_since_open is None:
