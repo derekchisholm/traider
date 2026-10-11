@@ -151,7 +151,9 @@ class IntradaySettings(_Group):
     last_start: time = time(15, 0)
     max_candidates: Annotated[int, Field(ge=1, le=100)] = 30
     deep_dive_count: Annotated[int, Field(ge=1, le=10)] = 3
-    max_run_s: Annotated[float, Field(ge=60, le=1200)] = 600.0
+    # At most 900: the lock lives max_run_s + LOCK_SPARE_S (600), so even at the cap it
+    # ends before the next start of the 30-minute schedule.
+    max_run_s: Annotated[float, Field(ge=60, le=900)] = 600.0
 
     @field_validator("last_start")
     @classmethod
