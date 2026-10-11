@@ -175,7 +175,7 @@ once every 15 minutes.
 | Settings table unreadable | The settings table has been unreadable for five minutes. If settings had loaded, the last good version stays in force and newer versions, tighter limits included, do not apply. If not, no new positions open. Sent once per outage. | Check the table and the task role. If you need tighter limits now, set the control switch to `close_only` or `halt`. |
 | Research is stale | The research table has been unreadable for longer than `research.max_stale_s` (10 minutes by default). | No new positions open; exits still work. Check the research table, the task role and the research jobs. |
 | Research readable again | It recovered. | Nothing. |
-| No research posture today | Research is on and, a few minutes after the open (`research.posture_alert_after_open_min`, 5 by default), there is no usable posture for today: the pre-market run failed, did not run (a missed start included), finished `partial` (ignored by default) or was switched off, or a posture item could not be read. The bot stands aside all day; the intraday runs do not rescue it. Once per bot process per trading day. Not sent when research is stale (the stale alert covers that). | Find out why: the morning's research alert, `traider research show` (what the bot sees), the research logs and the dead-letter queue (see [Research jobs](#research-jobs)). The bot picks up a posture within a minute of a run finishing `ok`; whether to start one by hand during the session is your call (it shares Schwab's request quota with the bot). |
+| No research posture today | Research is on and, a few minutes after the open (`research.posture_alert_after_open_min`, 5 by default), there is no usable posture for today: the pre-market run failed, did not run (a missed start included), finished `partial` (ignored by default) or was switched off, or a posture item could not be read. The bot stands aside all day; the intraday runs do not rescue it. Sent only by the instance holding the trading lease, once per bot process per trading day. Not sent when research is stale (the stale alert covers that). | Find out why: the morning's research alert, `traider research show` (what the bot sees), the research logs and the dead-letter queue (see [Research jobs](#research-jobs)). The bot picks up a posture within a minute of a run finishing `ok`; whether to start one by hand during the session is your call (it shares Schwab's request quota with the bot). |
 | Research DATE: ok | The pre-market research run finished. The alert gives the posture, each pick (L long, B bearish, its horizon and score) and the cost. | Nothing. `traider research show` before the open shows what the bot will act on. |
 | Research DATE: partial | The run finished, but planned work did not happen: a budget stopped Bedrock calls, a deadline passed, Finnhub failed, the Bedrock posture review failed, Bedrock calls failed or timed out in half the deep-dives or more, daily history was unreadable for half the names or more, or the trail could not be written. The alert ends with the reasons. By default the bot ignores a partial run's picks; its posture can only make today stricter, and with no `ok` run today the bot stands aside. | Read the reasons. Once the cause has passed, run it again (see [Research jobs](#research-jobs)). To trade on partial runs anyway, set `research.accept_partial_runs`; it applies to every partial run. |
 | Research DATE: failed | The run stopped at the stage it names (for example `collect`, `posture` or `dive`; a run that took longer than `research_jobs.max_run_s` plus 9 minutes fails too). It wrote no posture, so the bot stands aside today. If the message says "was written as ok" (or partial) "then failed", the result was already in the table when something went wrong (for example the time box ran out while the alert was sent): it stands, and the bot uses it as usual. | An expired Schwab sign-in is the usual cause: sign in, then run it again. Otherwise read the research logs. After "was written as ... then failed", nothing to redo; read the research logs. |
@@ -185,7 +185,7 @@ once every 15 minutes.
 | Research intraday DATE: ok | An intraday run added picks or made the posture stricter (the alert gives both). Quiet runs send nothing. | Nothing. |
 | Research intraday DATE: partial | An intraday run did not finish what it planned: a budget or deadline, Finnhub's calendar (failed, or empty over 5 or more weekdays), model calls, or a pick item it could not read (then it made no picks). By default the bot ignores a partial run's picks, but its posture can still only make the day stricter, and that reaches the bot. | Read the notes; nothing to redo, the next run is 30 minutes later. |
 | Research intraday DATE: failed | The run stopped at the stage it names. A failed intraday run writes no posture or picks (it does write a failed META and its cost): the posture and picks already in force stay in force. A run that cannot read the bot's ledger fails at `held` (it will not pick what it cannot tell is held). Can repeat at every firing: up to 12 alerts a day. | Read the research logs. For `held`, check the state table, `TRAIDER_STATE_NAMESPACE` and the research task role. To stop the noise, set `traider:researchIntradayEnabled false` and `pulumi up`. |
-| The research run stopped with an error | From AWS, not from the run: a research task exited with an error (it failed, it could not start, or another run of its kind held the lock). The alert names the task family: `<prefix>-research` is the pre-market run, `-scorecard` and `-intraday` the others. Only a missed pre-market run leaves the bot standing aside; a scorecard failure affects nothing the bot reads, and an intraday failure leaves the posture and picks already in force. | Read the research logs (below). A run that cannot even start (no Finnhub key stored or readable, invalid or unreadable settings, no research table or no AWS region) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
+| The research run stopped with an error | From AWS, not from the run: a research task exited with an error (it failed, it could not start, or another run held its lock: another run of its kind, or a pre-market and an intraday run met, which never overlap). The alert names the task family: `<prefix>-research` is the pre-market run, `-scorecard` and `-intraday` the others. Only a missed pre-market run leaves the bot standing aside; a scorecard failure affects nothing the bot reads, and an intraday failure leaves the posture and picks already in force. | Read the research logs (below). A run that cannot even start (no Finnhub key stored or readable, invalid or unreadable settings, no research table or no AWS region) writes no run record, so this alert is the only sign; it carries only a stop code and reason, and the cause is in the research logs ("cannot start the research run:"). Missing Bedrock model access does not stop the run: it finishes `partial` with notes. If the task could not start, check the image and the roles. |
 | Alarm: the scheduler could not start the research run | The scheduler gave up on starting a task (two retries within 10 minutes) and put the request in the dead-letter queue, which all three schedules share. No task ran, so the alert above cannot fire. If it was the pre-market schedule, the bot stands aside today; a missed scorecard affects nothing the bot reads, and a missed intraday run leaves the posture and picks in force. | Read the message (its attributes name the schedule; not verified), then **purge the queue after every message** (below). If you do not, the alarm stays in ALARM and later failures, a missed pre-market run included, send no new alert. Intraday starts can fail at every firing, up to 12 times a day. |
 | No research alert by about 08:30 on a trading day | (Unless `research_jobs.enabled` is false.) The pre-market run's alert, from its schedule only. No summary means the run did not finish, or never ran: the schedule is not enabled (`traider:researchScheduleEnabled`, off by default), the start failed, or the run is stuck. A start that AWS refuses with a failure list may not reach the dead-letter queue (not verified). | Look at the research logs and `traider research show`. Until a run is `ok`, the bot stands aside. |
 
@@ -228,7 +228,7 @@ aws dynamodb query --table-name "$(pulumi stack output stateTable)" \
 | `universe_changed` | The symbols the bot watches changed: `added`, `dropped` and the full `universe`. Held and busy symbols are never dropped. |
 | `research_stale` | Research could not be read for longer than `research.max_stale_s`. No live picks and the posture is stand aside until it can be read; exits are not affected. `detail` says what went wrong. |
 | `research_restored` | Research is readable again. |
-| `research_no_posture` | Research is on, the session has been open for `research.posture_alert_after_open_min` minutes (5 by default), and research, read since then, has no usable posture for today (none from an ok run, or an unreadable posture item), so the bot stands aside. Recorded with the alert, once a day (again after a restart). Not recorded when research chose `stand_aside`, or while research is stale (`research_stale` covers that). |
+| `research_no_posture` | Research is on, the session has been open for `research.posture_alert_after_open_min` minutes (5 by default), and research, read since then, has no usable posture for today (none from an ok run, or an unreadable posture item), so the bot stands aside. Recorded with the alert by the instance holding the trading lease, once a day (again after a restart). Not recorded when research chose `stand_aside`, or while research is stale (`research_stale` covers that). |
 
 **The paper account** (cash and positions) is kept in the same table so it survives
 restarts. To start it over, set `halt`, delete it and restart the bot. If the old
@@ -478,6 +478,14 @@ any pick that has not expired. A swing idea is made intraday. An alert comes onl
 run adds picks, tightens the posture or finishes `partial`; a quiet run still writes its
 posture and META.
 
+**Pre-market and intraday runs are mutually exclusive.** An intraday run holds the
+pre-market lock as well as its own for its whole run, so whichever starts second exits 2
+(`locked`) and writes nothing. A pre-market run forced during an intraday run
+(`traider research run --kind premarket --force`) prints `research premarket locked: ...`
+and exits 2; run it again once the intraday run has finished (at most
+`research_jobs.intraday.max_run_s` plus 9 minutes). Likewise, a scheduled intraday run that
+starts while a late pre-market run is still going exits 2, and AWS reports the task exit.
+
 **What the bot does with each outcome**
 
 | Run | Posture and picks |
@@ -495,13 +503,15 @@ Today's posture is the strictest of: the newest `ok` posture (when there is none
 `research.accept_partial_runs` is on, the earliest `partial` one), and every readable
 posture written at or after it today, whatever its run's status. So a partial intraday
 tightening reaches the bot, and no run can loosen the day. The exception is a newer `ok`
-pre-market run (for example `--force`): it is authoritative.
+pre-market run (for example `--force`) or a manual seed (`traider research seed`, which
+writes an `ok` run): either is authoritative.
 
 **Time and money limits.** Past `research_jobs.max_run_s` (20 minutes) before the screen,
 the run writes the posture and no picks, as `partial`. Past it during the deep-dives, no
 new dive starts and unfinished ones are cut short, as `partial`. A run still going 9
 minutes after `research_jobs.max_run_s` fails. The intraday runs have their own, shorter box,
-`research_jobs.intraday.max_run_s` (600 seconds), with the same rules; the scorecard uses
+`research_jobs.intraday.max_run_s` (600 seconds, at most 900 so its lock, which lives 10
+minutes longer, ends before the next start), with the same rules; the scorecard uses
 `research_jobs.max_run_s`. The cost meter stops all model calls once a call overruns
 its reservation or a budget would be exceeded, and estimates include a 1000-token allowance
 for tools.
@@ -509,11 +519,12 @@ for tools.
 **Running it again.** If the scheduler cannot start the task it retries twice within 10
 minutes; a run that failed after starting is not repeated by the schedule (a late
 pre-market run is not wanted). A run is skipped if an `ok` or `partial` one already
-finished today, and only one runs at a time (a second exits with code 2). After fixing the
+finished today, and only one runs at a time (a second exits with code 2); one started
+while an intraday run is going exits 2 as well. After fixing the
 cause, run it from your machine with the `localEnv` output loaded; without `--dry-run` it
 writes picks for the bot, and its trail stays on your machine. The scorecard is skipped the
 same way when one already finished today (`--force` to run it again). The intraday kind has no
-skip-if-done, only the lock; `--force` there ignores `research_jobs.intraday.last_start`, not
+skip-if-done, only its locks; `--force` there ignores `research_jobs.intraday.last_start`, not
 the need for an `ok` posture.
 
 ```sh

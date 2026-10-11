@@ -20,7 +20,7 @@ C2b (later) covers the earnings watch after the close, the weekly watchlist and 
 
 | Question | Decision | Why |
 |---|---|---|
-| Runtime | Same research image and CLI: `traider research run --kind scorecard` and `--kind intraday`. Each kind has its own ECS task definition (`{prefix}-research` for premarket, `{prefix}-research-scorecard`, `{prefix}-research-intraday`), its own Scheduler schedule and its own lock name. No schedule overrides the container's command. | Reuses C1's lock, trail, alerts, scrub, store and infra. A schedule can only start its own kind, whatever happens to an override. |
+| Runtime | Same research image and CLI: `traider research run --kind scorecard` and `--kind intraday`. Each kind has its own ECS task definition (`{prefix}-research` for premarket, `{prefix}-research-scorecard`, `{prefix}-research-intraday`), its own Scheduler schedule and its own lock name. An intraday run also holds the premarket lock for its whole run, so premarket and intraday never overlap (whichever starts second exits 2, `locked`). No schedule overrides the container's command. | Reuses C1's lock, trail, alerts, scrub, store and infra. A schedule can only start its own kind, whatever happens to an override. |
 | Scorecard schedule | `cron(30 16 ? * MON-FRI *)` New York | After the close. Uses daily bars, so an exact time is not needed. |
 | Intraday schedule | `cron(0/30 10-15 ? * MON-FRI *)` New York. The runner skips starts after `intraday.last_start` (15:00). | Runs 10:00 to 15:00. Leaves time before the bot's intraday flatten. |
 | Schedules start disabled | One toggle per kind: `traider:researchScorecardEnabled` and `traider:researchIntradayEnabled`, default false. | Same rollout as C1. |
@@ -33,8 +33,8 @@ C2b (later) covers the earnings watch after the close, the weekly watchlist and 
 | Intraday Schwab rate | Its own limiter at 20 requests/min (the other kinds keep 40). | The bot is trading live during the session. |
 | Scorecard method | Forward returns come from Schwab daily bars. No model calls. | Deterministic and cheap. |
 | "Traded" | True when the bot submitted a buy in the symbol (or an option on it) while the pick was live, per the bot's event log. `null` when the log cannot be read. Realised P&L is left to B. | Submission is what the log reliably holds. Fills and P&L come from the broker, which B will read. |
-| Today's posture (bot and intraday, only ever stricter) | The strictest of: the newest `ok` posture (when there is none and `accept_partial_runs` is on, the earliest `partial` one), and every readable posture written at or after it today, whatever its run's status. A newer `ok` premarket run (for example `--force`) is authoritative. An unreadable posture item means no posture. | A partial intraday tightening reaches the bot, and no run can loosen the day. |
-| Missing-posture alert | The bot's engine, at `research.posture_alert_after_open_min` (default 5) after the open on a trading day: if research is on and the view's posture is `stand_aside` because there is no usable posture (not because research chose it), alert once. Event `research_no_posture`. | Visibility. A missing posture is fail-closed but must not be silent. |
+| Today's posture (bot and intraday, only ever stricter) | The strictest of: the newest `ok` posture (when there is none and `accept_partial_runs` is on, the earliest `partial` one), and every readable posture written at or after it today, whatever its run's status. A newer `ok` premarket run (for example `--force`) or a manual seed (`traider research seed`, an `ok` run) is authoritative. An unreadable posture item means no posture. | A partial intraday tightening reaches the bot, and no run can loosen the day. |
+| Missing-posture alert | The bot's engine, at `research.posture_alert_after_open_min` (default 5) after the open on a trading day: if research is on and the view's posture is `stand_aside` because there is no usable posture (not because research chose it), alert once. Only the instance holding the trading lease checks. Event `research_no_posture`. | Visibility. A missing posture is fail-closed but must not be silent. |
 
 ## Scorecard
 
@@ -86,7 +86,7 @@ Writes are idempotent overwrites. A pick already marked `final` is skipped. A va
 Flow (reuses C1 stages):
 
 ```
-lock(intraday) → market open now? → after last_start (+5 min grace)? → today has an ok posture? → META running
+lock(intraday), lock(premarket) → market open now? → after last_start (+5 min grace)? → today has an ok posture? → META running
  → held (the bot's ledger) → live picks of earlier days
  → collect (context quotes, SPY bars, movers, and the Finnhub earnings calendar from
    yesterday to `earnings_lookahead_days` ahead: one call per run, see the decisions below)
@@ -106,7 +106,7 @@ This needs `Query` on the state table for `POS#<ns>` and `LOG#<ns>#<day>`, and n
 **Sizes:**
 - `intraday.max_candidates` is 30.
 - History reads are bounded the same way as the morning run's.
-- `intraday.max_run_s` is 600. The lock and the time box follow C1's rules.
+- `intraday.max_run_s` is 600, at most 900: the lock lives `max_run_s` + 600 s, so even at the cap it ends before the next 30-minute start. The lock and the time box follow C1's rules; the premarket lock an intraday run takes has the same TTL.
 
 **Assessment:** the dive prompt gains one line: "This is an intraday idea; it must be flat by today's close." Any assessment with `horizon = swing` is coerced to `intraday`, with a note.
 
@@ -158,7 +158,7 @@ Under the existing `traider:researchJobs` flag, no new bucket or secret. Additio
 
 - `--dry-run` writes nothing to the table.
 - For intraday, `--force` (and a dry run) ignores `last_start` but not the morning-posture requirement.
-- `--force` ignores skip-if-done. Skip-if-done applies to premarket and scorecard (once per day). Intraday has no skip-if-done; the lock stops overlaps.
+- `--force` ignores skip-if-done. Skip-if-done applies to premarket and scorecard (once per day). Intraday has no skip-if-done; the lock stops overlaps. A premarket run forced during an intraday run exits 2 (`locked`).
 
 ## Testing
 

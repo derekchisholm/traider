@@ -589,7 +589,11 @@ choose the strategy.
     ($0.75); every pick is intraday, flat by today's close (a swing idea is made intraday);
   - holds itself to 20 Schwab requests a minute, because the bot is trading;
   - alerts only when it adds picks, tightens the posture or finishes `partial`. If it
-    cannot read a pick item, it makes no picks and finishes `partial`.
+    cannot read a pick item, it makes no picks and finishes `partial`;
+  - never overlaps a pre-market run: it holds the pre-market lock as well as its own, so
+    whichever of the two starts second exits 2 (`locked`) and writes nothing. A pre-market
+    run forced (`--force`) during an intraday run exits 2 with `locked`; run it again once
+    the intraday run has finished.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -599,7 +603,7 @@ choose the strategy.
 | `research_jobs.intraday.last_start` | 15:00 | New York time; a later start does nothing |
 | `research_jobs.intraday.deep_dive_count` | 3 | names studied per run |
 | `research_jobs.intraday.max_candidates` | 30 | candidates screened per run |
-| `research_jobs.intraday.max_run_s` | 600 | seconds an intraday run may take (the scorecard uses `research_jobs.max_run_s`) |
+| `research_jobs.intraday.max_run_s` | 600 | seconds an intraday run may take, at most 900 so its lock ends before the next start (the scorecard uses `research_jobs.max_run_s`) |
 | `research_jobs.dive.intraday_model` | `anthropic.claude-sonnet-5-5` | the intraday dives' model; it needs a price in `research_jobs.budget.prices` |
 | `research_jobs.budget.intraday_run_usd` | 0.75 | Bedrock spend per intraday run, within `day_usd` |
 
@@ -607,12 +611,14 @@ choose the strategy.
 `research.accept_partial_runs` and no `ok` one, the earliest `partial` posture), and every
 readable posture written at or after it today, whatever its run's status. So a partial
 intraday tightening reaches the bot and no run can loosen the day. The exception is a newer
-`ok` pre-market run (for example `--force`), which is authoritative.
+`ok` pre-market run (for example `--force`) or a manual seed (`traider research seed`, which
+writes an `ok` run): either is authoritative.
 
 **Missing posture.** With research on, if a few minutes after the open
 (`research.posture_alert_after_open_min`, 5) the bot has read research and there is still no
-usable posture for today, it records `research_no_posture` and alerts once per process per
-trading day: it is standing aside all day, and the pre-market run failed, did not run or
+usable posture for today, the instance holding the trading lease records
+`research_no_posture` and alerts once per process per trading day (a standby stays quiet):
+it is standing aside all day, and the pre-market run failed, did not run or
 finished `partial`. It does not fire when research is stale (`research_stale` covers that).
 
 ### Seeding picks by hand
@@ -726,7 +732,10 @@ measured; capped at `research_jobs.budget.day_usd` a day), so roughly $20-45 a m
 well under a dollar of Fargate and S3. Finnhub's free tier costs nothing. The intraday
 runs, when switched on, cost up to `research_jobs.budget.intraday_run_usd` ($0.75) each, 11
 a day at most. That spend is unmeasured; it is capped per run and counts toward
-`research_jobs.budget.day_usd`, which all runs share. The scorecard calls no model.
+`research_jobs.budget.day_usd`, which all runs share. With the default budgets the day's cap
+can bind: $3 for the pre-market run plus 11 × $0.75 intraday is $11.25, over the $8
+`day_usd`. So on a costly day the late intraday runs can be budget-capped: they end
+`partial` (fewer or no deep-dives) and alert. The scorecard calls no model.
 
 There is no NAT gateway (about $32 a month saved): the task has a public address and
 a security group with no inbound rules and outbound HTTPS only.
